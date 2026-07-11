@@ -47,12 +47,13 @@ CREATE TABLE IF NOT EXISTS worker_runs (
     worker_run_id TEXT PRIMARY KEY NOT NULL,
     repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
     parent_instance_id TEXT NOT NULL REFERENCES agent_instances(instance_id) ON DELETE RESTRICT,
-    role TEXT NOT NULL CHECK(role IN ('executor', 'butler')),
+    role TEXT NOT NULL CHECK(role IN ('executor', 'butler', 'auditor')),
     status TEXT NOT NULL CHECK(status IN ('created', 'active', 'completed', 'failed', 'abandoned')),
     task_summary TEXT NOT NULL,
     context_refs_json TEXT NOT NULL,
     result_summary TEXT,
     error_summary TEXT,
+    addresses_audit_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE RESTRICT,
     created_at TEXT NOT NULL,
     activated_at TEXT,
     last_heartbeat_at TEXT NOT NULL,
@@ -66,13 +67,29 @@ CREATE INDEX IF NOT EXISTS worker_runs_repository_status_idx
 CREATE INDEX IF NOT EXISTS worker_runs_parent_status_idx
     ON worker_runs(parent_instance_id, status);
 
+CREATE UNIQUE INDEX IF NOT EXISTS worker_runs_one_remediation_per_audit_idx
+    ON worker_runs(addresses_audit_run_id)
+    WHERE addresses_audit_run_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS worker_run_audit_items (
+    worker_run_id TEXT NOT NULL REFERENCES worker_runs(worker_run_id) ON DELETE CASCADE,
+    work_item_id TEXT NOT NULL,
+    audit_iteration INTEGER NOT NULL CHECK(audit_iteration BETWEEN 1 AND 10),
+    max_iterations INTEGER NOT NULL CHECK(max_iterations BETWEEN 1 AND 10),
+    PRIMARY KEY(worker_run_id, work_item_id),
+    UNIQUE(work_item_id, audit_iteration)
+);
+
+CREATE INDEX IF NOT EXISTS worker_run_audit_items_work_item_idx
+    ON worker_run_audit_items(work_item_id, audit_iteration);
+
 CREATE TABLE IF NOT EXISTS artifacts (
     artifact_id TEXT PRIMARY KEY NOT NULL,
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
     producer_repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
     producer_instance_id TEXT REFERENCES agent_instances(instance_id) ON DELETE SET NULL,
     producer_worker_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE SET NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('implementation_report', 'api_contract', 'answer', 'note')),
+    kind TEXT NOT NULL CHECK(kind IN ('implementation_report', 'api_contract', 'answer', 'audit_report', 'note')),
     title TEXT NOT NULL,
     content_type TEXT NOT NULL,
     content TEXT NOT NULL,

@@ -11,11 +11,11 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::domain::{
-    ActorRef, AgentInstance, Artifact, ArtifactId, ConnectOrchestrator, ConnectResult,
-    CreateWorkerRun, DeliveryAck, InboxItem, InboxPage, InstanceId, Message, MessageId,
-    MessageTarget, PresenceStatus, Project, ProjectId, ProjectOverview, PublishMessage,
-    PublishResult, Repository, RepositoryId, RepositoryPresence, ThreadId, WorkerRun, WorkerRunId,
-    WorkerRunStatus,
+    ActorRef, AgentInstance, Artifact, ArtifactId, AuditScopeItem, ConnectOrchestrator,
+    ConnectResult, CreateWorkerRun, DeliveryAck, InboxItem, InboxPage, InstanceId, Message,
+    MessageId, MessageTarget, PresenceStatus, Project, ProjectId, ProjectOverview, PublishMessage,
+    PublishResult, Repository, RepositoryId, RepositoryPresence, ThreadId, WorkItemId, WorkerRole,
+    WorkerRun, WorkerRunId, WorkerRunStatus,
 };
 
 use super::schema::{CREATE_SCHEMA, SCHEMA_VERSION};
@@ -207,6 +207,7 @@ impl SqliteStore {
         command: CreateWorkerRun,
     ) -> Result<WorkerRun, StoreError> {
         let _write_guard = self.write_lock.lock().await;
+        validate_worker_run_command(&command)?;
         let now = utc_now();
         let worker_lease_expires_at = lease_deadline(self.worker_lease_duration);
         let orchestrator_lease_expires_at = lease_deadline(self.lease_duration);
@@ -230,6 +231,10 @@ impl SqliteStore {
             )));
         }
         let repository_id = RepositoryId::parse(parent.try_get("repository_id")?)?;
+        let audit_scope = prepare_audit_scope(&mut transaction, &command).await?;
+        if let Some(audit_run_id) = command.addresses_audit_run_id {
+            validate_remediation_audit(&mut transaction, repository_id, audit_run_id).await?;
+        }
 
         sqlx::query(
             "UPDATE agent_instances
@@ -245,9 +250,9 @@ impl SqliteStore {
         sqlx::query(
             "INSERT INTO worker_runs(
                  worker_run_id, repository_id, parent_instance_id, role, status,
-                 task_summary, context_refs_json, result_summary, error_summary,
+                 task_summary, context_refs_json, result_summary, error_summary, addresses_audit_run_id,
                  created_at, activated_at, last_heartbeat_at, lease_expires_at, finished_at
-             ) VALUES (?, ?, ?, ?, 'created', ?, ?, NULL, NULL, ?, NULL, ?, ?, NULL)",
+             ) VALUES (?, ?, ?, ?, 'created', ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, NULL)",
         )
         .bind(worker_run_id.to_string())
         .bind(repository_id.to_string())
@@ -255,11 +260,26 @@ impl SqliteStore {
         .bind(command.role.as_str())
         .bind(&command.task_summary)
         .bind(&context_refs_json)
+        .bind(command.addresses_audit_run_id.map(|id| id.to_string()))
         .bind(&now)
         .bind(&now)
         .bind(&worker_lease_expires_at)
         .execute(&mut *transaction)
         .await?;
+
+        for scope_item in &audit_scope {
+            sqlx::query(
+                "INSERT INTO worker_run_audit_items(
+                     worker_run_id, work_item_id, audit_iteration, max_iterations
+                 ) VALUES (?, ?, ?, ?)",
+            )
+            .bind(worker_run_id.to_string())
+            .bind(scope_item.work_item_id.to_string())
+            .bind(i64::from(scope_item.iteration))
+            .bind(i64::from(scope_item.max_iterations))
+            .execute(&mut *transaction)
+            .await?;
+        }
 
         transaction.commit().await?;
         self.get_worker_run(worker_run_id).await
@@ -366,7 +386,27 @@ impl SqliteStore {
             .fetch_optional(&self.pool)
             .await?
             .ok_or_else(|| StoreError::NotFound(format!("worker run {worker_run_id}")))?;
-        worker_run_from_row(&row)
+        let mut worker = worker_run_from_row(&row)?;
+        let audit_rows = sqlx::query(
+            "SELECT work_item_id, audit_iteration, max_iterations
+             FROM worker_run_audit_items
+             WHERE worker_run_id = ?
+             ORDER BY work_item_id",
+        )
+        .bind(worker_run_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        worker.audit_scope = audit_rows
+            .iter()
+            .map(|row| {
+                Ok(AuditScopeItem {
+                    work_item_id: WorkItemId::parse(row.try_get("work_item_id")?)?,
+                    iteration: row.try_get::<i64, _>("audit_iteration")? as u8,
+                    max_iterations: row.try_get::<i64, _>("max_iterations")? as u8,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok(worker)
     }
 
     async fn finish_worker_run(
@@ -888,6 +928,136 @@ impl SqliteStore {
     }
 }
 
+fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreError> {
+    let has_audit_scope = !command.audit_work_items.is_empty();
+    match command.role {
+        WorkerRole::Auditor => {
+            if !has_audit_scope {
+                return Err(StoreError::Conflict(
+                    "auditor run requires at least one audit_work_item".to_owned(),
+                ));
+            }
+            if command.addresses_audit_run_id.is_some() {
+                return Err(StoreError::Conflict(
+                    "auditor run cannot address another audit run".to_owned(),
+                ));
+            }
+        }
+        WorkerRole::Executor => {
+            if has_audit_scope {
+                return Err(StoreError::Conflict(
+                    "executor run cannot declare audit_work_items".to_owned(),
+                ));
+            }
+        }
+        WorkerRole::Butler => {
+            if has_audit_scope || command.addresses_audit_run_id.is_some() {
+                return Err(StoreError::Conflict(
+                    "butler run cannot declare audit scope or remediation link".to_owned(),
+                ));
+            }
+        }
+    }
+
+    let mut unique_work_items = BTreeSet::new();
+    for item in &command.audit_work_items {
+        if !(1..=10).contains(&item.max_iterations) {
+            return Err(StoreError::Conflict(format!(
+                "max_iterations for work item {} must be between 1 and 10",
+                item.work_item_id
+            )));
+        }
+        if !unique_work_items.insert(item.work_item_id.to_string()) {
+            return Err(StoreError::Conflict(format!(
+                "work item {} appears more than once in audit scope",
+                item.work_item_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_audit_scope(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command: &CreateWorkerRun,
+) -> Result<Vec<AuditScopeItem>, StoreError> {
+    if command.role != WorkerRole::Auditor {
+        return Ok(Vec::new());
+    }
+
+    let mut scope = Vec::with_capacity(command.audit_work_items.len());
+    for item in &command.audit_work_items {
+        let row = sqlx::query(
+            "SELECT MAX(audit_iteration) AS current_iteration,
+                    MIN(max_iterations) AS min_max_iterations,
+                    MAX(max_iterations) AS max_max_iterations
+             FROM worker_run_audit_items
+             WHERE work_item_id = ?",
+        )
+        .bind(item.work_item_id.to_string())
+        .fetch_one(&mut **transaction)
+        .await?;
+        let current_iteration: Option<i64> = row.try_get("current_iteration")?;
+        let stored_min: Option<i64> = row.try_get("min_max_iterations")?;
+        let stored_max: Option<i64> = row.try_get("max_max_iterations")?;
+        if let (Some(stored_min), Some(stored_max)) = (stored_min, stored_max) {
+            if stored_min != i64::from(item.max_iterations)
+                || stored_max != i64::from(item.max_iterations)
+            {
+                return Err(StoreError::Conflict(format!(
+                    "work item {} audit depth is already fixed at {stored_min}",
+                    item.work_item_id
+                )));
+            }
+        }
+        let iteration = current_iteration.unwrap_or(0) + 1;
+        if iteration > i64::from(item.max_iterations) {
+            return Err(StoreError::Conflict(format!(
+                "work item {} exhausted audit depth {}",
+                item.work_item_id, item.max_iterations
+            )));
+        }
+        scope.push(AuditScopeItem {
+            work_item_id: item.work_item_id,
+            iteration: iteration as u8,
+            max_iterations: item.max_iterations,
+        });
+    }
+    Ok(scope)
+}
+
+async fn validate_remediation_audit(
+    transaction: &mut Transaction<'_, Sqlite>,
+    repository_id: RepositoryId,
+    audit_run_id: WorkerRunId,
+) -> Result<(), StoreError> {
+    let audit =
+        sqlx::query("SELECT repository_id, role, status FROM worker_runs WHERE worker_run_id = ?")
+            .bind(audit_run_id.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("audit worker run {audit_run_id}")))?;
+    let audit_repository_id = RepositoryId::parse(audit.try_get("repository_id")?)?;
+    let role: String = audit.try_get("role")?;
+    let status: String = audit.try_get("status")?;
+    if audit_repository_id != repository_id || role != "auditor" || status != "completed" {
+        return Err(StoreError::Conflict(format!(
+            "worker run {audit_run_id} must be a completed auditor run in the same repository"
+        )));
+    }
+    let existing =
+        sqlx::query("SELECT worker_run_id FROM worker_runs WHERE addresses_audit_run_id = ?")
+            .bind(audit_run_id.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?;
+    if existing.is_some() {
+        return Err(StoreError::Conflict(format!(
+            "audit worker run {audit_run_id} already has a remediation executor run"
+        )));
+    }
+    Ok(())
+}
+
 async fn resolve_recipients(
     transaction: &mut Transaction<'_, Sqlite>,
     project_id: ProjectId,
@@ -1255,6 +1425,11 @@ fn worker_run_from_row(row: &SqliteRow) -> Result<WorkerRun, StoreError> {
         context_refs: serde_json::from_str(&context_refs_json)?,
         result_summary: row.try_get("result_summary")?,
         error_summary: row.try_get("error_summary")?,
+        audit_scope: Vec::new(),
+        addresses_audit_run_id: parse_optional_id(
+            row.try_get("addresses_audit_run_id")?,
+            WorkerRunId::parse,
+        )?,
         created_at: row.try_get("created_at")?,
         activated_at: row.try_get("activated_at")?,
         last_heartbeat_at: row.try_get("last_heartbeat_at")?,
@@ -1371,7 +1546,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::domain::WorkerRole;
+    use crate::domain::{AuditWorkItemInput, WorkItemId, WorkerRole};
 
     fn temp_database_path() -> PathBuf {
         std::env::temp_dir()
@@ -1515,6 +1690,8 @@ mod tests {
                 role: WorkerRole::Executor,
                 task_summary: "Implement a fake endpoint".to_owned(),
                 context_refs: json!([{ "kind": "message", "id": "message-1" }]),
+                audit_work_items: Vec::new(),
+                addresses_audit_run_id: None,
             })
             .await
             .unwrap();
@@ -1555,6 +1732,8 @@ mod tests {
                 role: WorkerRole::Butler,
                 task_summary: "Inspect a fake contract".to_owned(),
                 context_refs: json!([]),
+                audit_work_items: Vec::new(),
+                addresses_audit_run_id: None,
             })
             .await
             .unwrap();
@@ -1590,6 +1769,8 @@ mod tests {
                 role: WorkerRole::Executor,
                 task_summary: "Race two terminal transitions".to_owned(),
                 context_refs: json!([]),
+                audit_work_items: Vec::new(),
+                addresses_audit_run_id: None,
             })
             .await
             .unwrap();
@@ -1778,6 +1959,8 @@ mod tests {
                 role: WorkerRole::Executor,
                 task_summary: "Publish fake report".to_owned(),
                 context_refs: json!([]),
+                audit_work_items: Vec::new(),
+                addresses_audit_run_id: None,
             })
             .await
             .unwrap();
@@ -1924,6 +2107,8 @@ mod tests {
                 role: WorkerRole::Executor,
                 task_summary: "Expire this worker".to_owned(),
                 context_refs: json!([]),
+                audit_work_items: Vec::new(),
+                addresses_audit_run_id: None,
             })
             .await
             .unwrap();
@@ -2055,6 +2240,162 @@ mod tests {
         let after = store.get_instance(web.instance.instance_id).await.unwrap();
         assert_eq!(before.last_heartbeat_at, after.last_heartbeat_at);
         assert_eq!(before.lease_expires_at, after.lease_expires_at);
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn auditor_batches_items_and_enforces_per_item_depth() {
+        let (store, path) = test_store(90).await;
+        let connected = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let first_item = WorkItemId::new();
+        let second_item = WorkItemId::new();
+        let audit_items = || {
+            vec![
+                AuditWorkItemInput {
+                    work_item_id: first_item,
+                    max_iterations: 2,
+                },
+                AuditWorkItemInput {
+                    work_item_id: second_item,
+                    max_iterations: 2,
+                },
+            ]
+        };
+
+        let first_audit = store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: connected.instance.instance_id,
+                role: WorkerRole::Auditor,
+                task_summary: "Audit two completed work items".to_owned(),
+                context_refs: json!([]),
+                audit_work_items: audit_items(),
+                addresses_audit_run_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first_audit.audit_scope.len(), 2);
+        assert!(
+            first_audit
+                .audit_scope
+                .iter()
+                .all(|item| item.iteration == 1 && item.max_iterations == 2)
+        );
+        store
+            .activate_worker_run(first_audit.worker_run_id)
+            .await
+            .unwrap();
+        store
+            .complete_worker_run(first_audit.worker_run_id, "Found one issue")
+            .await
+            .unwrap();
+
+        let remediation = store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: connected.instance.instance_id,
+                role: WorkerRole::Executor,
+                task_summary: "Address the complete audit report".to_owned(),
+                context_refs: json!([]),
+                audit_work_items: Vec::new(),
+                addresses_audit_run_id: Some(first_audit.worker_run_id),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            remediation.addresses_audit_run_id,
+            Some(first_audit.worker_run_id)
+        );
+        assert!(matches!(
+            store
+                .create_worker_run(CreateWorkerRun {
+                    parent_instance_id: connected.instance.instance_id,
+                    role: WorkerRole::Executor,
+                    task_summary: "Second remediation must be rejected".to_owned(),
+                    context_refs: json!([]),
+                    audit_work_items: Vec::new(),
+                    addresses_audit_run_id: Some(first_audit.worker_run_id),
+                })
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+
+        let second_audit = store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: connected.instance.instance_id,
+                role: WorkerRole::Auditor,
+                task_summary: "Audit remediation".to_owned(),
+                context_refs: json!([]),
+                audit_work_items: audit_items(),
+                addresses_audit_run_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            second_audit
+                .audit_scope
+                .iter()
+                .all(|item| item.iteration == 2)
+        );
+        assert!(matches!(
+            store
+                .create_worker_run(CreateWorkerRun {
+                    parent_instance_id: connected.instance.instance_id,
+                    role: WorkerRole::Auditor,
+                    task_summary: "Depth is exhausted".to_owned(),
+                    context_refs: json!([]),
+                    audit_work_items: audit_items(),
+                    addresses_audit_run_id: None,
+                })
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn audit_scope_is_only_valid_for_auditor_role() {
+        let (store, path) = test_store(90).await;
+        let connected = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let item = AuditWorkItemInput {
+            work_item_id: WorkItemId::new(),
+            max_iterations: 1,
+        };
+
+        assert!(matches!(
+            store
+                .create_worker_run(CreateWorkerRun {
+                    parent_instance_id: connected.instance.instance_id,
+                    role: WorkerRole::Executor,
+                    task_summary: "Executor cannot declare audit scope".to_owned(),
+                    context_refs: json!([]),
+                    audit_work_items: vec![item],
+                    addresses_audit_run_id: None,
+                })
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(matches!(
+            store
+                .create_worker_run(CreateWorkerRun {
+                    parent_instance_id: connected.instance.instance_id,
+                    role: WorkerRole::Auditor,
+                    task_summary: "Auditor requires at least one item".to_owned(),
+                    context_refs: json!([]),
+                    audit_work_items: Vec::new(),
+                    addresses_audit_run_id: None,
+                })
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
 
         store.pool.close().await;
         remove_database(&path);

@@ -3,13 +3,14 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{InstanceId, RepositoryId, WorkerRunId};
+use super::{InstanceId, RepositoryId, WorkItemId, WorkerRunId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerRole {
     Executor,
     Butler,
+    Auditor,
 }
 
 impl WorkerRole {
@@ -17,6 +18,7 @@ impl WorkerRole {
         match self {
             Self::Executor => "executor",
             Self::Butler => "butler",
+            Self::Auditor => "auditor",
         }
     }
 }
@@ -34,8 +36,9 @@ impl FromStr for WorkerRole {
         match value {
             "executor" => Ok(Self::Executor),
             "butler" => Ok(Self::Butler),
+            "auditor" => Ok(Self::Auditor),
             _ => Err(format!(
-                "unknown worker role '{value}'; expected 'executor' or 'butler'"
+                "unknown worker role '{value}'; expected 'executor', 'butler' or 'auditor'"
             )),
         }
     }
@@ -84,6 +87,21 @@ pub struct CreateWorkerRun {
     pub role: WorkerRole,
     pub task_summary: String,
     pub context_refs: Value,
+    pub audit_work_items: Vec<AuditWorkItemInput>,
+    pub addresses_audit_run_id: Option<WorkerRunId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuditWorkItemInput {
+    pub work_item_id: WorkItemId,
+    pub max_iterations: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditScopeItem {
+    pub work_item_id: WorkItemId,
+    pub iteration: u8,
+    pub max_iterations: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,6 +115,8 @@ pub struct WorkerRun {
     pub context_refs: Value,
     pub result_summary: Option<String>,
     pub error_summary: Option<String>,
+    pub audit_scope: Vec<AuditScopeItem>,
+    pub addresses_audit_run_id: Option<WorkerRunId>,
     pub created_at: String,
     pub activated_at: Option<String>,
     pub last_heartbeat_at: String,
@@ -112,6 +132,7 @@ mod tests {
     fn parses_supported_worker_roles() {
         assert_eq!("executor".parse(), Ok(WorkerRole::Executor));
         assert_eq!("butler".parse(), Ok(WorkerRole::Butler));
+        assert_eq!("auditor".parse(), Ok(WorkerRole::Auditor));
         assert!("orchestrator".parse::<WorkerRole>().is_err());
     }
 }

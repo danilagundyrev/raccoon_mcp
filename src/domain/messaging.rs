@@ -49,6 +49,7 @@ pub enum ArtifactKind {
     ImplementationReport,
     ApiContract,
     Answer,
+    AuditReport,
     Note,
 }
 
@@ -58,6 +59,7 @@ impl ArtifactKind {
             Self::ImplementationReport => "implementation_report",
             Self::ApiContract => "api_contract",
             Self::Answer => "answer",
+            Self::AuditReport => "audit_report",
             Self::Note => "note",
         }
     }
@@ -71,9 +73,10 @@ impl FromStr for ArtifactKind {
             "implementation_report" => Ok(Self::ImplementationReport),
             "api_contract" => Ok(Self::ApiContract),
             "answer" => Ok(Self::Answer),
+            "audit_report" => Ok(Self::AuditReport),
             "note" => Ok(Self::Note),
             _ => Err(format!(
-                "unknown artifact kind '{value}'; expected implementation_report, api_contract, answer or note"
+                "unknown artifact kind '{value}'; expected implementation_report, api_contract, answer, audit_report or note"
             )),
         }
     }

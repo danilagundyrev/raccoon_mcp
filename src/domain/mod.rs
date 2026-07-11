@@ -4,14 +4,18 @@ mod presence;
 mod project;
 mod worker;
 
-pub use ids::{ArtifactId, InstanceId, MessageId, ProjectId, RepositoryId, ThreadId, WorkerRunId};
+pub use ids::{
+    ArtifactId, InstanceId, MessageId, ProjectId, RepositoryId, ThreadId, WorkItemId, WorkerRunId,
+};
 pub use messaging::{
     ActorRef, Artifact, ArtifactKind, DeliveryAck, InboxItem, InboxPage, Message, MessageKind,
     MessageTarget, PublishMessage, PublishResult,
 };
 pub use presence::{AgentInstance, ConnectOrchestrator, ConnectResult, PresenceStatus};
 pub use project::{Project, ProjectOverview, Repository, RepositoryPresence};
-pub use worker::{CreateWorkerRun, WorkerRole, WorkerRun, WorkerRunStatus};
+pub use worker::{
+    AuditScopeItem, AuditWorkItemInput, CreateWorkerRun, WorkerRole, WorkerRun, WorkerRunStatus,
+};
 
 pub(crate) fn validate_key(field_name: &str, value: &str) -> Result<String, String> {
     let value = value.trim();

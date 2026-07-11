@@ -21,9 +21,9 @@ use tokio::net::TcpListener;
 
 use crate::{
     domain::{
-        ActorRef, ArtifactId, ArtifactKind, ConnectOrchestrator, CreateWorkerRun, InstanceId,
-        MessageId, MessageKind, MessageTarget, ProjectId, PublishMessage, RepositoryId, ThreadId,
-        WorkerRole, WorkerRunId, validate_key,
+        ActorRef, ArtifactId, ArtifactKind, AuditWorkItemInput, ConnectOrchestrator,
+        CreateWorkerRun, InstanceId, MessageId, MessageKind, MessageTarget, ProjectId,
+        PublishMessage, RepositoryId, ThreadId, WorkItemId, WorkerRole, WorkerRunId, validate_key,
     },
     store::{SqliteStore, StoreError},
 };
@@ -367,7 +367,7 @@ async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. The child activates and completes/fails that run through MCP; it must not register as a separate repository. Use publish_message for direct or project-wide delivery, list_inbox for compact headers, read_artifact only when full content is needed, and ack_message after processing. Event waiting is not implemented yet.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. Roles are executor, butler and auditor. An auditor receives one or more audit_work_items with a bounded max_iterations policy and publishes an audit_report artifact. If findings require remediation, create exactly one executor with addresses_audit_run_id for the complete audit report; do not create one executor per finding. The child activates and completes/fails its run through MCP and never registers as a repository. Use publish_message for delivery, list_inbox for compact headers, read_artifact only when full content is needed, and ack_message after processing. Event waiting is not implemented yet.",
         })),
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
         "ping" => Ok(json!({})),
@@ -469,6 +469,10 @@ async fn call_tool(
                     role,
                     task_summary,
                     context_refs,
+                    audit_work_items: optional_audit_work_items(&arguments)?,
+                    addresses_audit_run_id: optional_string(&arguments, "addresses_audit_run_id")?
+                        .map(|value| WorkerRunId::parse(&value).map_err(invalid_uuid))
+                        .transpose()?,
                 })
                 .await
                 .map(|value| json!(value))
@@ -664,6 +668,12 @@ async fn read_resource(
                     "The child calls complete_worker_run or fail_worker_run before exiting.",
                     "A worker never calls connect_orchestrator and never creates a repository identity."
                 ],
+                "audit_flow": [
+                    "Create one auditor run for one or more work_item_ids; max_iterations defaults to one and is fixed per item.",
+                    "The auditor publishes one audit_report artifact covering its complete scope.",
+                    "If remediation is needed, create at most one executor run with addresses_audit_run_id; that executor addresses the whole report.",
+                    "A later audit increments each item's iteration independently and is rejected after that item's depth is exhausted."
+                ],
                 "messaging_flow": [
                     "Publish an immutable summary and optional artifact with publish_message.",
                     "Use list_inbox to read pending headers without artifact bodies.",
@@ -799,6 +809,38 @@ fn optional_repository_ids(
             .map(Some),
         Some(_) => Err(invalid_argument(
             "'target_repository_ids' must be an array when provided".to_owned(),
+        )),
+    }
+}
+
+fn optional_audit_work_items(
+    arguments: &JsonMap<String, Value>,
+) -> Result<Vec<AuditWorkItemInput>, RpcError> {
+    match arguments.get("audit_work_items") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                let object = value.as_object().ok_or_else(|| {
+                    invalid_argument("every audit_work_item must be an object".to_owned())
+                })?;
+                let work_item_id = WorkItemId::parse(&require_string(object, "work_item_id")?)
+                    .map_err(invalid_uuid)?;
+                let max_iterations =
+                    optional_nonnegative_i64(object, "max_iterations")?.unwrap_or(1);
+                if !(1..=10).contains(&max_iterations) {
+                    return Err(invalid_argument(
+                        "audit_work_item.max_iterations must be between 1 and 10".to_owned(),
+                    ));
+                }
+                Ok(AuditWorkItemInput {
+                    work_item_id,
+                    max_iterations: max_iterations as u8,
+                })
+            })
+            .collect(),
+        Some(_) => Err(invalid_argument(
+            "'audit_work_items' must be an array when provided".to_owned(),
         )),
     }
 }
@@ -952,19 +994,38 @@ fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) -> Value {
         },
         {
             "name": "create_worker_run",
-            "description": "Create a repository-scoped executor or butler run before spawning a child agent. Pass the returned worker_run_id to that child.",
+            "description": "Create a repository-scoped executor, butler or auditor run before spawning a child agent. Auditor runs accept one or more work items; remediation executors link to exactly one completed audit.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "instance_id": { "type": "string", "format": "uuid" },
-                    "role": { "type": "string", "enum": ["executor", "butler"] },
+                    "role": { "type": "string", "enum": ["executor", "butler", "auditor"] },
                     "task_summary": {
                         "type": "string",
                         "maxLength": max_summary_bytes,
                         "description": "Compact summary. The server enforces max_summary_bytes as UTF-8 bytes; put full context in artifacts."
                     },
-                    "context_refs": { "type": "array", "items": { "type": "object" } }
+                    "context_refs": { "type": "array", "items": { "type": "object" } },
+                    "audit_work_items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "work_item_id": { "type": "string", "format": "uuid" },
+                                "max_iterations": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 }
+                            },
+                            "required": ["work_item_id"]
+                        }
+                    },
+                    "addresses_audit_run_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Only for one executor run that remediates the complete report of a completed auditor run."
+                    }
                 },
                 "required": ["instance_id", "role", "task_summary"]
             },
@@ -1222,7 +1283,7 @@ fn publish_message_schema(max_summary_bytes: u16, max_artifact_bytes: u32) -> Va
             "artifact_kind".to_owned(),
             json!({
                 "type": "string",
-                "enum": ["implementation_report", "api_contract", "answer", "note"],
+                "enum": ["implementation_report", "api_contract", "answer", "audit_report", "note"],
                 "default": "note"
             }),
         ),
