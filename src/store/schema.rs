@@ -42,4 +42,27 @@ CREATE TABLE IF NOT EXISTS agent_instances (
 
 CREATE INDEX IF NOT EXISTS agent_instances_presence_idx
     ON agent_instances(repository_id, status, lease_expires_at);
+
+CREATE TABLE IF NOT EXISTS worker_runs (
+    worker_run_id TEXT PRIMARY KEY NOT NULL,
+    repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+    parent_instance_id TEXT NOT NULL REFERENCES agent_instances(instance_id) ON DELETE RESTRICT,
+    role TEXT NOT NULL CHECK(role IN ('executor', 'butler')),
+    status TEXT NOT NULL CHECK(status IN ('created', 'active', 'completed', 'failed', 'abandoned')),
+    task_summary TEXT NOT NULL,
+    context_refs_json TEXT NOT NULL,
+    result_summary TEXT,
+    error_summary TEXT,
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    last_heartbeat_at TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS worker_runs_repository_status_idx
+    ON worker_runs(repository_id, status, lease_expires_at);
+
+CREATE INDEX IF NOT EXISTS worker_runs_parent_status_idx
+    ON worker_runs(parent_instance_id, status);
 "#;

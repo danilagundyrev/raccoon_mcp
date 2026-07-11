@@ -1,10 +1,12 @@
 mod ids;
 mod presence;
 mod project;
+mod worker;
 
-pub use ids::{InstanceId, ProjectId, RepositoryId};
+pub use ids::{InstanceId, ProjectId, RepositoryId, WorkerRunId};
 pub use presence::{AgentInstance, ConnectOrchestrator, ConnectResult, PresenceStatus};
 pub use project::{Project, ProjectOverview, Repository, RepositoryPresence};
+pub use worker::{CreateWorkerRun, WorkerRole, WorkerRun, WorkerRunStatus};
 
 pub(crate) fn validate_key(field_name: &str, value: &str) -> Result<String, String> {
     let value = value.trim();

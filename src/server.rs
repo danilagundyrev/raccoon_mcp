@@ -20,7 +20,10 @@ use serde_json::{Map as JsonMap, Value, json};
 use tokio::net::TcpListener;
 
 use crate::{
-    domain::{ConnectOrchestrator, InstanceId, ProjectId, validate_key},
+    domain::{
+        ConnectOrchestrator, CreateWorkerRun, InstanceId, ProjectId, WorkerRole, WorkerRunId,
+        validate_key,
+    },
     store::{SqliteStore, StoreError},
 };
 
@@ -34,6 +37,7 @@ struct AppState {
     store: SqliteStore,
     allowed_hosts: Arc<HashSet<String>>,
     database_path: Arc<PathBuf>,
+    max_summary_bytes: u16,
 }
 
 #[derive(Debug)]
@@ -70,12 +74,18 @@ pub async fn run_server(
     port: u16,
     store: SqliteStore,
     database_path: PathBuf,
+    max_summary_bytes: u16,
     allow_hosts: Vec<String>,
 ) -> anyhow::Result<()> {
     let mut allowed_hosts = HashSet::from(["127.0.0.1".to_owned(), "localhost".to_owned()]);
     allowed_hosts.extend(allow_hosts.into_iter().map(|host| host.to_lowercase()));
 
-    let app = router(store, database_path.clone(), allowed_hosts);
+    let app = router(
+        store,
+        database_path.clone(),
+        max_summary_bytes,
+        allowed_hosts,
+    );
     let listener = TcpListener::bind((host.as_str(), port))
         .await
         .with_context(|| format!("failed to bind {host}:{port}"))?;
@@ -93,7 +103,12 @@ pub async fn run_server(
     Ok(())
 }
 
-fn router(store: SqliteStore, database_path: PathBuf, allowed_hosts: HashSet<String>) -> Router {
+fn router(
+    store: SqliteStore,
+    database_path: PathBuf,
+    max_summary_bytes: u16,
+    allowed_hosts: HashSet<String>,
+) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/healthz", get(healthz))
@@ -104,6 +119,7 @@ fn router(store: SqliteStore, database_path: PathBuf, allowed_hosts: HashSet<Str
             store,
             allowed_hosts: Arc::new(allowed_hosts),
             database_path: Arc::new(database_path),
+            max_summary_bytes,
         })
 }
 
@@ -120,6 +136,7 @@ async fn root(State(state): State<AppState>) -> Response {
             "title": SERVER_TITLE,
             "version": SERVER_VERSION,
             "database": state.database_path.to_string_lossy(),
+            "max_summary_bytes": state.max_summary_bytes,
             "mcp_endpoint": "/mcp",
             "health_endpoint": "/healthz",
         }),
@@ -202,14 +219,19 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         }
     };
 
-    let (status, response_body) = handle_rpc_payload(&state.store, payload).await;
+    let (status, response_body) =
+        handle_rpc_payload(&state.store, state.max_summary_bytes, payload).await;
     match response_body {
         Some(body) => json_response(status, body),
         None => no_content_response(status),
     }
 }
 
-async fn handle_rpc_payload(store: &SqliteStore, payload: Value) -> (StatusCode, Option<Value>) {
+async fn handle_rpc_payload(
+    store: &SqliteStore,
+    max_summary_bytes: u16,
+    payload: Value,
+) -> (StatusCode, Option<Value>) {
     if let Value::Array(items) = payload {
         if items.is_empty() {
             return (
@@ -226,7 +248,8 @@ async fn handle_rpc_payload(store: &SqliteStore, payload: Value) -> (StatusCode,
         let mut responses = Vec::new();
         let mut overall_status = StatusCode::OK;
         for item in items {
-            let (item_status, item_response) = handle_single_request(store, item).await;
+            let (item_status, item_response) =
+                handle_single_request(store, max_summary_bytes, item).await;
             if item_status.is_client_error() || item_status.is_server_error() {
                 overall_status = item_status;
             }
@@ -240,11 +263,15 @@ async fn handle_rpc_payload(store: &SqliteStore, payload: Value) -> (StatusCode,
             (overall_status, Some(Value::Array(responses)))
         }
     } else {
-        handle_single_request(store, payload).await
+        handle_single_request(store, max_summary_bytes, payload).await
     }
 }
 
-async fn handle_single_request(store: &SqliteStore, request: Value) -> (StatusCode, Option<Value>) {
+async fn handle_single_request(
+    store: &SqliteStore,
+    max_summary_bytes: u16,
+    request: Value,
+) -> (StatusCode, Option<Value>) {
     let Some(request) = request.as_object() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -290,7 +317,7 @@ async fn handle_single_request(store: &SqliteStore, request: Value) -> (StatusCo
         }
     };
 
-    match dispatch(store, method, &params).await {
+    match dispatch(store, max_summary_bytes, method, &params).await {
         Ok(_) if is_notification => (StatusCode::ACCEPTED, None),
         Ok(result) => (
             StatusCode::OK,
@@ -322,6 +349,7 @@ fn rpc_request_error(
 
 async fn dispatch(
     store: &SqliteStore,
+    max_summary_bytes: u16,
     method: &str,
     params: &JsonMap<String, Value>,
 ) -> Result<Value, RpcError> {
@@ -337,19 +365,19 @@ async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Messaging and work-item APIs are not implemented in this foundation build yet.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. The child activates and completes/fails that run through MCP; it must not register as a separate repository. Messaging APIs are not implemented yet.",
         })),
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-        "tools/call" => call_tool(store, params).await,
+        "tools/list" => Ok(json!({ "tools": tool_definitions(max_summary_bytes) })),
+        "tools/call" => call_tool(store, max_summary_bytes, params).await,
         "resources/list" => Ok(json!({ "resources": list_resources() })),
         "resources/templates/list" => Ok(json!({
             "resourceTemplates": list_resource_templates(),
         })),
         "resources/read" => {
             let uri = require_string(params, "uri")?;
-            read_resource(store, &uri).await
+            read_resource(store, max_summary_bytes, &uri).await
         }
         _ => Err(RpcError::new(-32601, "Method not found")
             .with_status(StatusCode::NOT_FOUND)
@@ -359,6 +387,7 @@ async fn dispatch(
 
 async fn call_tool(
     store: &SqliteStore,
+    max_summary_bytes: u16,
     params: &JsonMap<String, Value>,
 ) -> Result<Value, RpcError> {
     let tool_name = require_string(params, "name")?;
@@ -414,6 +443,69 @@ async fn call_tool(
                 .await
                 .map(|value| json!(value))
         }
+        "create_worker_run" => {
+            let parent_instance_id = parse_instance_id(&arguments)?;
+            let role = require_string(&arguments, "role")?
+                .parse::<WorkerRole>()
+                .map_err(invalid_argument)?;
+            let task_summary = validated_summary(&arguments, "task_summary", max_summary_bytes)?;
+            let context_refs = arguments
+                .get("context_refs")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            if !context_refs.is_array() {
+                return Err(invalid_argument(
+                    "'context_refs' must be an array when provided".to_owned(),
+                ));
+            }
+            store
+                .create_worker_run(CreateWorkerRun {
+                    parent_instance_id,
+                    role,
+                    task_summary,
+                    context_refs,
+                })
+                .await
+                .map(|value| json!(value))
+        }
+        "activate_worker_run" => {
+            let worker_run_id = parse_worker_run_id(&arguments)?;
+            store
+                .activate_worker_run(worker_run_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "heartbeat_worker_run" => {
+            let worker_run_id = parse_worker_run_id(&arguments)?;
+            store
+                .heartbeat_worker_run(worker_run_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "complete_worker_run" => {
+            let worker_run_id = parse_worker_run_id(&arguments)?;
+            let result_summary =
+                validated_summary(&arguments, "result_summary", max_summary_bytes)?;
+            store
+                .complete_worker_run(worker_run_id, &result_summary)
+                .await
+                .map(|value| json!(value))
+        }
+        "fail_worker_run" => {
+            let worker_run_id = parse_worker_run_id(&arguments)?;
+            let error_summary = validated_summary(&arguments, "error_summary", max_summary_bytes)?;
+            store
+                .fail_worker_run(worker_run_id, &error_summary)
+                .await
+                .map(|value| json!(value))
+        }
+        "get_worker_run" => {
+            let worker_run_id = parse_worker_run_id(&arguments)?;
+            store
+                .get_worker_run(worker_run_id)
+                .await
+                .map(|value| json!(value))
+        }
         "list_repositories" => {
             let project_id = parse_project_id(&arguments)?;
             store.list_repositories(project_id).await.map(
@@ -439,7 +531,11 @@ async fn call_tool(
     })
 }
 
-async fn read_resource(store: &SqliteStore, uri: &str) -> Result<Value, RpcError> {
+async fn read_resource(
+    store: &SqliteStore,
+    max_summary_bytes: u16,
+    uri: &str,
+) -> Result<Value, RpcError> {
     if uri == "hub://guide" {
         return Ok(resource_contents(
             uri,
@@ -449,7 +545,15 @@ async fn read_resource(store: &SqliteStore, uri: &str) -> Result<Value, RpcError
                 "recommended_entrypoint": "connect_orchestrator",
                 "identity": ["project", "repository", "orchestrator instance"],
                 "lease_note": "Call heartbeat before lease_expires_at. Repository identity and future mailbox state remain stable across orchestrator instances.",
-                "current_scope": "Foundation build: project, repository and orchestrator presence only.",
+                "max_summary_bytes": max_summary_bytes,
+                "summary_note": "Summary fields are compact UTF-8 indexes. Put full context in an artifact instead of enlarging every inbox/event payload.",
+                "worker_flow": [
+                    "The orchestrator calls create_worker_run before spawning a child.",
+                    "The child receives worker_run_id and calls activate_worker_run.",
+                    "The child calls complete_worker_run or fail_worker_run before exiting.",
+                    "A worker never calls connect_orchestrator and never creates a repository identity."
+                ],
+                "current_scope": "Project/repository presence and minimal worker-run lifecycle. Messaging is not implemented yet.",
             }),
         ));
     }
@@ -491,6 +595,24 @@ fn parse_instance_id(arguments: &JsonMap<String, Value>) -> Result<InstanceId, R
 
 fn parse_project_id(arguments: &JsonMap<String, Value>) -> Result<ProjectId, RpcError> {
     ProjectId::parse(&require_string(arguments, "project_id")?).map_err(invalid_uuid)
+}
+
+fn parse_worker_run_id(arguments: &JsonMap<String, Value>) -> Result<WorkerRunId, RpcError> {
+    WorkerRunId::parse(&require_string(arguments, "worker_run_id")?).map_err(invalid_uuid)
+}
+
+fn validated_summary(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+    max_summary_bytes: u16,
+) -> Result<String, RpcError> {
+    let summary = require_string(arguments, field_name)?;
+    if summary.len() > usize::from(max_summary_bytes) {
+        return Err(invalid_argument(format!(
+            "'{field_name}' must not exceed {max_summary_bytes} UTF-8 bytes"
+        )));
+    }
+    Ok(summary)
 }
 
 fn canonical_repository_path(raw_path: &str) -> Result<String, RpcError> {
@@ -578,7 +700,7 @@ fn tool_result(payload: Value, is_error: bool) -> Value {
     })
 }
 
-fn tool_definitions() -> Value {
+fn tool_definitions(max_summary_bytes: u16) -> Value {
     json!([
         {
             "name": "connect_orchestrator",
@@ -627,6 +749,86 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "create_worker_run",
+            "description": "Create a repository-scoped executor or butler run before spawning a child agent. Pass the returned worker_run_id to that child.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "instance_id": { "type": "string", "format": "uuid" },
+                    "role": { "type": "string", "enum": ["executor", "butler"] },
+                    "task_summary": {
+                        "type": "string",
+                        "maxLength": max_summary_bytes,
+                        "description": "Compact summary. The server enforces max_summary_bytes as UTF-8 bytes; put full context in artifacts."
+                    },
+                    "context_refs": { "type": "array", "items": { "type": "object" } }
+                },
+                "required": ["instance_id", "role", "task_summary"]
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "activate_worker_run",
+            "description": "Activate a worker run from the spawned child before it starts work.",
+            "inputSchema": id_schema("worker_run_id"),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "heartbeat_worker_run",
+            "description": "Extend the lease of an active worker run at a natural work checkpoint.",
+            "inputSchema": id_schema("worker_run_id"),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "complete_worker_run",
+            "description": "Complete an active worker run with a compact result summary.",
+            "inputSchema": worker_finish_schema("result_summary", max_summary_bytes),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "fail_worker_run",
+            "description": "Fail a created or active worker run with a compact error summary.",
+            "inputSchema": worker_finish_schema("error_summary", max_summary_bytes),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "get_worker_run",
+            "description": "Read one worker run without exposing it as a repository or mailbox identity.",
+            "inputSchema": id_schema("worker_run_id"),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "list_repositories",
             "description": "List repositories in a project with their current online instance counts.",
             "inputSchema": id_schema("project_id"),
@@ -659,6 +861,22 @@ fn id_schema(field_name: &str) -> Value {
             field_name: { "type": "string", "format": "uuid" }
         },
         "required": [field_name]
+    })
+}
+
+fn worker_finish_schema(summary_field: &str, max_summary_bytes: u16) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "worker_run_id": { "type": "string", "format": "uuid" },
+            summary_field: {
+                "type": "string",
+                "maxLength": max_summary_bytes,
+                "description": "Compact summary limited by the server's max_summary_bytes setting."
+            }
+        },
+        "required": ["worker_run_id", summary_field]
     })
 }
 
@@ -770,5 +988,20 @@ mod tests {
         let schema = id_schema("project_id");
         assert_eq!(schema["required"][0], "project_id");
         assert_eq!(schema["properties"]["project_id"]["format"], "uuid");
+    }
+
+    #[test]
+    fn summary_limit_counts_utf8_bytes() {
+        let mut arguments = JsonMap::new();
+        arguments.insert("summary".to_owned(), json!("аб"));
+
+        assert!(validated_summary(&arguments, "summary", 3).is_err());
+        assert_eq!(validated_summary(&arguments, "summary", 4).unwrap(), "аб");
+    }
+
+    #[test]
+    fn worker_schema_uses_configured_summary_limit() {
+        let schema = worker_finish_schema("result_summary", 4096);
+        assert_eq!(schema["properties"]["result_summary"]["maxLength"], 4096);
     }
 }

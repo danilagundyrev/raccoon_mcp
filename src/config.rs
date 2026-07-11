@@ -29,10 +29,26 @@ pub struct Args {
     #[arg(
         long,
         default_value_t = 1800,
-        value_parser = clap::value_parser!(u64).range(60..=86400),
+        value_parser = clap::value_parser!(u16).range(60..=65535),
         help = "Default orchestrator lease duration in seconds."
     )]
-    pub lease_seconds: u64,
+    pub lease_seconds: u16,
+
+    #[arg(
+        long,
+        default_value_t = 3600,
+        value_parser = clap::value_parser!(u16).range(60..=65535),
+        help = "Default worker-run lease duration in seconds."
+    )]
+    pub worker_lease_seconds: u16,
+
+    #[arg(
+        long,
+        default_value_t = 1024,
+        value_parser = clap::value_parser!(u16).range(128..=65535),
+        help = "Maximum UTF-8 byte length of compact summary fields."
+    )]
+    pub max_summary_bytes: u16,
 
     #[arg(
         long,

@@ -14,16 +14,29 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     init_logging(&args.log_level);
 
-    let store = SqliteStore::open(&args.database, args.max_db_connections, args.lease_seconds)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to initialize SQLite database at {}",
-                args.database.display()
-            )
-        })?;
+    let store = SqliteStore::open(
+        &args.database,
+        args.max_db_connections,
+        args.lease_seconds,
+        args.worker_lease_seconds,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to initialize SQLite database at {}",
+            args.database.display()
+        )
+    })?;
 
-    server::run_server(args.host, args.port, store, args.database, args.allow_hosts).await
+    server::run_server(
+        args.host,
+        args.port,
+        store,
+        args.database,
+        args.max_summary_bytes,
+        args.allow_hosts,
+    )
+    .await
 }
 
 fn init_logging(level: &str) {

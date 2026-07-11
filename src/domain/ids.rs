@@ -44,3 +44,4 @@ macro_rules! uuid_id {
 uuid_id!(ProjectId);
 uuid_id!(RepositoryId);
 uuid_id!(InstanceId);
+uuid_id!(WorkerRunId);
