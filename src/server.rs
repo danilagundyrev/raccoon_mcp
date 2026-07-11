@@ -456,15 +456,7 @@ async fn call_tool(
                 .parse::<WorkerRole>()
                 .map_err(invalid_argument)?;
             let task_summary = validated_summary(&arguments, "task_summary", max_summary_bytes)?;
-            let context_refs = arguments
-                .get("context_refs")
-                .cloned()
-                .unwrap_or_else(|| json!([]));
-            if !context_refs.is_array() {
-                return Err(invalid_argument(
-                    "'context_refs' must be an array when provided".to_owned(),
-                ));
-            }
+            let context_refs = validated_context_refs(&arguments)?;
             store
                 .create_worker_run(CreateWorkerRun {
                     parent_instance_id,
@@ -606,15 +598,7 @@ async fn call_tool(
             let question_summary =
                 validated_summary(&arguments, "question_summary", max_summary_bytes)?;
             let body = validated_optional_body(&arguments, max_artifact_bytes)?;
-            let context_refs = arguments
-                .get("context_refs")
-                .cloned()
-                .unwrap_or_else(|| json!([]));
-            if !context_refs.is_array() {
-                return Err(invalid_argument(
-                    "'context_refs' must be an array when provided".to_owned(),
-                ));
-            }
+            let context_refs = validated_context_refs(&arguments)?;
             store
                 .ask_repository(AskRepository {
                     actor,
@@ -895,6 +879,27 @@ fn validated_optional_body(
         )));
     }
     Ok(body)
+}
+
+fn validated_context_refs(arguments: &JsonMap<String, Value>) -> Result<Value, RpcError> {
+    match arguments.get("context_refs") {
+        None => Ok(json!([])),
+        Some(Value::Array(values)) => {
+            if let Some((index, _)) = values
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_object())
+            {
+                return Err(invalid_argument(format!(
+                    "'context_refs[{index}]' must be an object"
+                )));
+            }
+            Ok(Value::Array(values.clone()))
+        }
+        Some(_) => Err(invalid_argument(
+            "'context_refs' must be an array when provided".to_owned(),
+        )),
+    }
 }
 
 fn optional_nonnegative_i64(
@@ -1884,6 +1889,33 @@ mod tests {
             "fail_request",
         ] {
             assert!(names.contains(expected));
+        }
+    }
+
+    #[test]
+    fn context_refs_runtime_validation_matches_mcp_schema() {
+        let mut arguments = JsonMap::new();
+        assert_eq!(validated_context_refs(&arguments).unwrap(), json!([]));
+
+        arguments.insert(
+            "context_refs".to_owned(),
+            json!([
+                { "kind": "message", "id": "one" },
+                { "kind": "artifact", "id": "two", "metadata": { "optional": true } }
+            ]),
+        );
+        assert_eq!(
+            validated_context_refs(&arguments)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        for invalid in [json!(null), json!({}), json!([null, 42, "invalid"])] {
+            arguments.insert("context_refs".to_owned(), invalid);
+            assert!(validated_context_refs(&arguments).is_err());
         }
     }
 }
