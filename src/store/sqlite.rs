@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, path::Path, str::FromStr, time::Duration};
+use std::{collections::BTreeSet, path::Path, str::FromStr, sync::Arc, time::Duration};
 
 use chrono::{SecondsFormat, Utc};
 use sqlx::{
@@ -8,6 +8,7 @@ use sqlx::{
     },
 };
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use crate::domain::{
     ActorRef, AgentInstance, Artifact, ArtifactId, ConnectOrchestrator, ConnectResult,
@@ -40,6 +41,7 @@ pub struct SqliteStore {
     pool: SqlitePool,
     lease_duration: chrono::Duration,
     worker_lease_duration: chrono::Duration,
+    write_lock: Arc<Mutex<()>>,
 }
 
 struct ResolvedActor {
@@ -85,6 +87,7 @@ impl SqliteStore {
             pool,
             lease_duration: chrono::Duration::seconds(lease_seconds as i64),
             worker_lease_duration: chrono::Duration::seconds(worker_lease_seconds as i64),
+            write_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -97,6 +100,7 @@ impl SqliteStore {
         &self,
         command: ConnectOrchestrator,
     ) -> Result<ConnectResult, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
         let now = utc_now();
         let lease_expires_at =
             (Utc::now() + self.lease_duration).to_rfc3339_opts(SecondsFormat::Micros, true);
@@ -137,6 +141,7 @@ impl SqliteStore {
     }
 
     pub async fn heartbeat(&self, instance_id: InstanceId) -> Result<AgentInstance, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
         let row = sqlx::query("SELECT status FROM agent_instances WHERE instance_id = ?")
             .bind(instance_id.to_string())
             .fetch_optional(&self.pool)
@@ -170,6 +175,7 @@ impl SqliteStore {
         &self,
         instance_id: InstanceId,
     ) -> Result<AgentInstance, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
         let now = utc_now();
         let result = sqlx::query(
             "UPDATE agent_instances
@@ -200,6 +206,7 @@ impl SqliteStore {
         &self,
         command: CreateWorkerRun,
     ) -> Result<WorkerRun, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
         let now = utc_now();
         let worker_lease_expires_at = lease_deadline(self.worker_lease_duration);
         let orchestrator_lease_expires_at = lease_deadline(self.lease_duration);
@@ -262,7 +269,11 @@ impl SqliteStore {
         &self,
         worker_run_id: WorkerRunId,
     ) -> Result<WorkerRun, StoreError> {
+        let write_guard = self.write_lock.lock().await;
         let worker = self.get_worker_run(worker_run_id).await?;
+        if worker.lease_expires_at <= utc_now() {
+            return Err(expired_worker_lease(worker_run_id));
+        }
         match worker.status {
             WorkerRunStatus::Created => {
                 let now = utc_now();
@@ -281,7 +292,10 @@ impl SqliteStore {
                 .await?;
                 self.get_worker_run(worker_run_id).await
             }
-            WorkerRunStatus::Active => self.heartbeat_worker_run(worker_run_id).await,
+            WorkerRunStatus::Active => {
+                drop(write_guard);
+                self.heartbeat_worker_run(worker_run_id).await
+            }
             status => Err(invalid_worker_transition(worker_run_id, status, "active")),
         }
     }
@@ -290,16 +304,18 @@ impl SqliteStore {
         &self,
         worker_run_id: WorkerRunId,
     ) -> Result<WorkerRun, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
         let now = utc_now();
         let lease_expires_at = lease_deadline(self.worker_lease_duration);
         let result = sqlx::query(
             "UPDATE worker_runs
              SET last_heartbeat_at = ?, lease_expires_at = ?
-             WHERE worker_run_id = ? AND status = 'active'",
+             WHERE worker_run_id = ? AND status = 'active' AND lease_expires_at > ?",
         )
         .bind(&now)
         .bind(lease_expires_at)
         .bind(worker_run_id.to_string())
+        .bind(&now)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
@@ -360,6 +376,7 @@ impl SqliteStore {
         result_summary: Option<&str>,
         error_summary: Option<&str>,
     ) -> Result<WorkerRun, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
         let worker = self.get_worker_run(worker_run_id).await?;
         if worker.status == target_status {
             return Ok(worker);
@@ -418,29 +435,39 @@ impl SqliteStore {
         &self,
         command: PublishMessage,
     ) -> Result<PublishResult, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
         let now = utc_now();
         let mut transaction = self.pool.begin().await?;
         let actor = self
             .resolve_actor(&mut transaction, command.actor, &now)
             .await?;
 
-        let inherited_thread = if let Some(in_reply_to) = command.in_reply_to {
-            let row =
-                sqlx::query("SELECT project_id, thread_id FROM messages WHERE message_id = ?")
-                    .bind(in_reply_to.to_string())
-                    .fetch_optional(&mut *transaction)
-                    .await?
-                    .ok_or_else(|| StoreError::NotFound(format!("message {in_reply_to}")))?;
-            let parent_project_id = ProjectId::parse(row.try_get("project_id")?)?;
-            if parent_project_id != actor.project_id {
-                return Err(StoreError::Conflict(
-                    "in_reply_to message belongs to another project".to_owned(),
-                ));
-            }
-            Some(ThreadId::parse(row.try_get("thread_id")?)?)
-        } else {
-            None
-        };
+        let (inherited_thread, inherited_correlation_id) =
+            if let Some(in_reply_to) = command.in_reply_to {
+                let row = sqlx::query(
+                    "SELECT m.thread_id, m.correlation_id
+                 FROM messages m
+                 WHERE m.message_id = ? AND m.project_id = ?
+                   AND (m.sender_repository_id = ? OR EXISTS (
+                       SELECT 1 FROM deliveries d
+                       WHERE d.message_id = m.message_id
+                         AND d.recipient_repository_id = ?
+                   ))",
+                )
+                .bind(in_reply_to.to_string())
+                .bind(actor.project_id.to_string())
+                .bind(actor.repository_id.to_string())
+                .bind(actor.repository_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("accessible message {in_reply_to}")))?;
+                (
+                    Some(ThreadId::parse(row.try_get("thread_id")?)?),
+                    row.try_get::<Option<String>, _>("correlation_id")?,
+                )
+            } else {
+                (None, None)
+            };
         if let (Some(explicit), Some(inherited)) = (command.thread_id, inherited_thread) {
             if explicit != inherited {
                 return Err(StoreError::Conflict(
@@ -449,6 +476,17 @@ impl SqliteStore {
             }
         }
         let thread_id = command.thread_id.or(inherited_thread).unwrap_or_default();
+        if let (Some(explicit), Some(inherited)) = (
+            command.correlation_id.as_deref(),
+            inherited_correlation_id.as_deref(),
+        ) {
+            if explicit != inherited {
+                return Err(StoreError::Conflict(
+                    "explicit correlation_id does not match the replied-to message".to_owned(),
+                ));
+            }
+        }
+        let correlation_id = command.correlation_id.or(inherited_correlation_id);
 
         let recipient_ids =
             resolve_recipients(&mut transaction, actor.project_id, command.target).await?;
@@ -482,7 +520,7 @@ impl SqliteStore {
             sender_worker_run_id: actor.worker_run_id,
             kind: command.kind,
             thread_id,
-            correlation_id: command.correlation_id,
+            correlation_id,
             in_reply_to: command.in_reply_to,
             summary: command.summary,
             artifact_id: artifact.as_ref().map(|artifact| artifact.artifact_id),
@@ -523,11 +561,7 @@ impl SqliteStore {
         limit: u8,
     ) -> Result<InboxPage, StoreError> {
         let now = utc_now();
-        let mut transaction = self.pool.begin().await?;
-        let actor = self
-            .resolve_actor(&mut transaction, actor_ref, &now)
-            .await?;
-        transaction.commit().await?;
+        let actor = self.resolve_actor_readonly(actor_ref, &now).await?;
 
         let rows = sqlx::query(
             "SELECT d.delivery_id, m.*
@@ -570,11 +604,7 @@ impl SqliteStore {
         message_id: MessageId,
     ) -> Result<Message, StoreError> {
         let now = utc_now();
-        let mut transaction = self.pool.begin().await?;
-        let actor = self
-            .resolve_actor(&mut transaction, actor_ref, &now)
-            .await?;
-        transaction.commit().await?;
+        let actor = self.resolve_actor_readonly(actor_ref, &now).await?;
 
         let row = sqlx::query(
             "SELECT m.* FROM messages m
@@ -600,11 +630,7 @@ impl SqliteStore {
         artifact_id: ArtifactId,
     ) -> Result<Artifact, StoreError> {
         let now = utc_now();
-        let mut transaction = self.pool.begin().await?;
-        let actor = self
-            .resolve_actor(&mut transaction, actor_ref, &now)
-            .await?;
-        transaction.commit().await?;
+        let actor = self.resolve_actor_readonly(actor_ref, &now).await?;
 
         let row = sqlx::query(
             "SELECT a.* FROM artifacts a
@@ -631,6 +657,7 @@ impl SqliteStore {
         actor_ref: ActorRef,
         message_id: MessageId,
     ) -> Result<DeliveryAck, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
         let now = utc_now();
         let mut transaction = self.pool.begin().await?;
         let actor = self
@@ -711,7 +738,7 @@ impl SqliteStore {
             }
             ActorRef::Worker(worker_run_id) => {
                 let row = sqlx::query(
-                    "SELECT w.status, w.repository_id, r.project_id
+                    "SELECT w.status, w.lease_expires_at, w.repository_id, r.project_id
                      FROM worker_runs w
                      JOIN repositories r ON r.repository_id = w.repository_id
                      WHERE w.worker_run_id = ?",
@@ -726,6 +753,10 @@ impl SqliteStore {
                         "worker run {worker_run_id} is '{status}', expected 'active'"
                     )));
                 }
+                let lease_expires_at: String = row.try_get("lease_expires_at")?;
+                if lease_expires_at.as_str() <= now {
+                    return Err(expired_worker_lease(worker_run_id));
+                }
                 sqlx::query(
                     "UPDATE worker_runs
                      SET last_heartbeat_at = ?, lease_expires_at = ?
@@ -736,6 +767,67 @@ impl SqliteStore {
                 .bind(worker_run_id.to_string())
                 .execute(&mut **transaction)
                 .await?;
+                Ok(ResolvedActor {
+                    project_id: ProjectId::parse(row.try_get("project_id")?)?,
+                    repository_id: RepositoryId::parse(row.try_get("repository_id")?)?,
+                    instance_id: None,
+                    worker_run_id: Some(worker_run_id),
+                })
+            }
+        }
+    }
+
+    async fn resolve_actor_readonly(
+        &self,
+        actor_ref: ActorRef,
+        now: &str,
+    ) -> Result<ResolvedActor, StoreError> {
+        match actor_ref {
+            ActorRef::Orchestrator(instance_id) => {
+                let row = sqlx::query(
+                    "SELECT i.status, i.repository_id, r.project_id
+                     FROM agent_instances i
+                     JOIN repositories r ON r.repository_id = i.repository_id
+                     WHERE i.instance_id = ?",
+                )
+                .bind(instance_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("instance {instance_id}")))?;
+                let status: String = row.try_get("status")?;
+                if status == "disconnected" {
+                    return Err(StoreError::Conflict(format!(
+                        "instance {instance_id} is disconnected"
+                    )));
+                }
+                Ok(ResolvedActor {
+                    project_id: ProjectId::parse(row.try_get("project_id")?)?,
+                    repository_id: RepositoryId::parse(row.try_get("repository_id")?)?,
+                    instance_id: Some(instance_id),
+                    worker_run_id: None,
+                })
+            }
+            ActorRef::Worker(worker_run_id) => {
+                let row = sqlx::query(
+                    "SELECT w.status, w.lease_expires_at, w.repository_id, r.project_id
+                     FROM worker_runs w
+                     JOIN repositories r ON r.repository_id = w.repository_id
+                     WHERE w.worker_run_id = ?",
+                )
+                .bind(worker_run_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("worker run {worker_run_id}")))?;
+                let status: String = row.try_get("status")?;
+                if status != "active" {
+                    return Err(StoreError::Conflict(format!(
+                        "worker run {worker_run_id} is '{status}', expected 'active'"
+                    )));
+                }
+                let lease_expires_at: String = row.try_get("lease_expires_at")?;
+                if lease_expires_at.as_str() <= now {
+                    return Err(expired_worker_lease(worker_run_id));
+                }
                 Ok(ResolvedActor {
                     project_id: ProjectId::parse(row.try_get("project_id")?)?,
                     repository_id: RepositoryId::parse(row.try_get("repository_id")?)?,
@@ -1254,6 +1346,12 @@ fn invalid_worker_transition(
     StoreError::Conflict(format!(
         "worker run {worker_run_id} is '{}'; cannot transition to or perform '{requested_action}'",
         current_status.as_str()
+    ))
+}
+
+fn expired_worker_lease(worker_run_id: WorkerRunId) -> StoreError {
+    StoreError::Conflict(format!(
+        "worker run {worker_run_id} lease has expired and cannot be renewed"
     ))
 }
 
@@ -1776,6 +1874,189 @@ mod tests {
         assert_eq!(inbox.items[0].message.summary, "Persist across restart");
 
         reopened.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn concurrent_connects_to_new_project_do_not_lock_database() {
+        let (store, path) = test_store(90).await;
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..20 {
+            let store = store.clone();
+            tasks.spawn(async move {
+                store
+                    .connect_orchestrator(connect_command(
+                        "parallel-project",
+                        &format!("repository-{index}"),
+                        &format!("C:/parallel/repository-{index}"),
+                    ))
+                    .await
+            });
+        }
+
+        let mut connected = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            connected.push(result.unwrap().unwrap());
+        }
+        assert_eq!(connected.len(), 20);
+        let project_id = connected[0].project.project_id;
+        assert!(
+            connected
+                .iter()
+                .all(|result| result.project.project_id == project_id)
+        );
+        assert_eq!(store.list_repositories(project_id).await.unwrap().len(), 20);
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn expired_worker_cannot_renew_or_publish() {
+        let (store, path) = test_store(90).await;
+        let backend = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let worker = store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: backend.instance.instance_id,
+                role: WorkerRole::Executor,
+                task_summary: "Expire this worker".to_owned(),
+                context_refs: json!([]),
+            })
+            .await
+            .unwrap();
+        store
+            .activate_worker_run(worker.worker_run_id)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE worker_runs SET lease_expires_at = ? WHERE worker_run_id = ?")
+            .bind("2000-01-01T00:00:00.000000Z")
+            .bind(worker.worker_run_id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.heartbeat_worker_run(worker.worker_run_id).await,
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(matches!(
+            store
+                .publish_message(publish_command(
+                    ActorRef::Worker(worker.worker_run_id),
+                    MessageTarget::Broadcast,
+                    "Expired worker must not publish",
+                    None,
+                ))
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn repository_cannot_reply_to_message_it_cannot_access() {
+        let (store, path) = test_store(90).await;
+        let backend = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let web = store
+            .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+            .await
+            .unwrap();
+        let android = store
+            .connect_orchestrator(connect_command("project", "android", "C:/project/android"))
+            .await
+            .unwrap();
+        let mut original = publish_command(
+            ActorRef::Orchestrator(backend.instance.instance_id),
+            MessageTarget::Repositories(vec![web.repository.repository_id]),
+            "Private backend-to-web message",
+            None,
+        );
+        original.correlation_id = Some("private-correlation".to_owned());
+        let original = store.publish_message(original).await.unwrap();
+
+        let mut unauthorized_reply = publish_command(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            MessageTarget::Repositories(vec![backend.repository.repository_id]),
+            "Unauthorized reply",
+            None,
+        );
+        unauthorized_reply.in_reply_to = Some(original.message.message_id);
+        assert!(matches!(
+            store.publish_message(unauthorized_reply).await,
+            Err(StoreError::NotFound(_))
+        ));
+
+        let mut authorized_reply = publish_command(
+            ActorRef::Orchestrator(web.instance.instance_id),
+            MessageTarget::Repositories(vec![backend.repository.repository_id]),
+            "Authorized reply",
+            None,
+        );
+        authorized_reply.in_reply_to = Some(original.message.message_id);
+        let reply = store.publish_message(authorized_reply).await.unwrap();
+        assert_eq!(reply.message.thread_id, original.message.thread_id);
+        assert_eq!(
+            reply.message.correlation_id.as_deref(),
+            Some("private-correlation")
+        );
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn inbox_and_content_reads_do_not_renew_actor_lease() {
+        let (store, path) = test_store(90).await;
+        let backend = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let web = store
+            .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+            .await
+            .unwrap();
+        let published = store
+            .publish_message(publish_command(
+                ActorRef::Orchestrator(backend.instance.instance_id),
+                MessageTarget::Repositories(vec![web.repository.repository_id]),
+                "Read without heartbeat",
+                Some("Read-only artifact"),
+            ))
+            .await
+            .unwrap();
+        let before = store.get_instance(web.instance.instance_id).await.unwrap();
+
+        store
+            .list_inbox(ActorRef::Orchestrator(web.instance.instance_id), None, 20)
+            .await
+            .unwrap();
+        store
+            .read_message(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                published.message.message_id,
+            )
+            .await
+            .unwrap();
+        store
+            .read_artifact(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                published.artifact.unwrap().artifact_id,
+            )
+            .await
+            .unwrap();
+        let after = store.get_instance(web.instance.instance_id).await.unwrap();
+        assert_eq!(before.last_heartbeat_at, after.last_heartbeat_at);
+        assert_eq!(before.lease_expires_at, after.lease_expires_at);
+
+        store.pool.close().await;
         remove_database(&path);
     }
 }

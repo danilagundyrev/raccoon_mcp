@@ -245,39 +245,18 @@ async fn handle_rpc_payload(
     max_artifact_bytes: u32,
     payload: Value,
 ) -> (StatusCode, Option<Value>) {
-    if let Value::Array(items) = payload {
-        if items.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Some(json_rpc_error_response(
-                    Value::Null,
-                    -32600,
-                    "Invalid Request",
-                    None,
-                )),
-            );
-        }
-
-        let mut responses = Vec::new();
-        let mut overall_status = StatusCode::OK;
-        for item in items {
-            let (item_status, item_response) =
-                handle_single_request(store, max_summary_bytes, max_artifact_bytes, item).await;
-            if item_status.is_client_error() || item_status.is_server_error() {
-                overall_status = item_status;
-            }
-            if let Some(item_response) = item_response {
-                responses.push(item_response);
-            }
-        }
-        if responses.is_empty() {
-            (StatusCode::ACCEPTED, None)
-        } else {
-            (overall_status, Some(Value::Array(responses)))
-        }
-    } else {
-        handle_single_request(store, max_summary_bytes, max_artifact_bytes, payload).await
+    if payload.is_array() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Some(json_rpc_error_response(
+                Value::Null,
+                -32600,
+                "Invalid Request",
+                Some(json!("JSON-RPC batching is not supported by MCP.")),
+            )),
+        );
     }
+    handle_single_request(store, max_summary_bytes, max_artifact_bytes, payload).await
 }
 
 async fn handle_single_request(
