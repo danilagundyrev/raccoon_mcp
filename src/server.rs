@@ -18,19 +18,22 @@ use axum::{
 };
 use serde_json::{Map as JsonMap, Value, json};
 use tokio::net::TcpListener;
-use uuid::Uuid;
 
-use crate::store::{StoreError, SyncStore};
+use crate::{
+    domain::{ConnectOrchestrator, InstanceId, ProjectId, validate_key},
+    store::{SqliteStore, StoreError},
+};
 
 const PROTOCOL_VERSION: &str = "2026-06-18";
 const SERVER_NAME: &str = "agent-sync-mcp";
-const SERVER_TITLE: &str = "Agent Sync MCP";
-const SERVER_VERSION: &str = "0.1.0";
+const SERVER_TITLE: &str = "Agent Coordination Hub";
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone)]
 struct AppState {
-    store: SyncStore,
+    store: SqliteStore,
     allowed_hosts: Arc<HashSet<String>>,
+    database_path: Arc<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -65,69 +68,48 @@ impl RpcError {
 pub async fn run_server(
     host: String,
     port: u16,
-    store: SyncStore,
-    state_path: PathBuf,
-    session_id: String,
+    store: SqliteStore,
+    database_path: PathBuf,
     allow_hosts: Vec<String>,
 ) -> anyhow::Result<()> {
     let mut allowed_hosts = HashSet::from(["127.0.0.1".to_owned(), "localhost".to_owned()]);
     allowed_hosts.extend(allow_hosts.into_iter().map(|host| host.to_lowercase()));
 
-    let app = router(store, allowed_hosts);
+    let app = router(store, database_path.clone(), allowed_hosts);
     let listener = TcpListener::bind((host.as_str(), port))
         .await
         .with_context(|| format!("failed to bind {host}:{port}"))?;
 
     tracing::info!(
-        "Serving MCP sync server on http://{}:{}/mcp using session '{}' at {}",
+        "Serving MCP coordination hub on http://{}:{}/mcp using {}",
         host,
         listener.local_addr()?.port(),
-        session_id,
-        state_path.display()
+        database_path.display()
     );
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
-pub fn resolve_state_file(
-    state_file: Option<&Path>,
-    session_id: Option<&str>,
-    state_dir: &Path,
-) -> anyhow::Result<(PathBuf, String)> {
-    if let Some(state_file) = state_file {
-        let resolved_path = state_file.to_path_buf();
-        let resolved_session_id = match session_id {
-            Some(session_id) => slugify_session_id(session_id)?,
-            None => resolved_path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "state".to_owned()),
-        };
-        return Ok((resolved_path, resolved_session_id));
-    }
-
-    let raw_session_id = session_id
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("session-{}", &Uuid::new_v4().simple().to_string()[..12]));
-    let resolved_session_id = slugify_session_id(&raw_session_id)?;
-    Ok((
-        state_dir.join(format!("state_{resolved_session_id}.json")),
-        resolved_session_id,
-    ))
-}
-
-fn router(store: SyncStore, allowed_hosts: HashSet<String>) -> Router {
+fn router(store: SqliteStore, database_path: PathBuf, allowed_hosts: HashSet<String>) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/healthz", get(healthz))
         .route("/mcp", get(mcp_get).post(mcp_post))
         .fallback(not_found)
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(AppState {
             store,
             allowed_hosts: Arc::new(allowed_hosts),
+            database_path: Arc::new(database_path),
         })
+}
+
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("Shutdown signal received");
 }
 
 async fn root(State(state): State<AppState>) -> Response {
@@ -137,7 +119,7 @@ async fn root(State(state): State<AppState>) -> Response {
             "server": SERVER_NAME,
             "title": SERVER_TITLE,
             "version": SERVER_VERSION,
-            "session": state.store.get_snapshot()["session"].clone(),
+            "database": state.database_path.to_string_lossy(),
             "mcp_endpoint": "/mcp",
             "health_endpoint": "/healthz",
         }),
@@ -145,15 +127,25 @@ async fn root(State(state): State<AppState>) -> Response {
 }
 
 async fn healthz(State(state): State<AppState>) -> Response {
-    json_response(
-        StatusCode::OK,
-        json!({
-            "status": "ok",
-            "server": SERVER_NAME,
-            "version": SERVER_VERSION,
-            "session": state.store.get_snapshot()["session"].clone(),
-        }),
-    )
+    match state.store.health_check().await {
+        Ok(()) => json_response(
+            StatusCode::OK,
+            json!({
+                "status": "ok",
+                "server": SERVER_NAME,
+                "version": SERVER_VERSION,
+                "database": state.database_path.to_string_lossy(),
+            }),
+        ),
+        Err(error) => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({
+                "status": "unavailable",
+                "server": SERVER_NAME,
+                "error": error.to_string(),
+            }),
+        ),
+    }
 }
 
 async fn mcp_get() -> Response {
@@ -181,22 +173,18 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         }
     }
 
-    let Some(content_length) = headers.get(CONTENT_LENGTH) else {
-        return json_response(
-            StatusCode::LENGTH_REQUIRED,
-            json!({ "error": "Missing Content-Length header." }),
-        );
-    };
-    if content_length
-        .to_str()
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_none()
-    {
-        return json_response(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "Invalid Content-Length header." }),
-        );
+    if let Some(content_length) = headers.get(CONTENT_LENGTH) {
+        if content_length
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_none()
+        {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "Invalid Content-Length header." }),
+            );
+        }
     }
 
     let payload = match serde_json::from_slice::<Value>(&body) {
@@ -221,7 +209,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     }
 }
 
-async fn handle_rpc_payload(store: &SyncStore, payload: Value) -> (StatusCode, Option<Value>) {
+async fn handle_rpc_payload(store: &SqliteStore, payload: Value) -> (StatusCode, Option<Value>) {
     if let Value::Array(items) = payload {
         if items.is_empty() {
             return (
@@ -239,14 +227,13 @@ async fn handle_rpc_payload(store: &SyncStore, payload: Value) -> (StatusCode, O
         let mut overall_status = StatusCode::OK;
         for item in items {
             let (item_status, item_response) = handle_single_request(store, item).await;
-            if item_status.as_u16() >= 400 {
+            if item_status.is_client_error() || item_status.is_server_error() {
                 overall_status = item_status;
             }
             if let Some(item_response) = item_response {
                 responses.push(item_response);
             }
         }
-
         if responses.is_empty() {
             (StatusCode::ACCEPTED, None)
         } else {
@@ -257,7 +244,7 @@ async fn handle_rpc_payload(store: &SyncStore, payload: Value) -> (StatusCode, O
     }
 }
 
-async fn handle_single_request(store: &SyncStore, request: Value) -> (StatusCode, Option<Value>) {
+async fn handle_single_request(store: &SqliteStore, request: Value) -> (StatusCode, Option<Value>) {
     let Some(request) = request.as_object() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -272,118 +259,74 @@ async fn handle_single_request(store: &SyncStore, request: Value) -> (StatusCode
 
     let request_id = request.get("id").cloned().unwrap_or(Value::Null);
     let is_notification = !request.contains_key("id");
-
     if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        let response = json_rpc_error_response(
+        return rpc_request_error(
             request_id,
-            -32600,
-            "Invalid Request",
-            Some(json!("Expected jsonrpc='2.0'.")),
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            if is_notification {
-                None
-            } else {
-                Some(response)
-            },
+            is_notification,
+            RpcError::new(-32600, "Invalid Request").with_data(json!("Expected jsonrpc='2.0'.")),
         );
     }
-
-    let Some(method) = request.get("method").and_then(Value::as_str) else {
-        let response = json_rpc_error_response(
+    let Some(method) = request
+        .get("method")
+        .and_then(Value::as_str)
+        .filter(|method| !method.is_empty())
+    else {
+        return rpc_request_error(
             request_id,
-            -32600,
-            "Invalid Request",
-            Some(json!("Missing method.")),
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            if is_notification {
-                None
-            } else {
-                Some(response)
-            },
+            is_notification,
+            RpcError::new(-32600, "Invalid Request").with_data(json!("Missing method.")),
         );
     };
-    if method.is_empty() {
-        let response = json_rpc_error_response(
-            request_id,
-            -32600,
-            "Invalid Request",
-            Some(json!("Missing method.")),
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            if is_notification {
-                None
-            } else {
-                Some(response)
-            },
-        );
-    }
-
     let params = match request.get("params") {
         None | Some(Value::Null) => JsonMap::new(),
         Some(Value::Object(params)) => params.clone(),
         Some(_) => {
-            let response = json_rpc_error_response(
+            return rpc_request_error(
                 request_id,
-                -32602,
-                "Invalid params",
-                Some(json!("Expected params to be an object.")),
-            );
-            return (
-                StatusCode::BAD_REQUEST,
-                if is_notification {
-                    None
-                } else {
-                    Some(response)
-                },
+                is_notification,
+                RpcError::new(-32602, "Invalid params")
+                    .with_data(json!("Expected params to be an object.")),
             );
         }
     };
 
     match dispatch(store, method, &params).await {
-        Ok(result) => {
-            if is_notification {
-                (StatusCode::ACCEPTED, None)
-            } else {
-                (
-                    StatusCode::OK,
-                    Some(json!({
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "result": result.unwrap_or(Value::Null),
-                    })),
-                )
-            }
-        }
-        Err(error) => {
-            if is_notification {
-                (StatusCode::ACCEPTED, None)
-            } else {
-                (
-                    error.http_status,
-                    Some(json_rpc_error_response(
-                        request_id,
-                        error.code,
-                        &error.message,
-                        error.data,
-                    )),
-                )
-            }
-        }
+        Ok(_) if is_notification => (StatusCode::ACCEPTED, None),
+        Ok(result) => (
+            StatusCode::OK,
+            Some(json!({ "jsonrpc": "2.0", "id": request_id, "result": result })),
+        ),
+        Err(error) => rpc_request_error(request_id, is_notification, error),
+    }
+}
+
+fn rpc_request_error(
+    request_id: Value,
+    is_notification: bool,
+    error: RpcError,
+) -> (StatusCode, Option<Value>) {
+    if is_notification {
+        (StatusCode::ACCEPTED, None)
+    } else {
+        (
+            error.http_status,
+            Some(json_rpc_error_response(
+                request_id,
+                error.code,
+                &error.message,
+                error.data,
+            )),
+        )
     }
 }
 
 async fn dispatch(
-    store: &SyncStore,
+    store: &SqliteStore,
     method: &str,
     params: &JsonMap<String, Value>,
-) -> Result<Option<Value>, RpcError> {
+) -> Result<Value, RpcError> {
     match method {
-        "initialize" => Ok(Some(json!({
+        "initialize" => Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {
                 "tools": { "listChanged": false },
@@ -394,25 +337,19 @@ async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "Recommended entrypoint: call bootstrap_agent_session when the user tells you your role. The server already includes built-in defaults for backend-agent and client-agent. Use configure_agent_profile only if you need to override those defaults. Then use pull_updates with wait=false to check for already queued handoffs, write any returned handoff into the local file, and call ack_handoff only after that write succeeds. If you expected a startup handoff but got none, inspect sync://agent/{agent_name}/mailbox and sync://agent/{agent_name}/history before assuming there is no inbound work. Later use pull_updates with wait=true to block until a peer reply or task completion. End the loop with mark_task_complete when both repos are done.",
-        }))),
-        "notifications/initialized" | "notifications/cancelled" => Ok(None),
-        "ping" => Ok(Some(json!({}))),
-        "tools/list" => Ok(Some(json!({ "tools": tool_definitions() }))),
-        "tools/call" => call_tool(store, params).await.map(Some),
-        "resources/list" => Ok(Some(json!({ "resources": SyncStore::list_resources() }))),
-        "resources/templates/list" => Ok(Some(json!({
-            "resourceTemplates": SyncStore::list_resource_templates(),
-        }))),
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Messaging and work-item APIs are not implemented in this foundation build yet.",
+        })),
+        "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+        "tools/call" => call_tool(store, params).await,
+        "resources/list" => Ok(json!({ "resources": list_resources() })),
+        "resources/templates/list" => Ok(json!({
+            "resourceTemplates": list_resource_templates(),
+        })),
         "resources/read" => {
             let uri = require_string(params, "uri")?;
-            match store.read_resource(&uri) {
-                Ok(resource) => Ok(Some(resource)),
-                Err(StoreError::Invalid(message)) => {
-                    Err(RpcError::new(-32602, "Invalid params").with_data(json!(message)))
-                }
-                Err(error) => Err(internal_error(error)),
-            }
+            read_resource(store, &uri).await
         }
         _ => Err(RpcError::new(-32601, "Method not found")
             .with_status(StatusCode::NOT_FOUND)
@@ -420,137 +357,168 @@ async fn dispatch(
     }
 }
 
-async fn call_tool(store: &SyncStore, params: &JsonMap<String, Value>) -> Result<Value, RpcError> {
+async fn call_tool(
+    store: &SqliteStore,
+    params: &JsonMap<String, Value>,
+) -> Result<Value, RpcError> {
     let tool_name = require_string(params, "name")?;
-    let arguments = match params.get("arguments") {
-        None | Some(Value::Null) => JsonMap::new(),
-        Some(Value::Object(arguments)) => arguments.clone(),
-        Some(_) => {
+    let arguments = optional_arguments(params)?;
+    let result = match tool_name.as_str() {
+        "connect_orchestrator" => {
+            let project_key =
+                validate_key("project_key", &require_string(&arguments, "project_key")?)
+                    .map_err(invalid_argument)?;
+            let repository_key = validate_key(
+                "repository_key",
+                &require_string(&arguments, "repository_key")?,
+            )
+            .map_err(invalid_argument)?;
+            let repository_path = require_string(&arguments, "repository_path")?;
+            let canonical_path = canonical_repository_path(&repository_path)?;
+            let instance_id = optional_string(&arguments, "instance_id")?
+                .map(|value| InstanceId::parse(&value).map_err(invalid_uuid))
+                .transpose()?;
+            let capabilities = arguments
+                .get("capabilities")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if !capabilities.is_object() {
+                return Err(invalid_argument(
+                    "capabilities must be an object".to_owned(),
+                ));
+            }
+            store
+                .connect_orchestrator(ConnectOrchestrator {
+                    project_key,
+                    project_display_name: optional_string(&arguments, "project_display_name")?,
+                    repository_key,
+                    repository_display_name: optional_string(
+                        &arguments,
+                        "repository_display_name",
+                    )?,
+                    canonical_path,
+                    instance_id,
+                    capabilities,
+                })
+                .await
+                .map(|value| json!(value))
+        }
+        "heartbeat" => {
+            let instance_id = parse_instance_id(&arguments)?;
+            store.heartbeat(instance_id).await.map(|value| json!(value))
+        }
+        "disconnect_orchestrator" => {
+            let instance_id = parse_instance_id(&arguments)?;
+            store
+                .disconnect_orchestrator(instance_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "list_repositories" => {
+            let project_id = parse_project_id(&arguments)?;
+            store.list_repositories(project_id).await.map(
+                |repositories| json!({ "project_id": project_id, "repositories": repositories }),
+            )
+        }
+        "get_project_overview" => {
+            let project_id = parse_project_id(&arguments)?;
+            store
+                .project_overview(project_id)
+                .await
+                .map(|value| json!(value))
+        }
+        _ => {
             return Err(RpcError::new(-32602, "Invalid params")
-                .with_data(json!("'arguments' must be an object when provided.")));
+                .with_data(json!(format!("Unknown tool: {tool_name}"))));
         }
     };
 
-    match tool_name.as_str() {
-        "register_agent" => {
-            let result = store
-                .register_agent(
-                    &require_string(&arguments, "agent_name")?,
-                    optional_string(&arguments, "peer_name")?,
-                    optional_string(&arguments, "repo_path")?,
-                    optional_string(&arguments, "handoff_path")?,
-                    optional_object(&arguments, "metadata")?,
-                )
-                .map_err(internal_error)?;
-            Ok(tool_result(result, false))
-        }
-        "configure_agent_profile" => {
-            let result = store
-                .upsert_agent_profile(
-                    &require_string(&arguments, "agent_name")?,
-                    optional_string(&arguments, "peer_name")?,
-                    optional_string(&arguments, "repo_path")?,
-                    optional_string(&arguments, "handoff_path")?,
-                    optional_string(&arguments, "notes")?,
-                    optional_object(&arguments, "metadata")?,
-                )
-                .map_err(internal_error)?;
-            Ok(tool_result(result, false))
-        }
-        "bootstrap_agent_session" => {
-            let register = match arguments.get("register") {
-                None => true,
-                Some(Value::Bool(register)) => *register,
-                Some(_) => {
-                    return Err(RpcError::new(-32602, "Invalid params")
-                        .with_data(json!("'register' must be a boolean when provided.")));
-                }
-            };
-            let result = store
-                .bootstrap_agent_session(
-                    &require_string(&arguments, "agent_name")?,
-                    register,
-                    optional_string(&arguments, "peer_name")?,
-                    optional_string(&arguments, "repo_path")?,
-                    optional_string(&arguments, "handoff_path")?,
-                    optional_object(&arguments, "metadata")?,
-                )
-                .map_err(internal_error)?;
-            Ok(tool_result(result, false))
-        }
-        "send_handoff" => {
-            let result = store.send_handoff(
-                &require_string(&arguments, "from_agent")?,
-                &require_string(&arguments, "to_agent")?,
-                &require_string(&arguments, "content")?,
-                optional_string(&arguments, "file_path")?,
-                optional_string(&arguments, "summary")?,
-                optional_object(&arguments, "metadata")?,
-            );
-            match result {
-                Ok(result) => Ok(tool_result(result, false)),
-                Err(StoreError::Invalid(message)) => {
-                    Ok(tool_result(json!({ "error": message }), true))
-                }
-                Err(error) => Err(internal_error(error)),
-            }
-        }
-        "pull_updates" => {
-            let agent_name = require_string(&arguments, "agent_name")?;
-            let wait = json_truthy(arguments.get("wait"));
-            let timeout_seconds = optional_timeout(&arguments, "timeout_seconds")?;
-            let result = if wait {
-                store
-                    .wait_for_event(&agent_name, timeout_seconds)
-                    .await
-                    .map_err(internal_error)?
-            } else {
-                match store.poll_event(&agent_name).map_err(internal_error)? {
-                    Some(event) => event,
-                    None => json!({
-                        "event_type": "none",
-                        "agent_name": agent_name,
-                        "task_status": store.get_task_status().map_err(internal_error)?["status"].clone(),
-                    }),
-                }
-            };
-            Ok(tool_result(result, false))
-        }
-        "ack_handoff" => {
-            let result = store.ack_handoff(
-                &require_string(&arguments, "agent_name")?,
-                require_int(&arguments, "message_id")?,
-            );
-            match result {
-                Ok(result) => Ok(tool_result(result, false)),
-                Err(StoreError::Invalid(message)) => {
-                    Ok(tool_result(json!({ "error": message }), true))
-                }
-                Err(error) => Err(internal_error(error)),
-            }
-        }
-        "mark_task_complete" => {
-            let task = store
-                .mark_task_complete(
-                    &require_string(&arguments, "agent_name")?,
-                    optional_string(&arguments, "summary")?,
-                    optional_object(&arguments, "metadata")?,
-                )
-                .map_err(internal_error)?;
-            Ok(tool_result(json!({ "task": task }), false))
-        }
-        _ => Err(RpcError::new(-32602, "Invalid params")
-            .with_data(json!(format!("Unknown tool: {tool_name}")))),
+    Ok(match result {
+        Ok(payload) => tool_result(payload, false),
+        Err(error) => tool_result(store_error_payload(&error), true),
+    })
+}
+
+async fn read_resource(store: &SqliteStore, uri: &str) -> Result<Value, RpcError> {
+    if uri == "hub://guide" {
+        return Ok(resource_contents(
+            uri,
+            json!({
+                "server": SERVER_NAME,
+                "workflow": "multi-repository coordination hub",
+                "recommended_entrypoint": "connect_orchestrator",
+                "identity": ["project", "repository", "orchestrator instance"],
+                "lease_note": "Call heartbeat before lease_expires_at. Repository identity and future mailbox state remain stable across orchestrator instances.",
+                "current_scope": "Foundation build: project, repository and orchestrator presence only.",
+            }),
+        ));
+    }
+
+    if let Some(project_id) = uri
+        .strip_prefix("hub://project/")
+        .and_then(|suffix| suffix.strip_suffix("/overview"))
+    {
+        let project_id = ProjectId::parse(project_id).map_err(invalid_uuid)?;
+        let overview = store
+            .project_overview(project_id)
+            .await
+            .map_err(store_rpc_error)?;
+        return Ok(resource_contents(uri, json!(overview)));
+    }
+
+    if let Some(project_id) = uri
+        .strip_prefix("hub://project/")
+        .and_then(|suffix| suffix.strip_suffix("/repositories"))
+    {
+        let project_id = ProjectId::parse(project_id).map_err(invalid_uuid)?;
+        let repositories = store
+            .list_repositories(project_id)
+            .await
+            .map_err(store_rpc_error)?;
+        return Ok(resource_contents(
+            uri,
+            json!({ "project_id": project_id, "repositories": repositories }),
+        ));
+    }
+
+    Err(RpcError::new(-32602, "Invalid params")
+        .with_data(json!(format!("Unsupported resource URI: {uri}"))))
+}
+
+fn parse_instance_id(arguments: &JsonMap<String, Value>) -> Result<InstanceId, RpcError> {
+    InstanceId::parse(&require_string(arguments, "instance_id")?).map_err(invalid_uuid)
+}
+
+fn parse_project_id(arguments: &JsonMap<String, Value>) -> Result<ProjectId, RpcError> {
+    ProjectId::parse(&require_string(arguments, "project_id")?).map_err(invalid_uuid)
+}
+
+fn canonical_repository_path(raw_path: &str) -> Result<String, RpcError> {
+    std::fs::canonicalize(Path::new(raw_path))
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| {
+            invalid_argument(format!(
+                "repository_path '{raw_path}' cannot be canonicalized: {error}"
+            ))
+        })
+}
+
+fn optional_arguments(params: &JsonMap<String, Value>) -> Result<JsonMap<String, Value>, RpcError> {
+    match params.get("arguments") {
+        None | Some(Value::Null) => Ok(JsonMap::new()),
+        Some(Value::Object(arguments)) => Ok(arguments.clone()),
+        Some(_) => Err(invalid_argument(
+            "'arguments' must be an object when provided".to_owned(),
+        )),
     }
 }
 
 fn require_string(params: &JsonMap<String, Value>, field_name: &str) -> Result<String, RpcError> {
     match params.get(field_name).and_then(Value::as_str) {
         Some(value) if !value.trim().is_empty() => Ok(value.to_owned()),
-        _ => Err(RpcError::new(
-            -32602,
-            format!("'{field_name}' must be a non-empty string."),
-        )),
+        _ => Err(invalid_argument(format!(
+            "'{field_name}' must be a non-empty string"
+        ))),
     }
 }
 
@@ -561,84 +529,50 @@ fn optional_string(
     match params.get(field_name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
-        Some(_) => Err(RpcError::new(
-            -32602,
-            format!("'{field_name}' must be a string when provided."),
-        )),
+        Some(_) => Err(invalid_argument(format!(
+            "'{field_name}' must be a string when provided"
+        ))),
     }
 }
 
-fn optional_object(
-    params: &JsonMap<String, Value>,
-    field_name: &str,
-) -> Result<Option<JsonMap<String, Value>>, RpcError> {
-    match params.get(field_name) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Object(value)) => Ok(Some(value.clone())),
-        Some(_) => Err(RpcError::new(
-            -32602,
-            format!("'{field_name}' must be an object when provided."),
-        )),
-    }
+fn invalid_argument(message: String) -> RpcError {
+    RpcError::new(-32602, "Invalid params").with_data(json!(message))
 }
 
-fn optional_timeout(
-    params: &JsonMap<String, Value>,
-    field_name: &str,
-) -> Result<Option<f64>, RpcError> {
-    match params.get(field_name) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(value)) => {
-            let Some(value) = value.as_f64() else {
-                return Err(RpcError::new(
-                    -32602,
-                    format!("'{field_name}' must be a number when provided."),
-                ));
-            };
-            if value < 0.0 {
-                return Err(RpcError::new(
-                    -32602,
-                    format!("'{field_name}' must be zero or greater."),
-                ));
-            }
-            Ok(Some(value))
+fn invalid_uuid(error: uuid::Error) -> RpcError {
+    invalid_argument(format!("invalid UUID: {error}"))
+}
+
+fn store_rpc_error(error: StoreError) -> RpcError {
+    match error {
+        StoreError::NotFound(message) => {
+            RpcError::new(-32602, "Not found").with_data(json!(message))
         }
-        Some(_) => Err(RpcError::new(
-            -32602,
-            format!("'{field_name}' must be a number when provided."),
-        )),
+        StoreError::Conflict(message) => {
+            RpcError::new(-32602, "Invalid state").with_data(json!(message))
+        }
+        other => RpcError::new(-32603, "Internal error").with_data(json!(other.to_string())),
     }
 }
 
-fn require_int(params: &JsonMap<String, Value>, field_name: &str) -> Result<i64, RpcError> {
-    match params.get(field_name).and_then(Value::as_i64) {
-        Some(value) => Ok(value),
-        None => Err(RpcError::new(
-            -32602,
-            format!("'{field_name}' must be an integer."),
-        )),
-    }
-}
-
-fn json_truthy(value: Option<&Value>) -> bool {
-    match value {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(value)) => *value,
-        Some(Value::Number(value)) => value.as_f64().is_some_and(|value| value != 0.0),
-        Some(Value::String(value)) => !value.is_empty(),
-        Some(Value::Array(value)) => !value.is_empty(),
-        Some(Value::Object(value)) => !value.is_empty(),
-    }
+fn store_error_payload(error: &StoreError) -> Value {
+    let code = match error {
+        StoreError::NotFound(_) => "not_found",
+        StoreError::Conflict(_) => "conflict",
+        StoreError::Database(_)
+        | StoreError::Io(_)
+        | StoreError::Json(_)
+        | StoreError::InvalidUuid(_) => "internal_error",
+    };
+    json!({ "error": { "code": code, "message": error.to_string() } })
 }
 
 fn tool_result(payload: Value, is_error: bool) -> Value {
     json!({
-        "content": [
-            {
-                "type": "text",
-                "text": serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned()),
-            }
-        ],
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned()),
+        }],
         "structuredContent": payload,
         "isError": is_error,
     })
@@ -647,156 +581,121 @@ fn tool_result(payload: Value, is_error: bool) -> Value {
 fn tool_definitions() -> Value {
     json!([
         {
-            "name": "configure_agent_profile",
-            "description": "Create or update a persistent override for a role profile such as backend-agent or client-agent. Use this only when you need to change the built-in defaults.",
+            "name": "connect_orchestrator",
+            "description": "Join or reconnect an orchestrator to a user-defined project and repository. This is the required first call.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "agent_name": { "type": "string" },
-                    "peer_name": { "type": "string" },
-                    "repo_path": { "type": "string" },
-                    "handoff_path": { "type": "string" },
-                    "notes": { "type": "string" },
-                    "metadata": { "type": "object" },
+                    "project_key": { "type": "string", "maxLength": 64 },
+                    "project_display_name": { "type": "string" },
+                    "repository_key": { "type": "string", "maxLength": 64 },
+                    "repository_display_name": { "type": "string" },
+                    "repository_path": { "type": "string" },
+                    "instance_id": { "type": "string", "format": "uuid" },
+                    "capabilities": { "type": "object" }
                 },
-                "required": ["agent_name"],
-            },
-            "annotations": {
-                "readOnlyHint": false,
-                "destructiveHint": false,
-                "idempotentHint": true,
-                "openWorldHint": false,
-            },
-        },
-        {
-            "name": "bootstrap_agent_session",
-            "description": "Bootstrap the current session from a built-in or overridden role profile. This is the recommended first tool call when the user tells you your role. If you expect the peer to have already sent a startup handoff, follow with pull_updates and the fallback guidance in sync://guide.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "agent_name": { "type": "string" },
-                    "register": { "type": "boolean" },
-                    "peer_name": { "type": "string" },
-                    "repo_path": { "type": "string" },
-                    "handoff_path": { "type": "string" },
-                    "metadata": { "type": "object" },
-                },
-                "required": ["agent_name"],
-            },
-            "annotations": {
-                "readOnlyHint": false,
-                "destructiveHint": false,
-                "idempotentHint": true,
-                "openWorldHint": false,
-            },
-        },
-        {
-            "name": "register_agent",
-            "description": "Register this Codex instance as an agent. Call once near the start of the session. If the peer already sent a handoff, the result will show pending_messages > 0.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "agent_name": { "type": "string" },
-                    "peer_name": { "type": "string" },
-                    "repo_path": { "type": "string" },
-                    "handoff_path": { "type": "string" },
-                    "metadata": { "type": "object" },
-                },
-                "required": ["agent_name"],
-            },
-            "annotations": {
-                "readOnlyHint": false,
-                "destructiveHint": false,
-                "idempotentHint": true,
-                "openWorldHint": false,
-            },
-        },
-        {
-            "name": "send_handoff",
-            "description": "Send the current handoff note to the peer agent. Call this after writing the local handoff file.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "from_agent": { "type": "string" },
-                    "to_agent": { "type": "string" },
-                    "content": { "type": "string" },
-                    "file_path": { "type": "string" },
-                    "summary": { "type": "string" },
-                    "metadata": { "type": "object" },
-                },
-                "required": ["from_agent", "to_agent", "content"],
+                "required": ["project_key", "repository_key", "repository_path"]
             },
             "annotations": {
                 "readOnlyHint": false,
                 "destructiveHint": false,
                 "idempotentHint": false,
-                "openWorldHint": false,
-            },
+                "openWorldHint": false
+            }
         },
         {
-            "name": "pull_updates",
-            "description": "Check for the next inbound event for this agent. By default this is non-blocking. Set wait=true to block until a handoff arrives, the task is completed, or timeout_seconds elapses. Returned handoffs remain pending until ack_handoff succeeds.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "agent_name": { "type": "string" },
-                    "wait": { "type": "boolean" },
-                    "timeout_seconds": { "type": "number" },
-                },
-                "required": ["agent_name"],
-            },
+            "name": "heartbeat",
+            "description": "Extend an active orchestrator instance lease.",
+            "inputSchema": id_schema("instance_id"),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "disconnect_orchestrator",
+            "description": "Explicitly mark an orchestrator instance disconnected without deleting repository identity.",
+            "inputSchema": id_schema("instance_id"),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "list_repositories",
+            "description": "List repositories in a project with their current online instance counts.",
+            "inputSchema": id_schema("project_id"),
             "annotations": {
                 "readOnlyHint": true,
                 "destructiveHint": false,
-                "idempotentHint": false,
-                "openWorldHint": false,
-            },
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
         },
         {
-            "name": "ack_handoff",
-            "description": "Acknowledge an inbound handoff after writing message.content into the local handoff file. If startup recovery was needed, recover the handoff from mailbox/history first, then ack it.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "agent_name": { "type": "string" },
-                    "message_id": { "type": "integer" },
-                },
-                "required": ["agent_name", "message_id"],
-            },
+            "name": "get_project_overview",
+            "description": "Read the compact project and repository presence overview.",
+            "inputSchema": id_schema("project_id"),
             "annotations": {
-                "readOnlyHint": false,
+                "readOnlyHint": true,
                 "destructiveHint": false,
                 "idempotentHint": true,
-                "openWorldHint": false,
-            },
-        },
-        {
-            "name": "mark_task_complete",
-            "description": "Declare that both agents have no more work to exchange. This wakes any waiting peer with a task_completed event.",
-            "inputSchema": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "agent_name": { "type": "string" },
-                    "summary": { "type": "string" },
-                    "metadata": { "type": "object" },
-                },
-                "required": ["agent_name"],
-            },
-            "annotations": {
-                "readOnlyHint": false,
-                "destructiveHint": false,
-                "idempotentHint": true,
-                "openWorldHint": false,
-            },
-        },
+                "openWorldHint": false
+            }
+        }
     ])
+}
+
+fn id_schema(field_name: &str) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            field_name: { "type": "string", "format": "uuid" }
+        },
+        "required": [field_name]
+    })
+}
+
+fn list_resources() -> Value {
+    json!([{
+        "uri": "hub://guide",
+        "name": "Coordination hub guide",
+        "description": "Machine-readable bootstrap guidance and current implementation scope.",
+        "mimeType": "application/json"
+    }])
+}
+
+fn list_resource_templates() -> Value {
+    json!([
+        {
+            "uriTemplate": "hub://project/{project_id}/overview",
+            "name": "Project overview",
+            "description": "Project metadata and repository presence.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": "hub://project/{project_id}/repositories",
+            "name": "Project repositories",
+            "description": "Repositories and online orchestrator counts.",
+            "mimeType": "application/json"
+        }
+    ])
+}
+
+fn resource_contents(uri: &str, payload: Value) -> Value {
+    json!({
+        "contents": [{
+            "uri": uri,
+            "mimeType": "application/json",
+            "text": serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
+        }]
+    })
 }
 
 fn json_rpc_error_response(
@@ -811,11 +710,7 @@ fn json_rpc_error_response(
     if let Some(data) = data {
         error.insert("data".to_owned(), data);
     }
-    json!({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "error": Value::Object(error),
-    })
+    json!({ "jsonrpc": "2.0", "id": request_id, "error": error })
 }
 
 fn json_response(status: StatusCode, body: Value) -> Response {
@@ -836,30 +731,6 @@ fn no_content_response(status: StatusCode) -> Response {
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
-}
-
-fn internal_error(error: StoreError) -> RpcError {
-    RpcError::new(-32603, "Internal error").with_data(json!(error.to_string()))
-}
-
-fn slugify_session_id(raw_value: &str) -> anyhow::Result<String> {
-    let mut slug = String::with_capacity(raw_value.len());
-    let mut previous_dash = false;
-    for character in raw_value.trim().chars() {
-        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-            slug.push(character);
-            previous_dash = false;
-        } else if !previous_dash {
-            slug.push('-');
-            previous_dash = true;
-        }
-    }
-
-    let slug = slug.trim_matches(['.', '-']).to_owned();
-    if slug.is_empty() {
-        anyhow::bail!("session_id must contain at least one filename-safe character.");
-    }
-    Ok(slug)
 }
 
 fn origin_allowed(origin: &str, allowed_hosts: &HashSet<String>) -> bool {
@@ -888,24 +759,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_state_file_uses_session_specific_filename() {
-        let state_dir = PathBuf::from("tmp");
-        let (state_path, session_id) =
-            resolve_state_file(None, Some("task-42"), &state_dir).unwrap();
-
-        assert_eq!(session_id, "task-42");
-        assert_eq!(state_path, PathBuf::from("tmp").join("state_task-42.json"));
-    }
-
-    #[test]
-    fn slug_rejects_empty_session_id() {
-        assert!(slugify_session_id(" @@@ ").is_err());
-    }
-
-    #[test]
     fn origin_check_uses_hostname() {
         let allowed_hosts = HashSet::from(["localhost".to_owned()]);
         assert!(origin_allowed("http://localhost:8765", &allowed_hosts));
         assert!(!origin_allowed("http://example.com", &allowed_hosts));
+    }
+
+    #[test]
+    fn resource_template_schema_contains_dynamic_id_key() {
+        let schema = id_schema("project_id");
+        assert_eq!(schema["required"][0], "project_id");
+        assert_eq!(schema["properties"]["project_id"]["format"], "uuid");
     }
 }
