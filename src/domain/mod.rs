@@ -1,9 +1,14 @@
 mod ids;
+mod messaging;
 mod presence;
 mod project;
 mod worker;
 
-pub use ids::{InstanceId, ProjectId, RepositoryId, WorkerRunId};
+pub use ids::{ArtifactId, InstanceId, MessageId, ProjectId, RepositoryId, ThreadId, WorkerRunId};
+pub use messaging::{
+    ActorRef, Artifact, ArtifactKind, DeliveryAck, InboxItem, InboxPage, Message, MessageKind,
+    MessageTarget, PublishMessage, PublishResult,
+};
 pub use presence::{AgentInstance, ConnectOrchestrator, ConnectResult, PresenceStatus};
 pub use project::{Project, ProjectOverview, Repository, RepositoryPresence};
 pub use worker::{CreateWorkerRun, WorkerRole, WorkerRun, WorkerRunStatus};

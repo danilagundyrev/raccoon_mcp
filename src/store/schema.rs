@@ -65,4 +65,62 @@ CREATE INDEX IF NOT EXISTS worker_runs_repository_status_idx
 
 CREATE INDEX IF NOT EXISTS worker_runs_parent_status_idx
     ON worker_runs(parent_instance_id, status);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    artifact_id TEXT PRIMARY KEY NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    producer_repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+    producer_instance_id TEXT REFERENCES agent_instances(instance_id) ON DELETE SET NULL,
+    producer_worker_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE SET NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('implementation_report', 'api_contract', 'answer', 'note')),
+    title TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS artifacts_project_created_idx
+    ON artifacts(project_id, created_at);
+
+CREATE TABLE IF NOT EXISTS messages (
+    message_id TEXT PRIMARY KEY NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    sender_repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+    sender_instance_id TEXT REFERENCES agent_instances(instance_id) ON DELETE SET NULL,
+    sender_worker_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE SET NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('report', 'announcement', 'command')),
+    thread_id TEXT NOT NULL,
+    correlation_id TEXT,
+    in_reply_to TEXT REFERENCES messages(message_id) ON DELETE SET NULL,
+    summary TEXT NOT NULL,
+    artifact_id TEXT REFERENCES artifacts(artifact_id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS messages_project_thread_idx
+    ON messages(project_id, thread_id, created_at);
+
+CREATE INDEX IF NOT EXISTS messages_correlation_idx
+    ON messages(project_id, correlation_id);
+
+CREATE TABLE IF NOT EXISTS message_targets (
+    message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+    PRIMARY KEY(message_id, repository_id)
+);
+
+CREATE TABLE IF NOT EXISTS deliveries (
+    delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    recipient_repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'acked')),
+    created_at TEXT NOT NULL,
+    acked_at TEXT,
+    acked_by_instance_id TEXT REFERENCES agent_instances(instance_id) ON DELETE SET NULL,
+    acked_by_worker_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE SET NULL,
+    UNIQUE(message_id, recipient_repository_id)
+);
+
+CREATE INDEX IF NOT EXISTS deliveries_inbox_idx
+    ON deliveries(recipient_repository_id, status, delivery_id);
 "#;

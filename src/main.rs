@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
         store,
         args.database,
         args.max_summary_bytes,
+        args.max_artifact_bytes,
         args.allow_hosts,
     )
     .await

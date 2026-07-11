@@ -52,6 +52,14 @@ pub struct Args {
 
     #[arg(
         long,
+        default_value_t = 524_288,
+        value_parser = clap::value_parser!(u32).range(1024..=1_048_576),
+        help = "Maximum UTF-8 byte length of one artifact body."
+    )]
+    pub max_artifact_bytes: u32,
+
+    #[arg(
+        long,
         default_value = "INFO",
         value_parser = ["DEBUG", "INFO", "WARNING", "ERROR"],
         help = "Logging level."

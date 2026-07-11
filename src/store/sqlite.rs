@@ -1,4 +1,4 @@
-use std::{path::Path, str::FromStr, time::Duration};
+use std::{collections::BTreeSet, path::Path, str::FromStr, time::Duration};
 
 use chrono::{SecondsFormat, Utc};
 use sqlx::{
@@ -10,9 +10,11 @@ use sqlx::{
 use thiserror::Error;
 
 use crate::domain::{
-    AgentInstance, ConnectOrchestrator, ConnectResult, CreateWorkerRun, InstanceId, PresenceStatus,
-    Project, ProjectId, ProjectOverview, Repository, RepositoryId, RepositoryPresence, WorkerRun,
-    WorkerRunId, WorkerRunStatus,
+    ActorRef, AgentInstance, Artifact, ArtifactId, ConnectOrchestrator, ConnectResult,
+    CreateWorkerRun, DeliveryAck, InboxItem, InboxPage, InstanceId, Message, MessageId,
+    MessageTarget, PresenceStatus, Project, ProjectId, ProjectOverview, PublishMessage,
+    PublishResult, Repository, RepositoryId, RepositoryPresence, ThreadId, WorkerRun, WorkerRunId,
+    WorkerRunStatus,
 };
 
 use super::schema::{CREATE_SCHEMA, SCHEMA_VERSION};
@@ -38,6 +40,13 @@ pub struct SqliteStore {
     pool: SqlitePool,
     lease_duration: chrono::Duration,
     worker_lease_duration: chrono::Duration,
+}
+
+struct ResolvedActor {
+    project_id: ProjectId,
+    repository_id: RepositoryId,
+    instance_id: Option<InstanceId>,
+    worker_run_id: Option<WorkerRunId>,
 }
 
 impl SqliteStore {
@@ -121,7 +130,7 @@ impl SqliteStore {
                 "Inspect the project overview to discover peer repositories.".to_owned(),
                 "Before spawning a child, call create_worker_run and pass its worker_run_id to the child."
                     .to_owned(),
-                "Mailbox and message tools will be introduced in the next implementation step."
+                "Use list_inbox for compact pending headers and read_artifact only when full content is needed."
                     .to_owned(),
             ],
         })
@@ -405,6 +414,338 @@ impl SqliteStore {
         }
     }
 
+    pub async fn publish_message(
+        &self,
+        command: PublishMessage,
+    ) -> Result<PublishResult, StoreError> {
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(&mut transaction, command.actor, &now)
+            .await?;
+
+        let inherited_thread = if let Some(in_reply_to) = command.in_reply_to {
+            let row =
+                sqlx::query("SELECT project_id, thread_id FROM messages WHERE message_id = ?")
+                    .bind(in_reply_to.to_string())
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .ok_or_else(|| StoreError::NotFound(format!("message {in_reply_to}")))?;
+            let parent_project_id = ProjectId::parse(row.try_get("project_id")?)?;
+            if parent_project_id != actor.project_id {
+                return Err(StoreError::Conflict(
+                    "in_reply_to message belongs to another project".to_owned(),
+                ));
+            }
+            Some(ThreadId::parse(row.try_get("thread_id")?)?)
+        } else {
+            None
+        };
+        if let (Some(explicit), Some(inherited)) = (command.thread_id, inherited_thread) {
+            if explicit != inherited {
+                return Err(StoreError::Conflict(
+                    "explicit thread_id does not match the replied-to message".to_owned(),
+                ));
+            }
+        }
+        let thread_id = command.thread_id.or(inherited_thread).unwrap_or_default();
+
+        let recipient_ids =
+            resolve_recipients(&mut transaction, actor.project_id, command.target).await?;
+
+        let artifact = if let Some(content) = command.body {
+            let artifact = Artifact {
+                artifact_id: ArtifactId::new(),
+                project_id: actor.project_id,
+                producer_repository_id: actor.repository_id,
+                producer_instance_id: actor.instance_id,
+                producer_worker_run_id: actor.worker_run_id,
+                kind: command.artifact_kind,
+                title: command
+                    .artifact_title
+                    .unwrap_or_else(|| command.summary.clone()),
+                content_type: command.content_type,
+                content,
+                created_at: now.clone(),
+            };
+            insert_artifact(&mut transaction, &artifact).await?;
+            Some(artifact)
+        } else {
+            None
+        };
+
+        let message = Message {
+            message_id: MessageId::new(),
+            project_id: actor.project_id,
+            sender_repository_id: actor.repository_id,
+            sender_instance_id: actor.instance_id,
+            sender_worker_run_id: actor.worker_run_id,
+            kind: command.kind,
+            thread_id,
+            correlation_id: command.correlation_id,
+            in_reply_to: command.in_reply_to,
+            summary: command.summary,
+            artifact_id: artifact.as_ref().map(|artifact| artifact.artifact_id),
+            created_at: now.clone(),
+        };
+        insert_message(&mut transaction, &message).await?;
+        for recipient_id in &recipient_ids {
+            sqlx::query("INSERT INTO message_targets(message_id, repository_id) VALUES (?, ?)")
+                .bind(message.message_id.to_string())
+                .bind(recipient_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(
+                "INSERT INTO deliveries(
+                     message_id, recipient_repository_id, status, created_at,
+                     acked_at, acked_by_instance_id, acked_by_worker_run_id
+                 ) VALUES (?, ?, 'pending', ?, NULL, NULL, NULL)",
+            )
+            .bind(message.message_id.to_string())
+            .bind(recipient_id.to_string())
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        Ok(PublishResult {
+            message,
+            artifact,
+            recipient_count: recipient_ids.len(),
+        })
+    }
+
+    pub async fn list_inbox(
+        &self,
+        actor_ref: ActorRef,
+        after_delivery_id: Option<i64>,
+        limit: u8,
+    ) -> Result<InboxPage, StoreError> {
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(&mut transaction, actor_ref, &now)
+            .await?;
+        transaction.commit().await?;
+
+        let rows = sqlx::query(
+            "SELECT d.delivery_id, m.*
+             FROM deliveries d
+             JOIN messages m ON m.message_id = d.message_id
+             WHERE d.recipient_repository_id = ?
+               AND d.status = 'pending'
+               AND d.delivery_id > ?
+             ORDER BY d.delivery_id
+             LIMIT ?",
+        )
+        .bind(actor.repository_id.to_string())
+        .bind(after_delivery_id.unwrap_or(0))
+        .bind(i64::from(limit) + 1)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let has_more = rows.len() > usize::from(limit);
+        let items = rows
+            .iter()
+            .take(usize::from(limit))
+            .map(|row| {
+                Ok(InboxItem {
+                    delivery_id: row.try_get("delivery_id")?,
+                    message: message_from_row(row)?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let next_cursor = items.last().map(|item| item.delivery_id);
+        Ok(InboxPage {
+            items,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    pub async fn read_message(
+        &self,
+        actor_ref: ActorRef,
+        message_id: MessageId,
+    ) -> Result<Message, StoreError> {
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(&mut transaction, actor_ref, &now)
+            .await?;
+        transaction.commit().await?;
+
+        let row = sqlx::query(
+            "SELECT m.* FROM messages m
+             WHERE m.message_id = ?
+               AND (m.sender_repository_id = ? OR EXISTS (
+                   SELECT 1 FROM deliveries d
+                   WHERE d.message_id = m.message_id
+                     AND d.recipient_repository_id = ?
+               ))",
+        )
+        .bind(message_id.to_string())
+        .bind(actor.repository_id.to_string())
+        .bind(actor.repository_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("accessible message {message_id}")))?;
+        message_from_row(&row)
+    }
+
+    pub async fn read_artifact(
+        &self,
+        actor_ref: ActorRef,
+        artifact_id: ArtifactId,
+    ) -> Result<Artifact, StoreError> {
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(&mut transaction, actor_ref, &now)
+            .await?;
+        transaction.commit().await?;
+
+        let row = sqlx::query(
+            "SELECT a.* FROM artifacts a
+             WHERE a.artifact_id = ?
+               AND (a.producer_repository_id = ? OR EXISTS (
+                   SELECT 1
+                   FROM messages m
+                   JOIN deliveries d ON d.message_id = m.message_id
+                   WHERE m.artifact_id = a.artifact_id
+                     AND d.recipient_repository_id = ?
+               ))",
+        )
+        .bind(artifact_id.to_string())
+        .bind(actor.repository_id.to_string())
+        .bind(actor.repository_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("accessible artifact {artifact_id}")))?;
+        artifact_from_row(&row)
+    }
+
+    pub async fn ack_message(
+        &self,
+        actor_ref: ActorRef,
+        message_id: MessageId,
+    ) -> Result<DeliveryAck, StoreError> {
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(&mut transaction, actor_ref, &now)
+            .await?;
+        let existing = sqlx::query(
+            "SELECT * FROM deliveries
+             WHERE message_id = ? AND recipient_repository_id = ?",
+        )
+        .bind(message_id.to_string())
+        .bind(actor.repository_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("inbox message {message_id}")))?;
+        let status: String = existing.try_get("status")?;
+        if status == "pending" {
+            sqlx::query(
+                "UPDATE deliveries
+                 SET status = 'acked', acked_at = ?, acked_by_instance_id = ?,
+                     acked_by_worker_run_id = ?
+                 WHERE delivery_id = ? AND status = 'pending'",
+            )
+            .bind(&now)
+            .bind(actor.instance_id.map(|id| id.to_string()))
+            .bind(actor.worker_run_id.map(|id| id.to_string()))
+            .bind(existing.try_get::<i64, _>("delivery_id")?)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        let row = sqlx::query("SELECT * FROM deliveries WHERE delivery_id = ?")
+            .bind(existing.try_get::<i64, _>("delivery_id")?)
+            .fetch_one(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        delivery_ack_from_row(&row)
+    }
+
+    async fn resolve_actor(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        actor_ref: ActorRef,
+        now: &str,
+    ) -> Result<ResolvedActor, StoreError> {
+        match actor_ref {
+            ActorRef::Orchestrator(instance_id) => {
+                let row = sqlx::query(
+                    "SELECT i.status, i.repository_id, r.project_id
+                     FROM agent_instances i
+                     JOIN repositories r ON r.repository_id = i.repository_id
+                     WHERE i.instance_id = ?",
+                )
+                .bind(instance_id.to_string())
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("instance {instance_id}")))?;
+                let status: String = row.try_get("status")?;
+                if status == "disconnected" {
+                    return Err(StoreError::Conflict(format!(
+                        "instance {instance_id} is disconnected"
+                    )));
+                }
+                sqlx::query(
+                    "UPDATE agent_instances
+                     SET status = 'online', last_heartbeat_at = ?, lease_expires_at = ?
+                     WHERE instance_id = ?",
+                )
+                .bind(now)
+                .bind(lease_deadline(self.lease_duration))
+                .bind(instance_id.to_string())
+                .execute(&mut **transaction)
+                .await?;
+                Ok(ResolvedActor {
+                    project_id: ProjectId::parse(row.try_get("project_id")?)?,
+                    repository_id: RepositoryId::parse(row.try_get("repository_id")?)?,
+                    instance_id: Some(instance_id),
+                    worker_run_id: None,
+                })
+            }
+            ActorRef::Worker(worker_run_id) => {
+                let row = sqlx::query(
+                    "SELECT w.status, w.repository_id, r.project_id
+                     FROM worker_runs w
+                     JOIN repositories r ON r.repository_id = w.repository_id
+                     WHERE w.worker_run_id = ?",
+                )
+                .bind(worker_run_id.to_string())
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("worker run {worker_run_id}")))?;
+                let status: String = row.try_get("status")?;
+                if status != "active" {
+                    return Err(StoreError::Conflict(format!(
+                        "worker run {worker_run_id} is '{status}', expected 'active'"
+                    )));
+                }
+                sqlx::query(
+                    "UPDATE worker_runs
+                     SET last_heartbeat_at = ?, lease_expires_at = ?
+                     WHERE worker_run_id = ? AND status = 'active'",
+                )
+                .bind(now)
+                .bind(lease_deadline(self.worker_lease_duration))
+                .bind(worker_run_id.to_string())
+                .execute(&mut **transaction)
+                .await?;
+                Ok(ResolvedActor {
+                    project_id: ProjectId::parse(row.try_get("project_id")?)?,
+                    repository_id: RepositoryId::parse(row.try_get("repository_id")?)?,
+                    instance_id: None,
+                    worker_run_id: Some(worker_run_id),
+                })
+            }
+        }
+    }
+
     pub async fn list_repositories(
         &self,
         project_id: ProjectId,
@@ -453,6 +794,110 @@ impl SqliteStore {
             repositories,
         })
     }
+}
+
+async fn resolve_recipients(
+    transaction: &mut Transaction<'_, Sqlite>,
+    project_id: ProjectId,
+    target: MessageTarget,
+) -> Result<Vec<RepositoryId>, StoreError> {
+    match target {
+        MessageTarget::Broadcast => {
+            let rows = sqlx::query(
+                "SELECT repository_id FROM repositories
+                 WHERE project_id = ? ORDER BY repository_key",
+            )
+            .bind(project_id.to_string())
+            .fetch_all(&mut **transaction)
+            .await?;
+            rows.iter()
+                .map(|row| Ok(RepositoryId::parse(row.try_get("repository_id")?)?))
+                .collect()
+        }
+        MessageTarget::Repositories(repository_ids) => {
+            let unique: BTreeSet<String> = repository_ids
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect();
+            if unique.is_empty() {
+                return Err(StoreError::Conflict(
+                    "at least one target repository is required".to_owned(),
+                ));
+            }
+            let mut recipients = Vec::with_capacity(unique.len());
+            for repository_id in unique {
+                let row =
+                    sqlx::query("SELECT project_id FROM repositories WHERE repository_id = ?")
+                        .bind(&repository_id)
+                        .fetch_optional(&mut **transaction)
+                        .await?
+                        .ok_or_else(|| {
+                            StoreError::NotFound(format!("repository {repository_id}"))
+                        })?;
+                let recipient_project_id = ProjectId::parse(row.try_get("project_id")?)?;
+                if recipient_project_id != project_id {
+                    return Err(StoreError::Conflict(format!(
+                        "repository {repository_id} belongs to another project"
+                    )));
+                }
+                recipients.push(RepositoryId::parse(&repository_id)?);
+            }
+            Ok(recipients)
+        }
+    }
+}
+
+async fn insert_artifact(
+    transaction: &mut Transaction<'_, Sqlite>,
+    artifact: &Artifact,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO artifacts(
+             artifact_id, project_id, producer_repository_id, producer_instance_id,
+             producer_worker_run_id, kind, title, content_type, content, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(artifact.artifact_id.to_string())
+    .bind(artifact.project_id.to_string())
+    .bind(artifact.producer_repository_id.to_string())
+    .bind(artifact.producer_instance_id.map(|id| id.to_string()))
+    .bind(artifact.producer_worker_run_id.map(|id| id.to_string()))
+    .bind(artifact.kind.as_str())
+    .bind(&artifact.title)
+    .bind(&artifact.content_type)
+    .bind(&artifact.content)
+    .bind(&artifact.created_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn insert_message(
+    transaction: &mut Transaction<'_, Sqlite>,
+    message: &Message,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO messages(
+             message_id, project_id, sender_repository_id, sender_instance_id,
+             sender_worker_run_id, kind, thread_id, correlation_id, in_reply_to,
+             summary, artifact_id, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(message.message_id.to_string())
+    .bind(message.project_id.to_string())
+    .bind(message.sender_repository_id.to_string())
+    .bind(message.sender_instance_id.map(|id| id.to_string()))
+    .bind(message.sender_worker_run_id.map(|id| id.to_string()))
+    .bind(message.kind.as_str())
+    .bind(message.thread_id.to_string())
+    .bind(&message.correlation_id)
+    .bind(message.in_reply_to.map(|id| id.to_string()))
+    .bind(&message.summary)
+    .bind(message.artifact_id.map(|id| id.to_string()))
+    .bind(&message.created_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 async fn ensure_schema_version(pool: &SqlitePool) -> Result<(), StoreError> {
@@ -726,6 +1171,81 @@ fn worker_run_from_row(row: &SqliteRow) -> Result<WorkerRun, StoreError> {
     })
 }
 
+fn message_from_row(row: &SqliteRow) -> Result<Message, StoreError> {
+    let kind: String = row.try_get("kind")?;
+    Ok(Message {
+        message_id: MessageId::parse(row.try_get("message_id")?)?,
+        project_id: ProjectId::parse(row.try_get("project_id")?)?,
+        sender_repository_id: RepositoryId::parse(row.try_get("sender_repository_id")?)?,
+        sender_instance_id: parse_optional_id(
+            row.try_get("sender_instance_id")?,
+            InstanceId::parse,
+        )?,
+        sender_worker_run_id: parse_optional_id(
+            row.try_get("sender_worker_run_id")?,
+            WorkerRunId::parse,
+        )?,
+        kind: kind.parse().map_err(StoreError::Conflict)?,
+        thread_id: ThreadId::parse(row.try_get("thread_id")?)?,
+        correlation_id: row.try_get("correlation_id")?,
+        in_reply_to: parse_optional_id(row.try_get("in_reply_to")?, MessageId::parse)?,
+        summary: row.try_get("summary")?,
+        artifact_id: parse_optional_id(row.try_get("artifact_id")?, ArtifactId::parse)?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn artifact_from_row(row: &SqliteRow) -> Result<Artifact, StoreError> {
+    let kind: String = row.try_get("kind")?;
+    Ok(Artifact {
+        artifact_id: ArtifactId::parse(row.try_get("artifact_id")?)?,
+        project_id: ProjectId::parse(row.try_get("project_id")?)?,
+        producer_repository_id: RepositoryId::parse(row.try_get("producer_repository_id")?)?,
+        producer_instance_id: parse_optional_id(
+            row.try_get("producer_instance_id")?,
+            InstanceId::parse,
+        )?,
+        producer_worker_run_id: parse_optional_id(
+            row.try_get("producer_worker_run_id")?,
+            WorkerRunId::parse,
+        )?,
+        kind: kind.parse().map_err(StoreError::Conflict)?,
+        title: row.try_get("title")?,
+        content_type: row.try_get("content_type")?,
+        content: row.try_get("content")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn delivery_ack_from_row(row: &SqliteRow) -> Result<DeliveryAck, StoreError> {
+    Ok(DeliveryAck {
+        delivery_id: row.try_get("delivery_id")?,
+        message_id: MessageId::parse(row.try_get("message_id")?)?,
+        recipient_repository_id: RepositoryId::parse(row.try_get("recipient_repository_id")?)?,
+        status: row.try_get("status")?,
+        acked_at: row.try_get("acked_at")?,
+        acked_by_instance_id: parse_optional_id(
+            row.try_get("acked_by_instance_id")?,
+            InstanceId::parse,
+        )?,
+        acked_by_worker_run_id: parse_optional_id(
+            row.try_get("acked_by_worker_run_id")?,
+            WorkerRunId::parse,
+        )?,
+    })
+}
+
+fn parse_optional_id<T>(
+    value: Option<String>,
+    parser: impl FnOnce(&str) -> Result<T, uuid::Error>,
+) -> Result<Option<T>, StoreError> {
+    value
+        .as_deref()
+        .map(parser)
+        .transpose()
+        .map_err(StoreError::InvalidUuid)
+}
+
 fn invalid_worker_transition(
     worker_run_id: WorkerRunId,
     current_status: WorkerRunStatus,
@@ -778,6 +1298,27 @@ mod tests {
             canonical_path: path.to_owned(),
             instance_id: None,
             capabilities: json!({ "spawning": true }),
+        }
+    }
+
+    fn publish_command(
+        actor: ActorRef,
+        target: MessageTarget,
+        summary: &str,
+        body: Option<&str>,
+    ) -> PublishMessage {
+        PublishMessage {
+            actor,
+            kind: crate::domain::MessageKind::Report,
+            target,
+            summary: summary.to_owned(),
+            body: body.map(str::to_owned),
+            artifact_kind: crate::domain::ArtifactKind::ImplementationReport,
+            artifact_title: None,
+            content_type: "text/markdown".to_owned(),
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
         }
     }
 
@@ -971,6 +1512,270 @@ mod tests {
         ));
 
         store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn direct_message_exposes_header_then_artifact_and_ack_is_idempotent() {
+        let (store, path) = test_store(90).await;
+        let backend = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let web = store
+            .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+            .await
+            .unwrap();
+        let android = store
+            .connect_orchestrator(connect_command("project", "android", "C:/project/android"))
+            .await
+            .unwrap();
+
+        let published = store
+            .publish_message(publish_command(
+                ActorRef::Orchestrator(backend.instance.instance_id),
+                MessageTarget::Repositories(vec![web.repository.repository_id]),
+                "Backend contract is ready",
+                Some("# Full contract\n\nGET /example"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(published.recipient_count, 1);
+        let web_inbox = store
+            .list_inbox(ActorRef::Orchestrator(web.instance.instance_id), None, 20)
+            .await
+            .unwrap();
+        assert_eq!(web_inbox.items.len(), 1);
+        assert_eq!(
+            web_inbox.items[0].message.summary,
+            "Backend contract is ready"
+        );
+        assert!(
+            store
+                .list_inbox(
+                    ActorRef::Orchestrator(android.instance.instance_id),
+                    None,
+                    20
+                )
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let artifact = store
+            .read_artifact(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                published.artifact.unwrap().artifact_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(artifact.content, "# Full contract\n\nGET /example");
+        assert!(matches!(
+            store
+                .read_artifact(
+                    ActorRef::Orchestrator(android.instance.instance_id),
+                    artifact.artifact_id,
+                )
+                .await,
+            Err(StoreError::NotFound(_))
+        ));
+
+        let first_ack = store
+            .ack_message(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                published.message.message_id,
+            )
+            .await
+            .unwrap();
+        let second_ack = store
+            .ack_message(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                published.message.message_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_ack.delivery_id, second_ack.delivery_id);
+        assert!(
+            store
+                .list_inbox(ActorRef::Orchestrator(web.instance.instance_id), None, 20)
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn broadcast_deliveries_are_acknowledged_independently() {
+        let (store, path) = test_store(90).await;
+        let backend = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let web = store
+            .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+            .await
+            .unwrap();
+        let published = store
+            .publish_message(publish_command(
+                ActorRef::Orchestrator(backend.instance.instance_id),
+                MessageTarget::Broadcast,
+                "Project announcement",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(published.recipient_count, 2);
+
+        store
+            .ack_message(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                published.message.message_id,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_inbox(ActorRef::Orchestrator(web.instance.instance_id), None, 20)
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .list_inbox(
+                    ActorRef::Orchestrator(backend.instance.instance_id),
+                    None,
+                    20
+                )
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn active_worker_can_publish_without_creating_repository() {
+        let (store, path) = test_store(90).await;
+        let backend = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let web = store
+            .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+            .await
+            .unwrap();
+        let worker = store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: backend.instance.instance_id,
+                role: WorkerRole::Executor,
+                task_summary: "Publish fake report".to_owned(),
+                context_refs: json!([]),
+            })
+            .await
+            .unwrap();
+        store
+            .activate_worker_run(worker.worker_run_id)
+            .await
+            .unwrap();
+
+        let published = store
+            .publish_message(publish_command(
+                ActorRef::Worker(worker.worker_run_id),
+                MessageTarget::Repositories(vec![web.repository.repository_id]),
+                "Worker report",
+                Some("Done"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            published.message.sender_worker_run_id,
+            Some(worker.worker_run_id)
+        );
+        assert_eq!(
+            store
+                .project_overview(backend.project.project_id)
+                .await
+                .unwrap()
+                .repositories
+                .len(),
+            2
+        );
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn direct_message_cannot_cross_project_boundary() {
+        let (store, path) = test_store(90).await;
+        let first = store
+            .connect_orchestrator(connect_command("first", "backend", "C:/first/backend"))
+            .await
+            .unwrap();
+        let second = store
+            .connect_orchestrator(connect_command("second", "web", "C:/second/web"))
+            .await
+            .unwrap();
+
+        let error = store
+            .publish_message(publish_command(
+                ActorRef::Orchestrator(first.instance.instance_id),
+                MessageTarget::Repositories(vec![second.repository.repository_id]),
+                "Invalid cross-project message",
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Conflict(_)));
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn pending_inbox_survives_store_restart() {
+        let (store, path) = test_store(90).await;
+        let backend = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let web = store
+            .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+            .await
+            .unwrap();
+        let published = store
+            .publish_message(publish_command(
+                ActorRef::Orchestrator(backend.instance.instance_id),
+                MessageTarget::Repositories(vec![web.repository.repository_id]),
+                "Persist across restart",
+                Some("Persistent artifact"),
+            ))
+            .await
+            .unwrap();
+        store.pool.close().await;
+
+        let reopened = SqliteStore::open(&path, 2, 90, 3600).await.unwrap();
+        let inbox = reopened
+            .list_inbox(ActorRef::Orchestrator(web.instance.instance_id), None, 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            inbox.items[0].message.message_id,
+            published.message.message_id
+        );
+        assert_eq!(inbox.items[0].message.summary, "Persist across restart");
+
+        reopened.pool.close().await;
         remove_database(&path);
     }
 }

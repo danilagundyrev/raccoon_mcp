@@ -21,8 +21,9 @@ use tokio::net::TcpListener;
 
 use crate::{
     domain::{
-        ConnectOrchestrator, CreateWorkerRun, InstanceId, ProjectId, WorkerRole, WorkerRunId,
-        validate_key,
+        ActorRef, ArtifactId, ArtifactKind, ConnectOrchestrator, CreateWorkerRun, InstanceId,
+        MessageId, MessageKind, MessageTarget, ProjectId, PublishMessage, RepositoryId, ThreadId,
+        WorkerRole, WorkerRunId, validate_key,
     },
     store::{SqliteStore, StoreError},
 };
@@ -38,6 +39,7 @@ struct AppState {
     allowed_hosts: Arc<HashSet<String>>,
     database_path: Arc<PathBuf>,
     max_summary_bytes: u16,
+    max_artifact_bytes: u32,
 }
 
 #[derive(Debug)]
@@ -75,6 +77,7 @@ pub async fn run_server(
     store: SqliteStore,
     database_path: PathBuf,
     max_summary_bytes: u16,
+    max_artifact_bytes: u32,
     allow_hosts: Vec<String>,
 ) -> anyhow::Result<()> {
     let mut allowed_hosts = HashSet::from(["127.0.0.1".to_owned(), "localhost".to_owned()]);
@@ -84,6 +87,7 @@ pub async fn run_server(
         store,
         database_path.clone(),
         max_summary_bytes,
+        max_artifact_bytes,
         allowed_hosts,
     );
     let listener = TcpListener::bind((host.as_str(), port))
@@ -107,6 +111,7 @@ fn router(
     store: SqliteStore,
     database_path: PathBuf,
     max_summary_bytes: u16,
+    max_artifact_bytes: u32,
     allowed_hosts: HashSet<String>,
 ) -> Router {
     Router::new()
@@ -120,6 +125,7 @@ fn router(
             allowed_hosts: Arc::new(allowed_hosts),
             database_path: Arc::new(database_path),
             max_summary_bytes,
+            max_artifact_bytes,
         })
 }
 
@@ -137,6 +143,7 @@ async fn root(State(state): State<AppState>) -> Response {
             "version": SERVER_VERSION,
             "database": state.database_path.to_string_lossy(),
             "max_summary_bytes": state.max_summary_bytes,
+            "max_artifact_bytes": state.max_artifact_bytes,
             "mcp_endpoint": "/mcp",
             "health_endpoint": "/healthz",
         }),
@@ -219,8 +226,13 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         }
     };
 
-    let (status, response_body) =
-        handle_rpc_payload(&state.store, state.max_summary_bytes, payload).await;
+    let (status, response_body) = handle_rpc_payload(
+        &state.store,
+        state.max_summary_bytes,
+        state.max_artifact_bytes,
+        payload,
+    )
+    .await;
     match response_body {
         Some(body) => json_response(status, body),
         None => no_content_response(status),
@@ -230,6 +242,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
 async fn handle_rpc_payload(
     store: &SqliteStore,
     max_summary_bytes: u16,
+    max_artifact_bytes: u32,
     payload: Value,
 ) -> (StatusCode, Option<Value>) {
     if let Value::Array(items) = payload {
@@ -249,7 +262,7 @@ async fn handle_rpc_payload(
         let mut overall_status = StatusCode::OK;
         for item in items {
             let (item_status, item_response) =
-                handle_single_request(store, max_summary_bytes, item).await;
+                handle_single_request(store, max_summary_bytes, max_artifact_bytes, item).await;
             if item_status.is_client_error() || item_status.is_server_error() {
                 overall_status = item_status;
             }
@@ -263,13 +276,14 @@ async fn handle_rpc_payload(
             (overall_status, Some(Value::Array(responses)))
         }
     } else {
-        handle_single_request(store, max_summary_bytes, payload).await
+        handle_single_request(store, max_summary_bytes, max_artifact_bytes, payload).await
     }
 }
 
 async fn handle_single_request(
     store: &SqliteStore,
     max_summary_bytes: u16,
+    max_artifact_bytes: u32,
     request: Value,
 ) -> (StatusCode, Option<Value>) {
     let Some(request) = request.as_object() else {
@@ -317,7 +331,15 @@ async fn handle_single_request(
         }
     };
 
-    match dispatch(store, max_summary_bytes, method, &params).await {
+    match dispatch(
+        store,
+        max_summary_bytes,
+        max_artifact_bytes,
+        method,
+        &params,
+    )
+    .await
+    {
         Ok(_) if is_notification => (StatusCode::ACCEPTED, None),
         Ok(result) => (
             StatusCode::OK,
@@ -350,6 +372,7 @@ fn rpc_request_error(
 async fn dispatch(
     store: &SqliteStore,
     max_summary_bytes: u16,
+    max_artifact_bytes: u32,
     method: &str,
     params: &JsonMap<String, Value>,
 ) -> Result<Value, RpcError> {
@@ -365,19 +388,21 @@ async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. The child activates and completes/fails that run through MCP; it must not register as a separate repository. Messaging APIs are not implemented yet.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. The child activates and completes/fails that run through MCP; it must not register as a separate repository. Use publish_message for direct or project-wide delivery, list_inbox for compact headers, read_artifact only when full content is needed, and ack_message after processing. Event waiting is not implemented yet.",
         })),
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_definitions(max_summary_bytes) })),
-        "tools/call" => call_tool(store, max_summary_bytes, params).await,
+        "tools/list" => Ok(json!({
+            "tools": tool_definitions(max_summary_bytes, max_artifact_bytes)
+        })),
+        "tools/call" => call_tool(store, max_summary_bytes, max_artifact_bytes, params).await,
         "resources/list" => Ok(json!({ "resources": list_resources() })),
         "resources/templates/list" => Ok(json!({
             "resourceTemplates": list_resource_templates(),
         })),
         "resources/read" => {
             let uri = require_string(params, "uri")?;
-            read_resource(store, max_summary_bytes, &uri).await
+            read_resource(store, max_summary_bytes, max_artifact_bytes, &uri).await
         }
         _ => Err(RpcError::new(-32601, "Method not found")
             .with_status(StatusCode::NOT_FOUND)
@@ -388,6 +413,7 @@ async fn dispatch(
 async fn call_tool(
     store: &SqliteStore,
     max_summary_bytes: u16,
+    max_artifact_bytes: u32,
     params: &JsonMap<String, Value>,
 ) -> Result<Value, RpcError> {
     let tool_name = require_string(params, "name")?;
@@ -506,6 +532,110 @@ async fn call_tool(
                 .await
                 .map(|value| json!(value))
         }
+        "publish_message" => {
+            let actor = parse_actor(&arguments)?;
+            let kind = require_string(&arguments, "kind")?
+                .parse::<MessageKind>()
+                .map_err(invalid_argument)?;
+            let broadcast = optional_bool(&arguments, "broadcast")?.unwrap_or(false);
+            let target_repository_ids = optional_repository_ids(&arguments)?;
+            let target = match (broadcast, target_repository_ids) {
+                (true, None) => MessageTarget::Broadcast,
+                (false, Some(repository_ids)) if !repository_ids.is_empty() => {
+                    MessageTarget::Repositories(repository_ids)
+                }
+                (true, Some(_)) => {
+                    return Err(invalid_argument(
+                        "use either broadcast=true or target_repository_ids, not both".to_owned(),
+                    ));
+                }
+                _ => {
+                    return Err(invalid_argument(
+                        "provide broadcast=true or at least one target_repository_id".to_owned(),
+                    ));
+                }
+            };
+            let summary = validated_summary(&arguments, "summary", max_summary_bytes)?;
+            let body = optional_string(&arguments, "body")?;
+            if body
+                .as_ref()
+                .is_some_and(|body| body.len() > max_artifact_bytes as usize)
+            {
+                return Err(invalid_argument(format!(
+                    "'body' must not exceed {max_artifact_bytes} UTF-8 bytes"
+                )));
+            }
+            let artifact_kind = optional_string(&arguments, "artifact_kind")?
+                .unwrap_or_else(|| "note".to_owned())
+                .parse::<ArtifactKind>()
+                .map_err(invalid_argument)?;
+            let thread_id = optional_string(&arguments, "thread_id")?
+                .map(|value| ThreadId::parse(&value).map_err(invalid_uuid))
+                .transpose()?;
+            let in_reply_to = optional_string(&arguments, "in_reply_to")?
+                .map(|value| MessageId::parse(&value).map_err(invalid_uuid))
+                .transpose()?;
+            let correlation_id = optional_string(&arguments, "correlation_id")?;
+            if correlation_id
+                .as_ref()
+                .is_some_and(|value| value.len() > 128)
+            {
+                return Err(invalid_argument(
+                    "'correlation_id' must not exceed 128 UTF-8 bytes".to_owned(),
+                ));
+            }
+            store
+                .publish_message(PublishMessage {
+                    actor,
+                    kind,
+                    target,
+                    summary,
+                    body,
+                    artifact_kind,
+                    artifact_title: optional_string(&arguments, "artifact_title")?,
+                    content_type: optional_string(&arguments, "content_type")?
+                        .unwrap_or_else(|| "text/markdown".to_owned()),
+                    thread_id,
+                    correlation_id,
+                    in_reply_to,
+                })
+                .await
+                .map(|value| json!(value))
+        }
+        "list_inbox" => {
+            let actor = parse_actor(&arguments)?;
+            let after_delivery_id = optional_nonnegative_i64(&arguments, "after_delivery_id")?;
+            let limit = optional_limit(&arguments)?.unwrap_or(20);
+            store
+                .list_inbox(actor, after_delivery_id, limit)
+                .await
+                .map(|value| json!(value))
+        }
+        "read_message" => {
+            let actor = parse_actor(&arguments)?;
+            let message_id = parse_message_id(&arguments)?;
+            store
+                .read_message(actor, message_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "read_artifact" => {
+            let actor = parse_actor(&arguments)?;
+            let artifact_id = ArtifactId::parse(&require_string(&arguments, "artifact_id")?)
+                .map_err(invalid_uuid)?;
+            store
+                .read_artifact(actor, artifact_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "ack_message" => {
+            let actor = parse_actor(&arguments)?;
+            let message_id = parse_message_id(&arguments)?;
+            store
+                .ack_message(actor, message_id)
+                .await
+                .map(|value| json!(value))
+        }
         "list_repositories" => {
             let project_id = parse_project_id(&arguments)?;
             store.list_repositories(project_id).await.map(
@@ -534,6 +664,7 @@ async fn call_tool(
 async fn read_resource(
     store: &SqliteStore,
     max_summary_bytes: u16,
+    max_artifact_bytes: u32,
     uri: &str,
 ) -> Result<Value, RpcError> {
     if uri == "hub://guide" {
@@ -546,6 +677,7 @@ async fn read_resource(
                 "identity": ["project", "repository", "orchestrator instance"],
                 "lease_note": "Call heartbeat before lease_expires_at. Repository identity and future mailbox state remain stable across orchestrator instances.",
                 "max_summary_bytes": max_summary_bytes,
+                "max_artifact_bytes": max_artifact_bytes,
                 "summary_note": "Summary fields are compact UTF-8 indexes. Put full context in an artifact instead of enlarging every inbox/event payload.",
                 "worker_flow": [
                     "The orchestrator calls create_worker_run before spawning a child.",
@@ -553,7 +685,13 @@ async fn read_resource(
                     "The child calls complete_worker_run or fail_worker_run before exiting.",
                     "A worker never calls connect_orchestrator and never creates a repository identity."
                 ],
-                "current_scope": "Project/repository presence and minimal worker-run lifecycle. Messaging is not implemented yet.",
+                "messaging_flow": [
+                    "Publish an immutable summary and optional artifact with publish_message.",
+                    "Use list_inbox to read pending headers without artifact bodies.",
+                    "Use read_message/read_artifact only for selected items.",
+                    "Call ack_message after processing; broadcast recipients acknowledge independently."
+                ],
+                "current_scope": "Project/repository presence, worker runs, immutable messaging, artifacts and reliable per-repository delivery. Event waiting is not implemented yet.",
             }),
         ));
     }
@@ -599,6 +737,91 @@ fn parse_project_id(arguments: &JsonMap<String, Value>) -> Result<ProjectId, Rpc
 
 fn parse_worker_run_id(arguments: &JsonMap<String, Value>) -> Result<WorkerRunId, RpcError> {
     WorkerRunId::parse(&require_string(arguments, "worker_run_id")?).map_err(invalid_uuid)
+}
+
+fn parse_message_id(arguments: &JsonMap<String, Value>) -> Result<MessageId, RpcError> {
+    MessageId::parse(&require_string(arguments, "message_id")?).map_err(invalid_uuid)
+}
+
+fn parse_actor(arguments: &JsonMap<String, Value>) -> Result<ActorRef, RpcError> {
+    let instance_id = optional_string(arguments, "instance_id")?
+        .map(|value| InstanceId::parse(&value).map_err(invalid_uuid))
+        .transpose()?;
+    let worker_run_id = optional_string(arguments, "worker_run_id")?
+        .map(|value| WorkerRunId::parse(&value).map_err(invalid_uuid))
+        .transpose()?;
+    match (instance_id, worker_run_id) {
+        (Some(instance_id), None) => Ok(ActorRef::Orchestrator(instance_id)),
+        (None, Some(worker_run_id)) => Ok(ActorRef::Worker(worker_run_id)),
+        _ => Err(invalid_argument(
+            "provide exactly one actor: instance_id or worker_run_id".to_owned(),
+        )),
+    }
+}
+
+fn optional_bool(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<bool>, RpcError> {
+    match arguments.get(field_name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(invalid_argument(format!(
+            "'{field_name}' must be a boolean when provided"
+        ))),
+    }
+}
+
+fn optional_nonnegative_i64(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<i64>, RpcError> {
+    match arguments.get(field_name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .filter(|value| *value >= 0)
+            .map(Some)
+            .ok_or_else(|| {
+                invalid_argument(format!(
+                    "'{field_name}' must be a non-negative integer when provided"
+                ))
+            }),
+        Some(_) => Err(invalid_argument(format!(
+            "'{field_name}' must be a non-negative integer when provided"
+        ))),
+    }
+}
+
+fn optional_limit(arguments: &JsonMap<String, Value>) -> Result<Option<u8>, RpcError> {
+    match optional_nonnegative_i64(arguments, "limit")? {
+        None => Ok(None),
+        Some(value @ 1..=100) => Ok(Some(value as u8)),
+        Some(_) => Err(invalid_argument(
+            "'limit' must be between 1 and 100".to_owned(),
+        )),
+    }
+}
+
+fn optional_repository_ids(
+    arguments: &JsonMap<String, Value>,
+) -> Result<Option<Vec<RepositoryId>>, RpcError> {
+    match arguments.get("target_repository_ids") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                let value = value.as_str().ok_or_else(|| {
+                    invalid_argument("every target_repository_id must be a UUID string".to_owned())
+                })?;
+                RepositoryId::parse(value).map_err(invalid_uuid)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err(invalid_argument(
+            "'target_repository_ids' must be an array when provided".to_owned(),
+        )),
+    }
 }
 
 fn validated_summary(
@@ -700,7 +923,7 @@ fn tool_result(payload: Value, is_error: bool) -> Value {
     })
 }
 
-fn tool_definitions(max_summary_bytes: u16) -> Value {
+fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) -> Value {
     json!([
         {
             "name": "connect_orchestrator",
@@ -829,6 +1052,61 @@ fn tool_definitions(max_summary_bytes: u16) -> Value {
             }
         },
         {
+            "name": "publish_message",
+            "description": "Publish an immutable message envelope and optional artifact, then atomically fan it out to repository mailboxes.",
+            "inputSchema": publish_message_schema(max_summary_bytes, max_artifact_bytes),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "list_inbox",
+            "description": "List pending message headers for the actor's repository. Full artifact content is never included.",
+            "inputSchema": inbox_schema(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "read_message",
+            "description": "Read one accessible immutable message envelope. Read its artifact separately when needed.",
+            "inputSchema": actor_entity_schema("message_id"),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "read_artifact",
+            "description": "Read full artifact content only when the actor's repository produced it or received its message.",
+            "inputSchema": actor_entity_schema("artifact_id"),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "ack_message",
+            "description": "Idempotently acknowledge one message in the actor repository's mailbox after required content has been processed.",
+            "inputSchema": actor_entity_schema("message_id"),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "list_repositories",
             "description": "List repositories in a project with their current online instance counts.",
             "inputSchema": id_schema("project_id"),
@@ -877,6 +1155,135 @@ fn worker_finish_schema(summary_field: &str, max_summary_bytes: u16) -> Value {
             }
         },
         "required": ["worker_run_id", summary_field]
+    })
+}
+
+fn actor_properties() -> JsonMap<String, Value> {
+    let mut properties = JsonMap::new();
+    properties.insert(
+        "instance_id".to_owned(),
+        json!({ "type": "string", "format": "uuid" }),
+    );
+    properties.insert(
+        "worker_run_id".to_owned(),
+        json!({ "type": "string", "format": "uuid" }),
+    );
+    properties
+}
+
+fn actor_entity_schema(entity_field: &str) -> Value {
+    let mut properties = actor_properties();
+    properties.insert(
+        entity_field.to_owned(),
+        json!({ "type": "string", "format": "uuid" }),
+    );
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": [entity_field],
+        "oneOf": [
+            { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
+            { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
+        ]
+    })
+}
+
+fn inbox_schema() -> Value {
+    let mut properties = actor_properties();
+    properties.insert(
+        "after_delivery_id".to_owned(),
+        json!({ "type": "integer", "minimum": 0 }),
+    );
+    properties.insert(
+        "limit".to_owned(),
+        json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }),
+    );
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "oneOf": [
+            { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
+            { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
+        ]
+    })
+}
+
+fn publish_message_schema(max_summary_bytes: u16, max_artifact_bytes: u32) -> Value {
+    let mut properties = actor_properties();
+    properties.extend(JsonMap::from_iter([
+        (
+            "kind".to_owned(),
+            json!({ "type": "string", "enum": ["report", "announcement", "command"] }),
+        ),
+        ("broadcast".to_owned(), json!({ "type": "boolean" })),
+        (
+            "target_repository_ids".to_owned(),
+            json!({
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "format": "uuid" }
+            }),
+        ),
+        (
+            "summary".to_owned(),
+            json!({ "type": "string", "maxLength": max_summary_bytes }),
+        ),
+        (
+            "body".to_owned(),
+            json!({
+                "type": "string",
+                "maxLength": max_artifact_bytes,
+                "description": "Optional full content stored as a separate artifact. Server limit is UTF-8 bytes."
+            }),
+        ),
+        (
+            "artifact_kind".to_owned(),
+            json!({
+                "type": "string",
+                "enum": ["implementation_report", "api_contract", "answer", "note"],
+                "default": "note"
+            }),
+        ),
+        ("artifact_title".to_owned(), json!({ "type": "string" })),
+        (
+            "content_type".to_owned(),
+            json!({ "type": "string", "default": "text/markdown" }),
+        ),
+        (
+            "thread_id".to_owned(),
+            json!({ "type": "string", "format": "uuid" }),
+        ),
+        (
+            "correlation_id".to_owned(),
+            json!({ "type": "string", "maxLength": 128 }),
+        ),
+        (
+            "in_reply_to".to_owned(),
+            json!({ "type": "string", "format": "uuid" }),
+        ),
+    ]));
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": ["kind", "summary"],
+        "allOf": [
+            {
+                "oneOf": [
+                    { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
+                    { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
+                ]
+            },
+            {
+                "oneOf": [
+                    { "required": ["broadcast"], "properties": { "broadcast": { "const": true } }, "not": { "required": ["target_repository_ids"] } },
+                    { "required": ["target_repository_ids"], "not": { "required": ["broadcast"] } }
+                ]
+            }
+        ]
     })
 }
 
