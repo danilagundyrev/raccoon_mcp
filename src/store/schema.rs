@@ -140,4 +140,23 @@ CREATE TABLE IF NOT EXISTS deliveries (
 
 CREATE INDEX IF NOT EXISTS deliveries_inbox_idx
     ON deliveries(recipient_repository_id, status, delivery_id);
+
+CREATE TABLE IF NOT EXISTS events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    recipient_repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN (
+        'message_available',
+        'worker_run_created',
+        'worker_run_active',
+        'worker_run_completed',
+        'worker_run_failed'
+    )),
+    entity_type TEXT NOT NULL CHECK(entity_type IN ('message', 'worker_run')),
+    entity_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS events_repository_cursor_idx
+    ON events(recipient_repository_id, event_id);
 "#;

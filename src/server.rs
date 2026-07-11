@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -22,7 +23,7 @@ use tokio::net::TcpListener;
 use crate::{
     domain::{
         ActorRef, ArtifactId, ArtifactKind, AuditWorkItemInput, ConnectOrchestrator,
-        CreateWorkerRun, InstanceId, MessageId, MessageKind, MessageTarget, ProjectId,
+        CreateWorkerRun, EventKind, InstanceId, MessageId, MessageKind, MessageTarget, ProjectId,
         PublishMessage, RepositoryId, ThreadId, WorkItemId, WorkerRole, WorkerRunId, validate_key,
     },
     store::{SqliteStore, StoreError},
@@ -367,7 +368,7 @@ async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. Roles are executor, butler and auditor. An auditor receives one or more audit_work_items with a bounded max_iterations policy and publishes an audit_report artifact. If findings require remediation, create exactly one executor with addresses_audit_run_id for the complete audit report; do not create one executor per finding. The child activates and completes/fails its run through MCP and never registers as a repository. Use publish_message for delivery, list_inbox for compact headers, read_artifact only when full content is needed, and ack_message after processing. Event waiting is not implemented yet.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. Roles are executor, butler and auditor. An auditor receives one or more audit_work_items with a bounded max_iterations policy and publishes an audit_report artifact. If findings require remediation, create exactly one executor with addresses_audit_run_id for the complete audit report; do not create one executor per finding. The child activates and completes/fails its run through MCP and never registers as a repository. Use publish_message for delivery, wait_for_events for efficient repository-scoped waiting, list_inbox for compact headers, read_artifact only when full content is needed, and ack_message after processing. An active wait renews its actor lease; omit timeout_seconds for no server-side timeout.",
         })),
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
         "ping" => Ok(json!({})),
@@ -585,6 +586,17 @@ async fn call_tool(
                 .await
                 .map(|value| json!(value))
         }
+        "wait_for_events" => {
+            let actor = parse_actor(&arguments)?;
+            let cursor = optional_nonnegative_i64(&arguments, "cursor")?.unwrap_or(0);
+            let kinds = optional_event_kinds(&arguments)?;
+            let timeout = optional_timeout_seconds(&arguments)?.map(Duration::from_secs);
+            let limit = optional_event_limit(&arguments)?.unwrap_or(20);
+            store
+                .wait_for_events(actor, cursor, &kinds, timeout, limit)
+                .await
+                .map(|value| json!(value))
+        }
         "list_inbox" => {
             let actor = parse_actor(&arguments)?;
             let after_delivery_id = optional_nonnegative_i64(&arguments, "after_delivery_id")?;
@@ -676,11 +688,12 @@ async fn read_resource(
                 ],
                 "messaging_flow": [
                     "Publish an immutable summary and optional artifact with publish_message.",
+                    "Call wait_for_events with the last event cursor; omit timeout_seconds for an unbounded server wait. The server renews the waiting actor lease.",
                     "Use list_inbox to read pending headers without artifact bodies.",
                     "Use read_message/read_artifact only for selected items.",
                     "Call ack_message after processing; broadcast recipients acknowledge independently."
                 ],
-                "current_scope": "Project/repository presence, worker runs, immutable messaging, artifacts and reliable per-repository delivery. Event waiting is not implemented yet.",
+                "current_scope": "Project/repository presence, worker runs, immutable messaging, artifacts, reliable per-repository delivery and cursor-based event waiting.",
             }),
         ));
     }
@@ -788,6 +801,47 @@ fn optional_limit(arguments: &JsonMap<String, Value>) -> Result<Option<u8>, RpcE
         Some(value @ 1..=100) => Ok(Some(value as u8)),
         Some(_) => Err(invalid_argument(
             "'limit' must be between 1 and 100".to_owned(),
+        )),
+    }
+}
+
+fn optional_event_limit(arguments: &JsonMap<String, Value>) -> Result<Option<u8>, RpcError> {
+    match optional_nonnegative_i64(arguments, "limit")? {
+        None => Ok(None),
+        Some(value @ 1..=50) => Ok(Some(value as u8)),
+        Some(_) => Err(invalid_argument(
+            "'limit' must be between 1 and 50 for wait_for_events".to_owned(),
+        )),
+    }
+}
+
+fn optional_timeout_seconds(arguments: &JsonMap<String, Value>) -> Result<Option<u64>, RpcError> {
+    match optional_nonnegative_i64(arguments, "timeout_seconds")? {
+        None => Ok(None),
+        Some(value @ 0..=65_535) => Ok(Some(value as u64)),
+        Some(_) => Err(invalid_argument(
+            "'timeout_seconds' must be between 0 and 65535".to_owned(),
+        )),
+    }
+}
+
+fn optional_event_kinds(arguments: &JsonMap<String, Value>) -> Result<Vec<EventKind>, RpcError> {
+    match arguments.get("kinds") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        invalid_argument("every event kind must be a string".to_owned())
+                    })?
+                    .parse::<EventKind>()
+                    .map_err(invalid_argument)
+            })
+            .collect(),
+        Some(_) => Err(invalid_argument(
+            "'kinds' must be an array when provided".to_owned(),
         )),
     }
 }
@@ -1103,6 +1157,17 @@ fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) -> Value {
             }
         },
         {
+            "name": "wait_for_events",
+            "description": "Wait for append-only events addressed to the actor's repository. The cursor is independent of inbox acknowledgement. An omitted timeout waits without a server-side deadline, and the active wait renews the actor lease.",
+            "inputSchema": wait_for_events_schema(),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "list_inbox",
             "description": "List pending message headers for the actor's repository. Full artifact content is never included.",
             "inputSchema": inbox_schema(),
@@ -1238,6 +1303,53 @@ fn inbox_schema() -> Value {
     properties.insert(
         "limit".to_owned(),
         json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }),
+    );
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "oneOf": [
+            { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
+            { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
+        ]
+    })
+}
+
+fn wait_for_events_schema() -> Value {
+    let mut properties = actor_properties();
+    properties.insert(
+        "cursor".to_owned(),
+        json!({ "type": "integer", "minimum": 0, "default": 0 }),
+    );
+    properties.insert(
+        "kinds".to_owned(),
+        json!({
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+                "type": "string",
+                "enum": [
+                    "message_available",
+                    "worker_run_created",
+                    "worker_run_active",
+                    "worker_run_completed",
+                    "worker_run_failed"
+                ]
+            }
+        }),
+    );
+    properties.insert(
+        "timeout_seconds".to_owned(),
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65_535,
+            "description": "Omit for no server-side timeout; zero performs a non-blocking event check."
+        }),
+    );
+    properties.insert(
+        "limit".to_owned(),
+        json!({ "type": "integer", "minimum": 1, "maximum": 50, "default": 20 }),
     );
     json!({
         "type": "object",
@@ -1450,5 +1562,41 @@ mod tests {
     fn worker_schema_uses_configured_summary_limit() {
         let schema = worker_finish_schema("result_summary", 4096);
         assert_eq!(schema["properties"]["result_summary"]["maxLength"], 4096);
+    }
+
+    #[test]
+    fn event_wait_schema_has_explicit_unbounded_timeout_contract() {
+        let schema = wait_for_events_schema();
+        assert_eq!(schema["properties"]["limit"]["maximum"], 50);
+        assert_eq!(schema["properties"]["timeout_seconds"]["maximum"], 65_535);
+        assert!(
+            schema["properties"]["timeout_seconds"]
+                .get("default")
+                .is_none()
+        );
+
+        let tools = tool_definitions(1024, 524_288);
+        assert!(tools.as_array().unwrap().iter().any(|tool| {
+            tool["name"] == "wait_for_events"
+                && tool["annotations"]["readOnlyHint"] == Value::Bool(false)
+        }));
+    }
+
+    #[test]
+    fn event_wait_arguments_enforce_public_limits() {
+        let mut arguments = JsonMap::new();
+        arguments.insert("timeout_seconds".to_owned(), json!(65_535));
+        arguments.insert("limit".to_owned(), json!(50));
+        arguments.insert(
+            "kinds".to_owned(),
+            json!(["message_available", "worker_run_completed"]),
+        );
+
+        assert_eq!(optional_timeout_seconds(&arguments).unwrap(), Some(65_535));
+        assert_eq!(optional_event_limit(&arguments).unwrap(), Some(50));
+        assert_eq!(optional_event_kinds(&arguments).unwrap().len(), 2);
+
+        arguments.insert("limit".to_owned(), json!(51));
+        assert!(optional_event_limit(&arguments).is_err());
     }
 }

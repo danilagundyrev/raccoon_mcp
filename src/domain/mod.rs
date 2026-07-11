@@ -1,9 +1,11 @@
+mod events;
 mod ids;
 mod messaging;
 mod presence;
 mod project;
 mod worker;
 
+pub use events::{EventBatch, EventEntityType, EventKind, HubEvent, WaitOutcome};
 pub use ids::{
     ArtifactId, InstanceId, MessageId, ProjectId, RepositoryId, ThreadId, WorkItemId, WorkerRunId,
 };

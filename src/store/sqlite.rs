@@ -1,21 +1,31 @@
-use std::{collections::BTreeSet, path::Path, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::Path,
+    str::FromStr,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 
 use chrono::{SecondsFormat, Utc};
 use sqlx::{
-    Row, Sqlite, SqlitePool, Transaction,
+    QueryBuilder, Row, Sqlite, SqlitePool, Transaction,
     sqlite::{
         SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
     },
 };
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::{
+    sync::{Mutex, Notify},
+    time::{Instant, interval_at, sleep_until},
+};
 
 use crate::domain::{
     ActorRef, AgentInstance, Artifact, ArtifactId, AuditScopeItem, ConnectOrchestrator,
-    ConnectResult, CreateWorkerRun, DeliveryAck, InboxItem, InboxPage, InstanceId, Message,
-    MessageId, MessageTarget, PresenceStatus, Project, ProjectId, ProjectOverview, PublishMessage,
-    PublishResult, Repository, RepositoryId, RepositoryPresence, ThreadId, WorkItemId, WorkerRole,
-    WorkerRun, WorkerRunId, WorkerRunStatus,
+    ConnectResult, CreateWorkerRun, DeliveryAck, EventBatch, EventEntityType, EventKind, HubEvent,
+    InboxItem, InboxPage, InstanceId, Message, MessageId, MessageTarget, PresenceStatus, Project,
+    ProjectId, ProjectOverview, PublishMessage, PublishResult, Repository, RepositoryId,
+    RepositoryPresence, ThreadId, WaitOutcome, WorkItemId, WorkerRole, WorkerRun, WorkerRunId,
+    WorkerRunStatus,
 };
 
 use super::schema::{CREATE_SCHEMA, SCHEMA_VERSION};
@@ -42,6 +52,27 @@ pub struct SqliteStore {
     lease_duration: chrono::Duration,
     worker_lease_duration: chrono::Duration,
     write_lock: Arc<Mutex<()>>,
+    notifications: Arc<NotificationHub>,
+}
+
+#[derive(Default)]
+struct NotificationHub {
+    by_repository: StdMutex<HashMap<RepositoryId, Arc<Notify>>>,
+}
+
+impl NotificationHub {
+    fn for_repository(&self, repository_id: RepositoryId) -> Arc<Notify> {
+        self.by_repository
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(repository_id)
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+
+    fn notify(&self, repository_id: RepositoryId) {
+        self.for_repository(repository_id).notify_waiters();
+    }
 }
 
 struct ResolvedActor {
@@ -88,6 +119,7 @@ impl SqliteStore {
             lease_duration: chrono::Duration::seconds(lease_seconds as i64),
             worker_lease_duration: chrono::Duration::seconds(worker_lease_seconds as i64),
             write_lock: Arc::new(Mutex::new(())),
+            notifications: Arc::new(NotificationHub::default()),
         })
     }
 
@@ -231,6 +263,13 @@ impl SqliteStore {
             )));
         }
         let repository_id = RepositoryId::parse(parent.try_get("repository_id")?)?;
+        let project_id = ProjectId::parse(
+            sqlx::query("SELECT project_id FROM repositories WHERE repository_id = ?")
+                .bind(repository_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await?
+                .try_get("project_id")?,
+        )?;
         let audit_scope = prepare_audit_scope(&mut transaction, &command).await?;
         if let Some(audit_run_id) = command.addresses_audit_run_id {
             validate_remediation_audit(&mut transaction, repository_id, audit_run_id).await?;
@@ -281,7 +320,19 @@ impl SqliteStore {
             .await?;
         }
 
+        append_event(
+            &mut transaction,
+            project_id,
+            repository_id,
+            EventKind::WorkerRunCreated,
+            EventEntityType::WorkerRun,
+            &worker_run_id.to_string(),
+            &now,
+        )
+        .await?;
+
         transaction.commit().await?;
+        self.notifications.notify(repository_id);
         self.get_worker_run(worker_run_id).await
     }
 
@@ -298,6 +349,7 @@ impl SqliteStore {
             WorkerRunStatus::Created => {
                 let now = utc_now();
                 let lease_expires_at = lease_deadline(self.worker_lease_duration);
+                let mut transaction = self.pool.begin().await?;
                 sqlx::query(
                     "UPDATE worker_runs
                      SET status = 'active', activated_at = ?, last_heartbeat_at = ?,
@@ -308,8 +360,22 @@ impl SqliteStore {
                 .bind(&now)
                 .bind(lease_expires_at)
                 .bind(worker_run_id.to_string())
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await?;
+                let project_id =
+                    repository_project_id(&mut transaction, worker.repository_id).await?;
+                append_event(
+                    &mut transaction,
+                    project_id,
+                    worker.repository_id,
+                    EventKind::WorkerRunActive,
+                    EventEntityType::WorkerRun,
+                    &worker_run_id.to_string(),
+                    &now,
+                )
+                .await?;
+                transaction.commit().await?;
+                self.notifications.notify(worker.repository_id);
                 self.get_worker_run(worker_run_id).await
             }
             WorkerRunStatus::Active => {
@@ -440,6 +506,7 @@ impl SqliteStore {
         }
 
         let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE worker_runs
              SET status = ?, result_summary = ?, error_summary = ?,
@@ -457,18 +524,36 @@ impl SqliteStore {
         .bind(worker_run_id.to_string())
         .bind(target_status.as_str())
         .bind(target_status.as_str())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
-        let current = self.get_worker_run(worker_run_id).await?;
-        if result.rows_affected() == 1 || current.status == target_status {
-            Ok(current)
-        } else {
-            Err(invalid_worker_transition(
+        if result.rows_affected() != 1 {
+            transaction.rollback().await?;
+            let current = self.get_worker_run(worker_run_id).await?;
+            return Err(invalid_worker_transition(
                 worker_run_id,
                 current.status,
                 target_status.as_str(),
-            ))
+            ));
         }
+        let project_id = repository_project_id(&mut transaction, worker.repository_id).await?;
+        let event_kind = match target_status {
+            WorkerRunStatus::Completed => EventKind::WorkerRunCompleted,
+            WorkerRunStatus::Failed => EventKind::WorkerRunFailed,
+            _ => unreachable!("finish_worker_run validates terminal status"),
+        };
+        append_event(
+            &mut transaction,
+            project_id,
+            worker.repository_id,
+            event_kind,
+            EventEntityType::WorkerRun,
+            &worker_run_id.to_string(),
+            &now,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.notifications.notify(worker.repository_id);
+        self.get_worker_run(worker_run_id).await
     }
 
     pub async fn publish_message(
@@ -584,9 +669,22 @@ impl SqliteStore {
             .bind(&now)
             .execute(&mut *transaction)
             .await?;
+            append_event(
+                &mut transaction,
+                actor.project_id,
+                *recipient_id,
+                EventKind::MessageAvailable,
+                EventEntityType::Message,
+                &message.message_id.to_string(),
+                &now,
+            )
+            .await?;
         }
 
         transaction.commit().await?;
+        for recipient_id in &recipient_ids {
+            self.notifications.notify(*recipient_id);
+        }
         Ok(PublishResult {
             message,
             artifact,
@@ -878,6 +976,124 @@ impl SqliteStore {
         }
     }
 
+    pub async fn wait_for_events(
+        &self,
+        actor_ref: ActorRef,
+        cursor: i64,
+        kinds: &[EventKind],
+        timeout: Option<Duration>,
+        limit: u8,
+    ) -> Result<EventBatch, StoreError> {
+        if cursor < 0 {
+            return Err(StoreError::Conflict(
+                "event cursor must be non-negative".to_owned(),
+            ));
+        }
+        if !(1..=50).contains(&limit) {
+            return Err(StoreError::Conflict(
+                "event limit must be between 1 and 50".to_owned(),
+            ));
+        }
+
+        let actor = self.touch_actor(actor_ref).await?;
+        let repository_id = actor.repository_id;
+        let notifier = self.notifications.for_repository(repository_id);
+        let lease_seconds = match actor_ref {
+            ActorRef::Orchestrator(_) => self.lease_duration.num_seconds(),
+            ActorRef::Worker(_) => self.worker_lease_duration.num_seconds(),
+        };
+        let heartbeat_every = Duration::from_secs((lease_seconds / 3).max(1) as u64);
+        let mut heartbeat = interval_at(Instant::now() + heartbeat_every, heartbeat_every);
+        let deadline = timeout.map(|duration| Instant::now() + duration);
+
+        loop {
+            // Register before querying so a commit between the query and await cannot be missed.
+            let notified = notifier.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let batch = self
+                .fetch_events(repository_id, cursor, kinds, limit)
+                .await?;
+            if !batch.events.is_empty() {
+                return Ok(batch);
+            }
+
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = heartbeat.tick() => {
+                    let renewed = self.touch_actor(actor_ref).await?;
+                    if renewed.repository_id != repository_id {
+                        return Err(StoreError::Conflict(
+                            "actor repository changed while waiting for events".to_owned(),
+                        ));
+                    }
+                }
+                _ = wait_until(deadline) => {
+                    return Ok(EventBatch {
+                        outcome: WaitOutcome::Timeout,
+                        events: Vec::new(),
+                        next_cursor: cursor,
+                        has_more: false,
+                    });
+                }
+            }
+        }
+    }
+
+    async fn touch_actor(&self, actor_ref: ActorRef) -> Result<ResolvedActor, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(&mut transaction, actor_ref, &utc_now())
+            .await?;
+        transaction.commit().await?;
+        Ok(actor)
+    }
+
+    async fn fetch_events(
+        &self,
+        repository_id: RepositoryId,
+        cursor: i64,
+        kinds: &[EventKind],
+        limit: u8,
+    ) -> Result<EventBatch, StoreError> {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT event_id, project_id, recipient_repository_id, kind, entity_type, entity_id, created_at \
+             FROM events WHERE recipient_repository_id = ",
+        );
+        query
+            .push_bind(repository_id.to_string())
+            .push(" AND event_id > ")
+            .push_bind(cursor);
+        if !kinds.is_empty() {
+            query.push(" AND kind IN (");
+            let mut separated = query.separated(", ");
+            for kind in kinds {
+                separated.push_bind(kind.as_str());
+            }
+            separated.push_unseparated(")");
+        }
+        query
+            .push(" ORDER BY event_id LIMIT ")
+            .push_bind(i64::from(limit) + 1);
+
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let has_more = rows.len() > usize::from(limit);
+        let events = rows
+            .iter()
+            .take(usize::from(limit))
+            .map(event_from_row)
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let next_cursor = events.last().map_or(cursor, |event| event.event_id);
+        Ok(EventBatch {
+            outcome: WaitOutcome::Events,
+            events,
+            next_cursor,
+            has_more,
+        })
+    }
+
     pub async fn list_repositories(
         &self,
         project_id: ProjectId,
@@ -926,6 +1142,49 @@ impl SqliteStore {
             repositories,
         })
     }
+}
+
+async fn wait_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn repository_project_id(
+    transaction: &mut Transaction<'_, Sqlite>,
+    repository_id: RepositoryId,
+) -> Result<ProjectId, StoreError> {
+    let row = sqlx::query("SELECT project_id FROM repositories WHERE repository_id = ?")
+        .bind(repository_id.to_string())
+        .fetch_one(&mut **transaction)
+        .await?;
+    Ok(ProjectId::parse(row.try_get("project_id")?)?)
+}
+
+async fn append_event(
+    transaction: &mut Transaction<'_, Sqlite>,
+    project_id: ProjectId,
+    recipient_repository_id: RepositoryId,
+    kind: EventKind,
+    entity_type: EventEntityType,
+    entity_id: &str,
+    created_at: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO events(
+             project_id, recipient_repository_id, kind, entity_type, entity_id, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(project_id.to_string())
+    .bind(recipient_repository_id.to_string())
+    .bind(kind.as_str())
+    .bind(entity_type.as_str())
+    .bind(entity_id)
+    .bind(created_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreError> {
@@ -1502,6 +1761,20 @@ fn delivery_ack_from_row(row: &SqliteRow) -> Result<DeliveryAck, StoreError> {
     })
 }
 
+fn event_from_row(row: &SqliteRow) -> Result<HubEvent, StoreError> {
+    let kind: String = row.try_get("kind")?;
+    let entity_type: String = row.try_get("entity_type")?;
+    Ok(HubEvent {
+        event_id: row.try_get("event_id")?,
+        project_id: ProjectId::parse(row.try_get("project_id")?)?,
+        recipient_repository_id: RepositoryId::parse(row.try_get("recipient_repository_id")?)?,
+        kind: kind.parse().map_err(StoreError::Conflict)?,
+        entity_type: entity_type.parse().map_err(StoreError::Conflict)?,
+        entity_id: row.try_get("entity_id")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
 fn parse_optional_id<T>(
     value: Option<String>,
     parser: impl FnOnce(&str) -> Result<T, uuid::Error>,
@@ -1714,6 +1987,32 @@ mod tests {
             Some("Fake endpoint implemented")
         );
         assert!(completed.finished_at.is_some());
+        let lifecycle_events = store
+            .wait_for_events(
+                ActorRef::Orchestrator(connected.instance.instance_id),
+                0,
+                &[
+                    EventKind::WorkerRunCreated,
+                    EventKind::WorkerRunActive,
+                    EventKind::WorkerRunCompleted,
+                ],
+                Some(Duration::ZERO),
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            lifecycle_events
+                .events
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                EventKind::WorkerRunCreated,
+                EventKind::WorkerRunActive,
+                EventKind::WorkerRunCompleted,
+            ]
+        );
 
         store.pool.close().await;
         remove_database(&path);
@@ -2396,6 +2695,143 @@ mod tests {
                 .await,
             Err(StoreError::Conflict(_))
         ));
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn queued_message_is_returned_as_repository_event() {
+        let (store, path) = test_store(90).await;
+        let backend = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let web = store
+            .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+            .await
+            .unwrap();
+        let published = store
+            .publish_message(publish_command(
+                ActorRef::Orchestrator(backend.instance.instance_id),
+                MessageTarget::Repositories(vec![web.repository.repository_id]),
+                "Contract ready",
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let filtered = store
+            .wait_for_events(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                0,
+                &[EventKind::WorkerRunCompleted],
+                Some(Duration::ZERO),
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.outcome, WaitOutcome::Timeout);
+        assert_eq!(filtered.next_cursor, 0);
+
+        let batch = store
+            .wait_for_events(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                0,
+                &[EventKind::MessageAvailable],
+                Some(Duration::ZERO),
+                20,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(batch.outcome, WaitOutcome::Events);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].kind, EventKind::MessageAvailable);
+        assert_eq!(
+            batch.events[0].entity_id,
+            published.message.message_id.to_string()
+        );
+        assert_eq!(batch.next_cursor, batch.events[0].event_id);
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn waiter_is_notified_after_message_commit() {
+        let (store, path) = test_store(90).await;
+        let backend = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let web = store
+            .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+            .await
+            .unwrap();
+        let web_instance_id = web.instance.instance_id;
+        let web_repository_id = web.repository.repository_id;
+        let waiting_store = store.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_store
+                .wait_for_events(
+                    ActorRef::Orchestrator(web_instance_id),
+                    0,
+                    &[],
+                    Some(Duration::from_secs(2)),
+                    20,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        store
+            .publish_message(publish_command(
+                ActorRef::Orchestrator(backend.instance.instance_id),
+                MessageTarget::Repositories(vec![web_repository_id]),
+                "Wake waiter",
+                None,
+            ))
+            .await
+            .unwrap();
+        let batch = waiter.await.unwrap().unwrap();
+
+        assert_eq!(batch.outcome, WaitOutcome::Events);
+        assert_eq!(batch.events.len(), 1);
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn wait_timeout_preserves_cursor_and_renews_lease() {
+        let (store, path) = test_store(1).await;
+        let connected = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let initial_heartbeat = connected.instance.last_heartbeat_at;
+
+        let batch = store
+            .wait_for_events(
+                ActorRef::Orchestrator(connected.instance.instance_id),
+                42,
+                &[],
+                Some(Duration::from_millis(1_500)),
+                20,
+            )
+            .await
+            .unwrap();
+        let renewed = store
+            .get_instance(connected.instance.instance_id)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.outcome, WaitOutcome::Timeout);
+        assert_eq!(batch.next_cursor, 42);
+        assert!(batch.events.is_empty());
+        assert!(renewed.last_heartbeat_at > initial_heartbeat);
+        assert!(renewed.lease_expires_at > utc_now());
 
         store.pool.close().await;
         remove_database(&path);
