@@ -141,6 +141,36 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE INDEX IF NOT EXISTS deliveries_inbox_idx
     ON deliveries(recipient_repository_id, status, delivery_id);
 
+CREATE TABLE IF NOT EXISTS requests (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    requester_repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+    target_repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+    created_by_instance_id TEXT REFERENCES agent_instances(instance_id) ON DELETE SET NULL,
+    created_by_worker_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE SET NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'claimed', 'answered', 'failed')),
+    question_summary TEXT NOT NULL,
+    question_artifact_id TEXT REFERENCES artifacts(artifact_id) ON DELETE SET NULL,
+    context_refs_json TEXT NOT NULL,
+    claimed_by_instance_id TEXT REFERENCES agent_instances(instance_id) ON DELETE SET NULL,
+    claimed_by_worker_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE SET NULL,
+    claim_expires_at TEXT,
+    failure_summary TEXT,
+    failure_retryable INTEGER CHECK(failure_retryable IN (0, 1)),
+    answer_message_id TEXT REFERENCES messages(message_id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    CHECK(requester_repository_id <> target_repository_id),
+    CHECK(NOT (claimed_by_instance_id IS NOT NULL AND claimed_by_worker_run_id IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS requests_target_status_idx
+    ON requests(target_repository_id, status, claim_expires_at, created_at);
+
+CREATE INDEX IF NOT EXISTS requests_requester_status_idx
+    ON requests(requester_repository_id, status, created_at);
+
 CREATE TABLE IF NOT EXISTS events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
@@ -150,9 +180,13 @@ CREATE TABLE IF NOT EXISTS events (
         'worker_run_created',
         'worker_run_active',
         'worker_run_completed',
-        'worker_run_failed'
+        'worker_run_failed',
+        'request_available',
+        'request_claimed',
+        'request_answered',
+        'request_failed'
     )),
-    entity_type TEXT NOT NULL CHECK(entity_type IN ('message', 'worker_run')),
+    entity_type TEXT NOT NULL CHECK(entity_type IN ('message', 'worker_run', 'request')),
     entity_id TEXT NOT NULL,
     created_at TEXT NOT NULL
 );

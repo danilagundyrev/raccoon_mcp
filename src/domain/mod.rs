@@ -3,11 +3,13 @@ mod ids;
 mod messaging;
 mod presence;
 mod project;
+mod requests;
 mod worker;
 
 pub use events::{EventBatch, EventEntityType, EventKind, HubEvent, WaitOutcome};
 pub use ids::{
-    ArtifactId, InstanceId, MessageId, ProjectId, RepositoryId, ThreadId, WorkItemId, WorkerRunId,
+    ArtifactId, InstanceId, MessageId, ProjectId, RepositoryId, RequestId, ThreadId, WorkItemId,
+    WorkerRunId,
 };
 pub use messaging::{
     ActorRef, Artifact, ArtifactKind, DeliveryAck, InboxItem, InboxPage, Message, MessageKind,
@@ -15,6 +17,10 @@ pub use messaging::{
 };
 pub use presence::{AgentInstance, ConnectOrchestrator, ConnectResult, PresenceStatus};
 pub use project::{Project, ProjectOverview, Repository, RepositoryPresence};
+pub use requests::{
+    AnswerRequest, AnswerRequestResult, AskRepository, CoordinationRequest, FailRequest,
+    RequestStatus,
+};
 pub use worker::{
     AuditScopeItem, AuditWorkItemInput, CreateWorkerRun, WorkerRole, WorkerRun, WorkerRunStatus,
 };

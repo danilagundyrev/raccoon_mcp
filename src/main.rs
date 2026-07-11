@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod config;
 mod domain;
 mod server;
@@ -19,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
         args.max_db_connections,
         args.lease_seconds,
         args.worker_lease_seconds,
+        args.request_claim_lease_seconds,
     )
     .await
     .with_context(|| {

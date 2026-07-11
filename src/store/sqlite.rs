@@ -20,12 +20,13 @@ use tokio::{
 };
 
 use crate::domain::{
-    ActorRef, AgentInstance, Artifact, ArtifactId, AuditScopeItem, ConnectOrchestrator,
-    ConnectResult, CreateWorkerRun, DeliveryAck, EventBatch, EventEntityType, EventKind, HubEvent,
-    InboxItem, InboxPage, InstanceId, Message, MessageId, MessageTarget, PresenceStatus, Project,
-    ProjectId, ProjectOverview, PublishMessage, PublishResult, Repository, RepositoryId,
-    RepositoryPresence, ThreadId, WaitOutcome, WorkItemId, WorkerRole, WorkerRun, WorkerRunId,
-    WorkerRunStatus,
+    ActorRef, AgentInstance, AnswerRequest, AnswerRequestResult, Artifact, ArtifactId,
+    ArtifactKind, AskRepository, AuditScopeItem, ConnectOrchestrator, ConnectResult,
+    CoordinationRequest, CreateWorkerRun, DeliveryAck, EventBatch, EventEntityType, EventKind,
+    FailRequest, HubEvent, InboxItem, InboxPage, InstanceId, Message, MessageId, MessageKind,
+    MessageTarget, PresenceStatus, Project, ProjectId, ProjectOverview, PublishMessage,
+    PublishResult, Repository, RepositoryId, RepositoryPresence, RequestId, RequestStatus,
+    ThreadId, WaitOutcome, WorkItemId, WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
 };
 
 use super::schema::{CREATE_SCHEMA, SCHEMA_VERSION};
@@ -51,6 +52,7 @@ pub struct SqliteStore {
     pool: SqlitePool,
     lease_duration: chrono::Duration,
     worker_lease_duration: chrono::Duration,
+    request_claim_lease_duration: chrono::Duration,
     write_lock: Arc<Mutex<()>>,
     notifications: Arc<NotificationHub>,
 }
@@ -88,6 +90,7 @@ impl SqliteStore {
         max_connections: u32,
         lease_seconds: u16,
         worker_lease_seconds: u16,
+        request_claim_lease_seconds: u16,
     ) -> Result<Self, StoreError> {
         if let Some(parent) = database_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -118,6 +121,9 @@ impl SqliteStore {
             pool,
             lease_duration: chrono::Duration::seconds(lease_seconds as i64),
             worker_lease_duration: chrono::Duration::seconds(worker_lease_seconds as i64),
+            request_claim_lease_duration: chrono::Duration::seconds(
+                request_claim_lease_seconds as i64,
+            ),
             write_lock: Arc::new(Mutex::new(())),
             notifications: Arc::new(NotificationHub::default()),
         })
@@ -692,6 +698,415 @@ impl SqliteStore {
         })
     }
 
+    pub async fn ask_repository(
+        &self,
+        command: AskRepository,
+    ) -> Result<CoordinationRequest, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(&mut transaction, command.actor, &now)
+            .await?;
+        let target_project_id =
+            repository_project_id(&mut transaction, command.target_repository_id).await?;
+        if target_project_id != actor.project_id {
+            return Err(StoreError::Conflict(
+                "request target must belong to the actor project".to_owned(),
+            ));
+        }
+        if command.target_repository_id == actor.repository_id {
+            return Err(StoreError::Conflict(
+                "request target must differ from the requester repository".to_owned(),
+            ));
+        }
+        let context_refs_json = serde_json::to_string(&command.context_refs)?;
+        let request_id = RequestId::new();
+        let question_artifact = command.body.map(|content| Artifact {
+            artifact_id: ArtifactId::new(),
+            project_id: actor.project_id,
+            producer_repository_id: actor.repository_id,
+            producer_instance_id: actor.instance_id,
+            producer_worker_run_id: actor.worker_run_id,
+            kind: ArtifactKind::Note,
+            title: command.question_summary.clone(),
+            content_type: "text/markdown".to_owned(),
+            content,
+            created_at: now.clone(),
+        });
+        if let Some(artifact) = &question_artifact {
+            insert_artifact(&mut transaction, artifact).await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO requests(
+                 request_id, project_id, requester_repository_id, target_repository_id,
+                 created_by_instance_id, created_by_worker_run_id, status, question_summary,
+                 question_artifact_id, context_refs_json, claimed_by_instance_id,
+                 claimed_by_worker_run_id, claim_expires_at, failure_summary, failure_retryable,
+                 answer_message_id, created_at, updated_at, finished_at
+             ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL)",
+        )
+        .bind(request_id.to_string())
+        .bind(actor.project_id.to_string())
+        .bind(actor.repository_id.to_string())
+        .bind(command.target_repository_id.to_string())
+        .bind(actor.instance_id.map(|id| id.to_string()))
+        .bind(actor.worker_run_id.map(|id| id.to_string()))
+        .bind(command.question_summary)
+        .bind(question_artifact.as_ref().map(|artifact| artifact.artifact_id.to_string()))
+        .bind(context_refs_json)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?;
+        append_event(
+            &mut transaction,
+            actor.project_id,
+            command.target_repository_id,
+            EventKind::RequestAvailable,
+            EventEntityType::Request,
+            &request_id.to_string(),
+            &now,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.notifications.notify(command.target_repository_id);
+        self.get_request(request_id).await
+    }
+
+    pub async fn get_request(
+        &self,
+        request_id: RequestId,
+    ) -> Result<CoordinationRequest, StoreError> {
+        let row = sqlx::query("SELECT * FROM requests WHERE request_id = ?")
+            .bind(request_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("request {request_id}")))?;
+        request_from_row(&row)
+    }
+
+    pub async fn read_request(
+        &self,
+        actor_ref: ActorRef,
+        request_id: RequestId,
+    ) -> Result<CoordinationRequest, StoreError> {
+        let actor = self.resolve_actor_readonly(actor_ref, &utc_now()).await?;
+        let row = sqlx::query(
+            "SELECT * FROM requests
+             WHERE request_id = ? AND project_id = ?
+               AND (requester_repository_id = ? OR target_repository_id = ?)",
+        )
+        .bind(request_id.to_string())
+        .bind(actor.project_id.to_string())
+        .bind(actor.repository_id.to_string())
+        .bind(actor.repository_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("accessible request {request_id}")))?;
+        request_from_row(&row)
+    }
+
+    pub async fn claim_request(
+        &self,
+        actor_ref: ActorRef,
+        request_id: RequestId,
+    ) -> Result<CoordinationRequest, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(&mut transaction, actor_ref, &now)
+            .await?;
+        let claim_expires_at = (Utc::now() + self.request_claim_lease_duration)
+            .to_rfc3339_opts(SecondsFormat::Micros, true);
+        let result = sqlx::query(
+            "UPDATE requests
+             SET status = 'claimed', claimed_by_instance_id = ?, claimed_by_worker_run_id = ?,
+                 claim_expires_at = ?, updated_at = ?
+             WHERE request_id = ? AND target_repository_id = ?
+               AND (status = 'pending' OR (status = 'claimed' AND claim_expires_at <= ?))",
+        )
+        .bind(actor.instance_id.map(|id| id.to_string()))
+        .bind(actor.worker_run_id.map(|id| id.to_string()))
+        .bind(&claim_expires_at)
+        .bind(&now)
+        .bind(request_id.to_string())
+        .bind(actor.repository_id.to_string())
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(request_transition_conflict(request_id, "claim"));
+        }
+        append_event(
+            &mut transaction,
+            actor.project_id,
+            actor.repository_id,
+            EventKind::RequestClaimed,
+            EventEntityType::Request,
+            &request_id.to_string(),
+            &now,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.notifications.notify(actor.repository_id);
+        self.get_request(request_id).await
+    }
+
+    pub async fn renew_request_claim(
+        &self,
+        actor_ref: ActorRef,
+        request_id: RequestId,
+    ) -> Result<CoordinationRequest, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(&mut transaction, actor_ref, &now)
+            .await?;
+        let claim_expires_at = (Utc::now() + self.request_claim_lease_duration)
+            .to_rfc3339_opts(SecondsFormat::Micros, true);
+        let (owner_column, owner_id) = actor_owner(&actor);
+        let query = format!(
+            "UPDATE requests SET claim_expires_at = ?, updated_at = ?
+             WHERE request_id = ? AND target_repository_id = ? AND status = 'claimed'
+               AND {owner_column} = ? AND claim_expires_at > ?"
+        );
+        let result = sqlx::query(&query)
+            .bind(claim_expires_at)
+            .bind(&now)
+            .bind(request_id.to_string())
+            .bind(actor.repository_id.to_string())
+            .bind(owner_id)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(request_transition_conflict(request_id, "renew claim"));
+        }
+        transaction.commit().await?;
+        self.get_request(request_id).await
+    }
+
+    pub async fn release_request_claim(
+        &self,
+        actor_ref: ActorRef,
+        request_id: RequestId,
+    ) -> Result<CoordinationRequest, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(&mut transaction, actor_ref, &now)
+            .await?;
+        let (owner_column, owner_id) = actor_owner(&actor);
+        let query = format!(
+            "UPDATE requests
+             SET status = 'pending', claimed_by_instance_id = NULL,
+                 claimed_by_worker_run_id = NULL, claim_expires_at = NULL, updated_at = ?
+             WHERE request_id = ? AND target_repository_id = ? AND status = 'claimed'
+               AND {owner_column} = ? AND claim_expires_at > ?"
+        );
+        let result = sqlx::query(&query)
+            .bind(&now)
+            .bind(request_id.to_string())
+            .bind(actor.repository_id.to_string())
+            .bind(owner_id)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(request_transition_conflict(request_id, "release claim"));
+        }
+        append_event(
+            &mut transaction,
+            actor.project_id,
+            actor.repository_id,
+            EventKind::RequestAvailable,
+            EventEntityType::Request,
+            &request_id.to_string(),
+            &now,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.notifications.notify(actor.repository_id);
+        self.get_request(request_id).await
+    }
+
+    pub async fn answer_request(
+        &self,
+        command: AnswerRequest,
+    ) -> Result<AnswerRequestResult, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(&mut transaction, command.actor, &now)
+            .await?;
+        let request_row = sqlx::query("SELECT * FROM requests WHERE request_id = ?")
+            .bind(command.request_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("request {}", command.request_id)))?;
+        let request = request_from_row(&request_row)?;
+        ensure_active_request_claim(&request, &actor, &now)?;
+
+        let artifact = command.body.map(|content| Artifact {
+            artifact_id: ArtifactId::new(),
+            project_id: actor.project_id,
+            producer_repository_id: actor.repository_id,
+            producer_instance_id: actor.instance_id,
+            producer_worker_run_id: actor.worker_run_id,
+            kind: ArtifactKind::Answer,
+            title: command.answer_summary.clone(),
+            content_type: command.content_type,
+            content,
+            created_at: now.clone(),
+        });
+        if let Some(artifact) = &artifact {
+            insert_artifact(&mut transaction, artifact).await?;
+        }
+        let message = Message {
+            message_id: MessageId::new(),
+            project_id: actor.project_id,
+            sender_repository_id: actor.repository_id,
+            sender_instance_id: actor.instance_id,
+            sender_worker_run_id: actor.worker_run_id,
+            kind: MessageKind::Report,
+            thread_id: ThreadId::new(),
+            correlation_id: Some(command.request_id.to_string()),
+            in_reply_to: None,
+            summary: command.answer_summary,
+            artifact_id: artifact.as_ref().map(|value| value.artifact_id),
+            created_at: now.clone(),
+        };
+        insert_message(&mut transaction, &message).await?;
+        insert_delivery(
+            &mut transaction,
+            message.message_id,
+            request.requester_repository_id,
+            &now,
+        )
+        .await?;
+        let (owner_column, owner_id) = actor_owner(&actor);
+        let query = format!(
+            "UPDATE requests
+             SET status = 'answered', answer_message_id = ?, claim_expires_at = NULL,
+                 updated_at = ?, finished_at = ?
+             WHERE request_id = ? AND target_repository_id = ? AND status = 'claimed'
+               AND {owner_column} = ? AND claim_expires_at > ?"
+        );
+        let result = sqlx::query(&query)
+            .bind(message.message_id.to_string())
+            .bind(&now)
+            .bind(&now)
+            .bind(command.request_id.to_string())
+            .bind(actor.repository_id.to_string())
+            .bind(owner_id)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(request_transition_conflict(command.request_id, "answer"));
+        }
+        append_event(
+            &mut transaction,
+            actor.project_id,
+            request.requester_repository_id,
+            EventKind::MessageAvailable,
+            EventEntityType::Message,
+            &message.message_id.to_string(),
+            &now,
+        )
+        .await?;
+        append_event(
+            &mut transaction,
+            actor.project_id,
+            request.requester_repository_id,
+            EventKind::RequestAnswered,
+            EventEntityType::Request,
+            &command.request_id.to_string(),
+            &now,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.notifications.notify(request.requester_repository_id);
+        Ok(AnswerRequestResult {
+            request: self.get_request(command.request_id).await?,
+            message,
+            artifact,
+        })
+    }
+
+    pub async fn fail_request(
+        &self,
+        command: FailRequest,
+    ) -> Result<CoordinationRequest, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(&mut transaction, command.actor, &now)
+            .await?;
+        let request_row = sqlx::query("SELECT * FROM requests WHERE request_id = ?")
+            .bind(command.request_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("request {}", command.request_id)))?;
+        let request = request_from_row(&request_row)?;
+        ensure_active_request_claim(&request, &actor, &now)?;
+        let next_status = if command.retryable {
+            "pending"
+        } else {
+            "failed"
+        };
+        let finished_at = (!command.retryable).then_some(now.as_str());
+        let (owner_column, owner_id) = actor_owner(&actor);
+        let query = format!(
+            "UPDATE requests
+             SET status = ?, claimed_by_instance_id = NULL, claimed_by_worker_run_id = NULL,
+                 claim_expires_at = NULL, failure_summary = ?, failure_retryable = ?,
+                 updated_at = ?, finished_at = ?
+             WHERE request_id = ? AND target_repository_id = ? AND status = 'claimed'
+               AND {owner_column} = ? AND claim_expires_at > ?"
+        );
+        let result = sqlx::query(&query)
+            .bind(next_status)
+            .bind(command.summary)
+            .bind(command.retryable)
+            .bind(&now)
+            .bind(finished_at)
+            .bind(command.request_id.to_string())
+            .bind(actor.repository_id.to_string())
+            .bind(owner_id)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(request_transition_conflict(command.request_id, "fail"));
+        }
+        let (recipient, event_kind) = if command.retryable {
+            (actor.repository_id, EventKind::RequestAvailable)
+        } else {
+            (request.requester_repository_id, EventKind::RequestFailed)
+        };
+        append_event(
+            &mut transaction,
+            actor.project_id,
+            recipient,
+            event_kind,
+            EventEntityType::Request,
+            &command.request_id.to_string(),
+            &now,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.notifications.notify(recipient);
+        self.get_request(command.request_id).await
+    }
+
     pub async fn list_inbox(
         &self,
         actor_ref: ActorRef,
@@ -773,15 +1188,21 @@ impl SqliteStore {
         let row = sqlx::query(
             "SELECT a.* FROM artifacts a
              WHERE a.artifact_id = ?
-               AND (a.producer_repository_id = ? OR EXISTS (
-                   SELECT 1
-                   FROM messages m
-                   JOIN deliveries d ON d.message_id = m.message_id
-                   WHERE m.artifact_id = a.artifact_id
-                     AND d.recipient_repository_id = ?
-               ))",
+                AND (a.producer_repository_id = ? OR EXISTS (
+                    SELECT 1
+                    FROM messages m
+                    JOIN deliveries d ON d.message_id = m.message_id
+                    WHERE m.artifact_id = a.artifact_id
+                      AND d.recipient_repository_id = ?
+                ) OR EXISTS (
+                    SELECT 1 FROM requests q
+                    WHERE q.question_artifact_id = a.artifact_id
+                      AND (q.requester_repository_id = ? OR q.target_repository_id = ?)
+                ))",
         )
         .bind(artifact_id.to_string())
+        .bind(actor.repository_id.to_string())
+        .bind(actor.repository_id.to_string())
         .bind(actor.repository_id.to_string())
         .bind(actor.repository_id.to_string())
         .fetch_optional(&self.pool)
@@ -1185,6 +1606,69 @@ async fn append_event(
     .execute(&mut **transaction)
     .await?;
     Ok(())
+}
+
+async fn insert_delivery(
+    transaction: &mut Transaction<'_, Sqlite>,
+    message_id: MessageId,
+    recipient_repository_id: RepositoryId,
+    created_at: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("INSERT INTO message_targets(message_id, repository_id) VALUES (?, ?)")
+        .bind(message_id.to_string())
+        .bind(recipient_repository_id.to_string())
+        .execute(&mut **transaction)
+        .await?;
+    sqlx::query(
+        "INSERT INTO deliveries(
+             message_id, recipient_repository_id, status, created_at,
+             acked_at, acked_by_instance_id, acked_by_worker_run_id
+         ) VALUES (?, ?, 'pending', ?, NULL, NULL, NULL)",
+    )
+    .bind(message_id.to_string())
+    .bind(recipient_repository_id.to_string())
+    .bind(created_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+fn actor_owner(actor: &ResolvedActor) -> (&'static str, String) {
+    match (actor.instance_id, actor.worker_run_id) {
+        (Some(instance_id), None) => ("claimed_by_instance_id", instance_id.to_string()),
+        (None, Some(worker_run_id)) => ("claimed_by_worker_run_id", worker_run_id.to_string()),
+        _ => unreachable!("resolved actor has exactly one identity"),
+    }
+}
+
+fn ensure_active_request_claim(
+    request: &CoordinationRequest,
+    actor: &ResolvedActor,
+    now: &str,
+) -> Result<(), StoreError> {
+    let owns_claim = match (actor.instance_id, actor.worker_run_id) {
+        (Some(instance_id), None) => request.claimed_by_instance_id == Some(instance_id),
+        (None, Some(worker_run_id)) => request.claimed_by_worker_run_id == Some(worker_run_id),
+        _ => false,
+    };
+    if request.project_id != actor.project_id
+        || request.target_repository_id != actor.repository_id
+        || request.status != RequestStatus::Claimed
+        || !owns_claim
+        || request
+            .claim_expires_at
+            .as_deref()
+            .is_none_or(|expires| expires <= now)
+    {
+        return Err(request_transition_conflict(request.request_id, "use claim"));
+    }
+    Ok(())
+}
+
+fn request_transition_conflict(request_id: RequestId, action: &str) -> StoreError {
+    StoreError::Conflict(format!(
+        "request {request_id} cannot perform '{action}': status, target, owner or claim lease does not match"
+    ))
 }
 
 fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreError> {
@@ -1775,6 +2259,47 @@ fn event_from_row(row: &SqliteRow) -> Result<HubEvent, StoreError> {
     })
 }
 
+fn request_from_row(row: &SqliteRow) -> Result<CoordinationRequest, StoreError> {
+    let status: String = row.try_get("status")?;
+    let context_refs_json: String = row.try_get("context_refs_json")?;
+    Ok(CoordinationRequest {
+        request_id: RequestId::parse(row.try_get("request_id")?)?,
+        project_id: ProjectId::parse(row.try_get("project_id")?)?,
+        requester_repository_id: RepositoryId::parse(row.try_get("requester_repository_id")?)?,
+        target_repository_id: RepositoryId::parse(row.try_get("target_repository_id")?)?,
+        created_by_instance_id: parse_optional_id(
+            row.try_get("created_by_instance_id")?,
+            InstanceId::parse,
+        )?,
+        created_by_worker_run_id: parse_optional_id(
+            row.try_get("created_by_worker_run_id")?,
+            WorkerRunId::parse,
+        )?,
+        status: status.parse().map_err(StoreError::Conflict)?,
+        question_summary: row.try_get("question_summary")?,
+        question_artifact_id: parse_optional_id(
+            row.try_get("question_artifact_id")?,
+            ArtifactId::parse,
+        )?,
+        context_refs: serde_json::from_str(&context_refs_json)?,
+        claimed_by_instance_id: parse_optional_id(
+            row.try_get("claimed_by_instance_id")?,
+            InstanceId::parse,
+        )?,
+        claimed_by_worker_run_id: parse_optional_id(
+            row.try_get("claimed_by_worker_run_id")?,
+            WorkerRunId::parse,
+        )?,
+        claim_expires_at: row.try_get("claim_expires_at")?,
+        failure_summary: row.try_get("failure_summary")?,
+        failure_retryable: row.try_get::<Option<bool>, _>("failure_retryable")?,
+        answer_message_id: parse_optional_id(row.try_get("answer_message_id")?, MessageId::parse)?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        finished_at: row.try_get("finished_at")?,
+    })
+}
+
 fn parse_optional_id<T>(
     value: Option<String>,
     parser: impl FnOnce(&str) -> Result<T, uuid::Error>,
@@ -1819,7 +2344,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::domain::{AuditWorkItemInput, WorkItemId, WorkerRole};
+    use crate::domain::{
+        AnswerRequest, AskRepository, AuditWorkItemInput, FailRequest, RequestStatus, WorkItemId,
+        WorkerRole,
+    };
 
     fn temp_database_path() -> PathBuf {
         std::env::temp_dir()
@@ -1829,7 +2357,7 @@ mod tests {
 
     async fn test_store(lease_seconds: u16) -> (SqliteStore, PathBuf) {
         let path = temp_database_path();
-        let store = SqliteStore::open(&path, 2, lease_seconds, 3600)
+        let store = SqliteStore::open(&path, 2, lease_seconds, 3600, 600)
             .await
             .unwrap();
         (store, path)
@@ -2344,7 +2872,7 @@ mod tests {
             .unwrap();
         store.pool.close().await;
 
-        let reopened = SqliteStore::open(&path, 2, 90, 3600).await.unwrap();
+        let reopened = SqliteStore::open(&path, 2, 90, 3600, 600).await.unwrap();
         let inbox = reopened
             .list_inbox(ActorRef::Orchestrator(web.instance.instance_id), None, 20)
             .await
@@ -2832,6 +3360,281 @@ mod tests {
         assert!(batch.events.is_empty());
         assert!(renewed.last_heartbeat_at > initial_heartbeat);
         assert!(renewed.lease_expires_at > utc_now());
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn only_one_actor_can_claim_the_same_request() {
+        let (store, path) = test_store(90).await;
+        let requester = store
+            .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+            .await
+            .unwrap();
+        let target_one = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let target_two = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let request = store
+            .ask_repository(AskRepository {
+                actor: ActorRef::Orchestrator(requester.instance.instance_id),
+                target_repository_id: target_one.repository.repository_id,
+                question_summary: "Which response fields are guaranteed?".to_owned(),
+                body: Some("Need the complete API contract.".to_owned()),
+                context_refs: json!([]),
+            })
+            .await
+            .unwrap();
+
+        let (first, second) = tokio::join!(
+            store.claim_request(
+                ActorRef::Orchestrator(target_one.instance.instance_id),
+                request.request_id
+            ),
+            store.claim_request(
+                ActorRef::Orchestrator(target_two.instance.instance_id),
+                request.request_id
+            )
+        );
+
+        assert_ne!(first.is_ok(), second.is_ok());
+        let claimed = store.get_request(request.request_id).await.unwrap();
+        assert_eq!(claimed.status, RequestStatus::Claimed);
+        assert!(claimed.claim_expires_at.is_some());
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn expired_claim_can_be_taken_over_and_retryable_failure_requeues() {
+        let (store, path) = test_store(90).await;
+        let requester = store
+            .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+            .await
+            .unwrap();
+        let target_one = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let target_two = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let request = store
+            .ask_repository(AskRepository {
+                actor: ActorRef::Orchestrator(requester.instance.instance_id),
+                target_repository_id: target_one.repository.repository_id,
+                question_summary: "Can this request be retried?".to_owned(),
+                body: None,
+                context_refs: json!([]),
+            })
+            .await
+            .unwrap();
+        store
+            .claim_request(
+                ActorRef::Orchestrator(target_one.instance.instance_id),
+                request.request_id,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE requests SET claim_expires_at = ? WHERE request_id = ?")
+            .bind("2000-01-01T00:00:00.000000Z")
+            .bind(request.request_id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        store
+            .claim_request(
+                ActorRef::Orchestrator(target_two.instance.instance_id),
+                request.request_id,
+            )
+            .await
+            .unwrap();
+        let requeued = store
+            .fail_request(FailRequest {
+                actor: ActorRef::Orchestrator(target_two.instance.instance_id),
+                request_id: request.request_id,
+                retryable: true,
+                summary: "Temporary dependency failure".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(requeued.status, RequestStatus::Pending);
+        assert_eq!(
+            requeued.failure_summary.as_deref(),
+            Some("Temporary dependency failure")
+        );
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn answer_atomically_closes_request_and_delivers_artifact() {
+        let (store, path) = test_store(90).await;
+        let requester = store
+            .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+            .await
+            .unwrap();
+        let target = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let request = store
+            .ask_repository(AskRepository {
+                actor: ActorRef::Orchestrator(requester.instance.instance_id),
+                target_repository_id: target.repository.repository_id,
+                question_summary: "Return the contract".to_owned(),
+                body: None,
+                context_refs: json!([]),
+            })
+            .await
+            .unwrap();
+        store
+            .claim_request(
+                ActorRef::Orchestrator(target.instance.instance_id),
+                request.request_id,
+            )
+            .await
+            .unwrap();
+
+        let answered = store
+            .answer_request(AnswerRequest {
+                actor: ActorRef::Orchestrator(target.instance.instance_id),
+                request_id: request.request_id,
+                answer_summary: "Contract attached".to_owned(),
+                body: Some("# API contract".to_owned()),
+                content_type: "text/markdown".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(answered.request.status, RequestStatus::Answered);
+        assert_eq!(
+            answered.message.correlation_id,
+            Some(request.request_id.to_string())
+        );
+        assert_eq!(answered.artifact.unwrap().content, "# API contract");
+        let inbox = store
+            .list_inbox(
+                ActorRef::Orchestrator(requester.instance.instance_id),
+                None,
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(inbox.items.len(), 1);
+        assert!(
+            store
+                .answer_request(AnswerRequest {
+                    actor: ActorRef::Orchestrator(target.instance.instance_id),
+                    request_id: request.request_id,
+                    answer_summary: "Duplicate".to_owned(),
+                    body: None,
+                    content_type: "text/plain".to_owned(),
+                })
+                .await
+                .is_err()
+        );
+
+        store.pool.close().await;
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn claim_owner_can_renew_release_and_terminally_fail_request() {
+        let (store, path) = test_store(90).await;
+        let requester = store
+            .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+            .await
+            .unwrap();
+        let owner = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let peer = store
+            .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+            .await
+            .unwrap();
+        let request = store
+            .ask_repository(AskRepository {
+                actor: ActorRef::Orchestrator(requester.instance.instance_id),
+                target_repository_id: owner.repository.repository_id,
+                question_summary: "Resolve ownership rules".to_owned(),
+                body: None,
+                context_refs: json!([]),
+            })
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_request(
+                ActorRef::Orchestrator(owner.instance.instance_id),
+                request.request_id,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .renew_request_claim(
+                    ActorRef::Orchestrator(peer.instance.instance_id),
+                    request.request_id,
+                )
+                .await
+                .is_err()
+        );
+        let renewed = store
+            .renew_request_claim(
+                ActorRef::Orchestrator(owner.instance.instance_id),
+                request.request_id,
+            )
+            .await
+            .unwrap();
+        assert!(renewed.claim_expires_at >= claimed.claim_expires_at);
+        let released = store
+            .release_request_claim(
+                ActorRef::Orchestrator(owner.instance.instance_id),
+                request.request_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(released.status, RequestStatus::Pending);
+        store
+            .claim_request(
+                ActorRef::Orchestrator(peer.instance.instance_id),
+                request.request_id,
+            )
+            .await
+            .unwrap();
+        let failed = store
+            .fail_request(FailRequest {
+                actor: ActorRef::Orchestrator(peer.instance.instance_id),
+                request_id: request.request_id,
+                retryable: false,
+                summary: "No supported contract exists".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(failed.status, RequestStatus::Failed);
+        assert!(failed.finished_at.is_some());
+        let events = store
+            .wait_for_events(
+                ActorRef::Orchestrator(requester.instance.instance_id),
+                0,
+                &[EventKind::RequestFailed],
+                Some(Duration::ZERO),
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(events.events[0].entity_id, request.request_id.to_string());
 
         store.pool.close().await;
         remove_database(&path);

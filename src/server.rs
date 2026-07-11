@@ -22,9 +22,10 @@ use tokio::net::TcpListener;
 
 use crate::{
     domain::{
-        ActorRef, ArtifactId, ArtifactKind, AuditWorkItemInput, ConnectOrchestrator,
-        CreateWorkerRun, EventKind, InstanceId, MessageId, MessageKind, MessageTarget, ProjectId,
-        PublishMessage, RepositoryId, ThreadId, WorkItemId, WorkerRole, WorkerRunId, validate_key,
+        ActorRef, AnswerRequest, ArtifactId, ArtifactKind, AskRepository, AuditWorkItemInput,
+        ConnectOrchestrator, CreateWorkerRun, EventKind, FailRequest, InstanceId, MessageId,
+        MessageKind, MessageTarget, ProjectId, PublishMessage, RepositoryId, RequestId, ThreadId,
+        WorkItemId, WorkerRole, WorkerRunId, validate_key,
     },
     store::{SqliteStore, StoreError},
 };
@@ -368,7 +369,7 @@ async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. Roles are executor, butler and auditor. An auditor receives one or more audit_work_items with a bounded max_iterations policy and publishes an audit_report artifact. If findings require remediation, create exactly one executor with addresses_audit_run_id for the complete audit report; do not create one executor per finding. The child activates and completes/fails its run through MCP and never registers as a repository. Use publish_message for delivery, wait_for_events for efficient repository-scoped waiting, list_inbox for compact headers, read_artifact only when full content is needed, and ack_message after processing. An active wait renews its actor lease; omit timeout_seconds for no server-side timeout.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. Roles are executor, butler and auditor. An auditor receives one or more audit_work_items with a bounded max_iterations policy and publishes an audit_report artifact. If findings require remediation, create exactly one executor with addresses_audit_run_id for the complete audit report; do not create one executor per finding. The child activates and completes/fails its run through MCP and never registers as a repository. Use ask_repository plus claim/renew/release/answer/fail for durable questions that require exclusive handling. Use publish_message for ordinary delivery, wait_for_events for efficient repository-scoped waiting, list_inbox for compact headers, read_artifact only when full content is needed, and ack_message after processing. An active wait renews its actor lease; omit timeout_seconds for no server-side timeout.",
         })),
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
         "ping" => Ok(json!({})),
@@ -597,6 +598,102 @@ async fn call_tool(
                 .await
                 .map(|value| json!(value))
         }
+        "ask_repository" => {
+            let actor = parse_actor(&arguments)?;
+            let target_repository_id =
+                RepositoryId::parse(&require_string(&arguments, "target_repository_id")?)
+                    .map_err(invalid_uuid)?;
+            let question_summary =
+                validated_summary(&arguments, "question_summary", max_summary_bytes)?;
+            let body = validated_optional_body(&arguments, max_artifact_bytes)?;
+            let context_refs = arguments
+                .get("context_refs")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            if !context_refs.is_array() {
+                return Err(invalid_argument(
+                    "'context_refs' must be an array when provided".to_owned(),
+                ));
+            }
+            store
+                .ask_repository(AskRepository {
+                    actor,
+                    target_repository_id,
+                    question_summary,
+                    body,
+                    context_refs,
+                })
+                .await
+                .map(|value| json!(value))
+        }
+        "read_request" => {
+            let actor = parse_actor(&arguments)?;
+            let request_id = parse_request_id(&arguments)?;
+            store
+                .read_request(actor, request_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "claim_request" => {
+            let actor = parse_actor(&arguments)?;
+            let request_id = parse_request_id(&arguments)?;
+            store
+                .claim_request(actor, request_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "renew_request_claim" => {
+            let actor = parse_actor(&arguments)?;
+            let request_id = parse_request_id(&arguments)?;
+            store
+                .renew_request_claim(actor, request_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "release_request_claim" => {
+            let actor = parse_actor(&arguments)?;
+            let request_id = parse_request_id(&arguments)?;
+            store
+                .release_request_claim(actor, request_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "answer_request" => {
+            let actor = parse_actor(&arguments)?;
+            let request_id = parse_request_id(&arguments)?;
+            let answer_summary =
+                validated_summary(&arguments, "answer_summary", max_summary_bytes)?;
+            let body = validated_optional_body(&arguments, max_artifact_bytes)?;
+            let content_type = optional_string(&arguments, "content_type")?
+                .unwrap_or_else(|| "text/markdown".to_owned());
+            store
+                .answer_request(AnswerRequest {
+                    actor,
+                    request_id,
+                    answer_summary,
+                    body,
+                    content_type,
+                })
+                .await
+                .map(|value| json!(value))
+        }
+        "fail_request" => {
+            let actor = parse_actor(&arguments)?;
+            let request_id = parse_request_id(&arguments)?;
+            let retryable = optional_bool(&arguments, "retryable")?.ok_or_else(|| {
+                invalid_argument("'retryable' is required and must be a boolean".to_owned())
+            })?;
+            let summary = validated_summary(&arguments, "summary", max_summary_bytes)?;
+            store
+                .fail_request(FailRequest {
+                    actor,
+                    request_id,
+                    retryable,
+                    summary,
+                })
+                .await
+                .map(|value| json!(value))
+        }
         "list_inbox" => {
             let actor = parse_actor(&arguments)?;
             let after_delivery_id = optional_nonnegative_i64(&arguments, "after_delivery_id")?;
@@ -686,6 +783,12 @@ async fn read_resource(
                     "If remediation is needed, create at most one executor run with addresses_audit_run_id; that executor addresses the whole report.",
                     "A later audit increments each item's iteration independently and is rejected after that item's depth is exhausted."
                 ],
+                "request_flow": [
+                    "Create a durable directed question with ask_repository; the target receives request_available.",
+                    "One target actor atomically claims it and renews the claim while working; an expired claim can be taken over.",
+                    "answer_request atomically closes the request and delivers an answer message/artifact to the requester.",
+                    "A retryable failure returns the request to pending; a terminal failure closes it and notifies the requester."
+                ],
                 "messaging_flow": [
                     "Publish an immutable summary and optional artifact with publish_message.",
                     "Call wait_for_events with the last event cursor; omit timeout_seconds for an unbounded server wait. The server renews the waiting actor lease.",
@@ -693,7 +796,7 @@ async fn read_resource(
                     "Use read_message/read_artifact only for selected items.",
                     "Call ack_message after processing; broadcast recipients acknowledge independently."
                 ],
-                "current_scope": "Project/repository presence, worker runs, immutable messaging, artifacts, reliable per-repository delivery and cursor-based event waiting.",
+                "current_scope": "Project/repository presence, worker runs, immutable messaging, artifacts, reliable per-repository delivery, cursor-based event waiting and claimed repository requests.",
             }),
         ));
     }
@@ -745,6 +848,10 @@ fn parse_message_id(arguments: &JsonMap<String, Value>) -> Result<MessageId, Rpc
     MessageId::parse(&require_string(arguments, "message_id")?).map_err(invalid_uuid)
 }
 
+fn parse_request_id(arguments: &JsonMap<String, Value>) -> Result<RequestId, RpcError> {
+    RequestId::parse(&require_string(arguments, "request_id")?).map_err(invalid_uuid)
+}
+
 fn parse_actor(arguments: &JsonMap<String, Value>) -> Result<ActorRef, RpcError> {
     let instance_id = optional_string(arguments, "instance_id")?
         .map(|value| InstanceId::parse(&value).map_err(invalid_uuid))
@@ -772,6 +879,22 @@ fn optional_bool(
             "'{field_name}' must be a boolean when provided"
         ))),
     }
+}
+
+fn validated_optional_body(
+    arguments: &JsonMap<String, Value>,
+    max_artifact_bytes: u32,
+) -> Result<Option<String>, RpcError> {
+    let body = optional_string(arguments, "body")?;
+    if body
+        .as_ref()
+        .is_some_and(|body| body.len() > max_artifact_bytes as usize)
+    {
+        return Err(invalid_argument(format!(
+            "'body' must not exceed {max_artifact_bytes} UTF-8 bytes"
+        )));
+    }
+    Ok(body)
 }
 
 fn optional_nonnegative_i64(
@@ -1168,6 +1291,48 @@ fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) -> Value {
             }
         },
         {
+            "name": "ask_repository",
+            "description": "Create a durable question for one repository. The target receives a request_available event and may atomically claim it.",
+            "inputSchema": ask_repository_schema(max_summary_bytes, max_artifact_bytes),
+            "annotations": mutation_annotations(false)
+        },
+        {
+            "name": "read_request",
+            "description": "Read request state from its requester or target repository without renewing actor or claim leases.",
+            "inputSchema": actor_entity_schema("request_id"),
+            "annotations": mutation_annotations(true)
+        },
+        {
+            "name": "claim_request",
+            "description": "Atomically claim a pending request, or take over a claim whose lease expired.",
+            "inputSchema": actor_entity_schema("request_id"),
+            "annotations": mutation_annotations(false)
+        },
+        {
+            "name": "renew_request_claim",
+            "description": "Extend an unexpired request claim owned by this exact actor.",
+            "inputSchema": actor_entity_schema("request_id"),
+            "annotations": mutation_annotations(false)
+        },
+        {
+            "name": "release_request_claim",
+            "description": "Release an owned request claim back to pending and notify the target repository.",
+            "inputSchema": actor_entity_schema("request_id"),
+            "annotations": mutation_annotations(false)
+        },
+        {
+            "name": "answer_request",
+            "description": "Atomically close an owned request and deliver an answer message with an optional artifact to the requester.",
+            "inputSchema": answer_request_schema(max_summary_bytes, max_artifact_bytes),
+            "annotations": mutation_annotations(false)
+        },
+        {
+            "name": "fail_request",
+            "description": "Fail an owned request. Retryable failures return it to pending; terminal failures notify the requester.",
+            "inputSchema": fail_request_schema(max_summary_bytes),
+            "annotations": mutation_annotations(false)
+        },
+        {
             "name": "list_inbox",
             "description": "List pending message headers for the actor's repository. Full artifact content is never included.",
             "inputSchema": inbox_schema(),
@@ -1333,7 +1498,11 @@ fn wait_for_events_schema() -> Value {
                     "worker_run_created",
                     "worker_run_active",
                     "worker_run_completed",
-                    "worker_run_failed"
+                    "worker_run_failed",
+                    "request_available",
+                    "request_claimed",
+                    "request_answered",
+                    "request_failed"
                 ]
             }
         }),
@@ -1359,6 +1528,98 @@ fn wait_for_events_schema() -> Value {
             { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
             { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
         ]
+    })
+}
+
+fn ask_repository_schema(max_summary_bytes: u16, max_artifact_bytes: u32) -> Value {
+    let mut properties = actor_properties();
+    properties.insert(
+        "target_repository_id".to_owned(),
+        json!({ "type": "string", "format": "uuid" }),
+    );
+    properties.insert(
+        "question_summary".to_owned(),
+        json!({ "type": "string", "maxLength": max_summary_bytes }),
+    );
+    properties.insert(
+        "body".to_owned(),
+        json!({ "type": "string", "maxLength": max_artifact_bytes }),
+    );
+    properties.insert(
+        "context_refs".to_owned(),
+        json!({ "type": "array", "items": { "type": "object" } }),
+    );
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": ["target_repository_id", "question_summary"],
+        "oneOf": [
+            { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
+            { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
+        ]
+    })
+}
+
+fn answer_request_schema(max_summary_bytes: u16, max_artifact_bytes: u32) -> Value {
+    let mut properties = actor_properties();
+    properties.insert(
+        "request_id".to_owned(),
+        json!({ "type": "string", "format": "uuid" }),
+    );
+    properties.insert(
+        "answer_summary".to_owned(),
+        json!({ "type": "string", "maxLength": max_summary_bytes }),
+    );
+    properties.insert(
+        "body".to_owned(),
+        json!({ "type": "string", "maxLength": max_artifact_bytes }),
+    );
+    properties.insert(
+        "content_type".to_owned(),
+        json!({ "type": "string", "default": "text/markdown" }),
+    );
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": ["request_id", "answer_summary"],
+        "oneOf": [
+            { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
+            { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
+        ]
+    })
+}
+
+fn fail_request_schema(max_summary_bytes: u16) -> Value {
+    let mut properties = actor_properties();
+    properties.insert(
+        "request_id".to_owned(),
+        json!({ "type": "string", "format": "uuid" }),
+    );
+    properties.insert("retryable".to_owned(), json!({ "type": "boolean" }));
+    properties.insert(
+        "summary".to_owned(),
+        json!({ "type": "string", "maxLength": max_summary_bytes }),
+    );
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": ["request_id", "retryable", "summary"],
+        "oneOf": [
+            { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
+            { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
+        ]
+    })
+}
+
+fn mutation_annotations(read_only: bool) -> Value {
+    json!({
+        "readOnlyHint": read_only,
+        "destructiveHint": false,
+        "idempotentHint": read_only,
+        "openWorldHint": false
     })
 }
 
@@ -1598,5 +1859,31 @@ mod tests {
 
         arguments.insert("limit".to_owned(), json!(51));
         assert!(optional_event_limit(&arguments).is_err());
+    }
+
+    #[test]
+    fn request_tools_expose_actor_scoping_and_payload_limits() {
+        let ask = ask_repository_schema(2048, 65_536);
+        assert_eq!(ask["properties"]["question_summary"]["maxLength"], 2048);
+        assert_eq!(ask["properties"]["body"]["maxLength"], 65_536);
+
+        let tools = tool_definitions(2048, 65_536);
+        let names = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<HashSet<_>>();
+        for expected in [
+            "ask_repository",
+            "read_request",
+            "claim_request",
+            "renew_request_claim",
+            "release_request_claim",
+            "answer_request",
+            "fail_request",
+        ] {
+            assert!(names.contains(expected));
+        }
     }
 }

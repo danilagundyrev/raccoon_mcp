@@ -44,6 +44,14 @@ pub struct Args {
 
     #[arg(
         long,
+        default_value_t = 600,
+        value_parser = clap::value_parser!(u16).range(60..=65535),
+        help = "Default repository-request claim lease duration in seconds."
+    )]
+    pub request_claim_lease_seconds: u16,
+
+    #[arg(
+        long,
         default_value_t = 1024,
         value_parser = clap::value_parser!(u16).range(128..=65535),
         help = "Maximum UTF-8 byte length of compact summary fields."

@@ -49,3 +49,4 @@ uuid_id!(MessageId);
 uuid_id!(ArtifactId);
 uuid_id!(ThreadId);
 uuid_id!(WorkItemId);
+uuid_id!(RequestId);
