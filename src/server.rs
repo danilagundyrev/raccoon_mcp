@@ -369,7 +369,7 @@ async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. Roles are executor, butler and auditor. An auditor receives one or more audit_work_items with a bounded max_iterations policy and publishes an audit_report artifact. If findings require remediation, create exactly one executor with addresses_audit_run_id for the complete audit report; do not create one executor per finding. The child activates and completes/fails its run through MCP and never registers as a repository. Use ask_repository plus claim/renew/release/answer/fail for durable questions that require exclusive handling. Use publish_message for ordinary delivery, wait_for_events for efficient repository-scoped waiting, list_inbox for compact headers, read_artifact only when full content is needed, and ack_message after processing. An active wait renews its actor lease; omit timeout_seconds for no server-side timeout.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. Roles are executor, butler and auditor. An auditor receives one or more audit_work_items with a bounded max_iterations policy and publishes an audit_report artifact. If findings require remediation, create exactly one executor with addresses_audit_run_id for the complete audit report; do not create one executor per finding. The child activates and completes/fails its run through MCP and never registers as a repository. Use ask_repository plus claim/renew/release/answer/fail for durable questions that require exclusive handling. Use an idempotency_key when create_worker_run, publish_message or ask_repository may be retried after transport uncertainty. Use publish_message for ordinary delivery, wait_for_events for efficient repository-scoped waiting, list_inbox for compact headers, read_artifact only when full content is needed, and ack_message after processing. An active wait renews its actor lease and any unexpired request claim owned by it; omit timeout_seconds for no server-side timeout.",
         })),
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
         "ping" => Ok(json!({})),
@@ -457,17 +457,24 @@ async fn call_tool(
                 .map_err(invalid_argument)?;
             let task_summary = validated_summary(&arguments, "task_summary", max_summary_bytes)?;
             let context_refs = validated_context_refs(&arguments)?;
+            let idempotency_key = optional_idempotency_key(&arguments)?;
             store
-                .create_worker_run(CreateWorkerRun {
-                    parent_instance_id,
-                    role,
-                    task_summary,
-                    context_refs,
-                    audit_work_items: optional_audit_work_items(&arguments)?,
-                    addresses_audit_run_id: optional_string(&arguments, "addresses_audit_run_id")?
+                .create_worker_run_idempotent(
+                    CreateWorkerRun {
+                        parent_instance_id,
+                        role,
+                        task_summary,
+                        context_refs,
+                        audit_work_items: optional_audit_work_items(&arguments)?,
+                        addresses_audit_run_id: optional_string(
+                            &arguments,
+                            "addresses_audit_run_id",
+                        )?
                         .map(|value| WorkerRunId::parse(&value).map_err(invalid_uuid))
                         .transpose()?,
-                })
+                    },
+                    idempotency_key.as_deref(),
+                )
                 .await
                 .map(|value| json!(value))
         }
@@ -561,21 +568,25 @@ async fn call_tool(
                     "'correlation_id' must not exceed 128 UTF-8 bytes".to_owned(),
                 ));
             }
+            let idempotency_key = optional_idempotency_key(&arguments)?;
             store
-                .publish_message(PublishMessage {
-                    actor,
-                    kind,
-                    target,
-                    summary,
-                    body,
-                    artifact_kind,
-                    artifact_title: optional_string(&arguments, "artifact_title")?,
-                    content_type: optional_string(&arguments, "content_type")?
-                        .unwrap_or_else(|| "text/markdown".to_owned()),
-                    thread_id,
-                    correlation_id,
-                    in_reply_to,
-                })
+                .publish_message_idempotent(
+                    PublishMessage {
+                        actor,
+                        kind,
+                        target,
+                        summary,
+                        body,
+                        artifact_kind,
+                        artifact_title: optional_string(&arguments, "artifact_title")?,
+                        content_type: optional_string(&arguments, "content_type")?
+                            .unwrap_or_else(|| "text/markdown".to_owned()),
+                        thread_id,
+                        correlation_id,
+                        in_reply_to,
+                    },
+                    idempotency_key.as_deref(),
+                )
                 .await
                 .map(|value| json!(value))
         }
@@ -599,14 +610,18 @@ async fn call_tool(
                 validated_summary(&arguments, "question_summary", max_summary_bytes)?;
             let body = validated_optional_body(&arguments, max_artifact_bytes)?;
             let context_refs = validated_context_refs(&arguments)?;
+            let idempotency_key = optional_idempotency_key(&arguments)?;
             store
-                .ask_repository(AskRepository {
-                    actor,
-                    target_repository_id,
-                    question_summary,
-                    body,
-                    context_refs,
-                })
+                .ask_repository_idempotent(
+                    AskRepository {
+                        actor,
+                        target_repository_id,
+                        question_summary,
+                        body,
+                        context_refs,
+                    },
+                    idempotency_key.as_deref(),
+                )
                 .await
                 .map(|value| json!(value))
         }
@@ -769,12 +784,13 @@ async fn read_resource(
                 ],
                 "request_flow": [
                     "Create a durable directed question with ask_repository; the target receives request_available.",
-                    "One target actor atomically claims it and renews the claim while working; an expired claim can be taken over.",
+                    "One target actor atomically claims it; explicit renew, heartbeat, mutating actor activity and active event waiting extend only an unexpired claim.",
                     "answer_request atomically closes the request and delivers an answer message/artifact to the requester.",
                     "A retryable failure returns the request to pending; a terminal failure closes it and notifies the requester."
                 ],
                 "messaging_flow": [
                     "Publish an immutable summary and optional artifact with publish_message.",
+                    "Supply an actor-scoped idempotency_key to creation calls that may be retried; the same key requires an identical payload.",
                     "Call wait_for_events with the last event cursor; omit timeout_seconds for an unbounded server wait. The server renews the waiting actor lease.",
                     "Use list_inbox to read pending headers without artifact bodies.",
                     "Use read_message/read_artifact only for selected items.",
@@ -900,6 +916,21 @@ fn validated_context_refs(arguments: &JsonMap<String, Value>) -> Result<Value, R
             "'context_refs' must be an array when provided".to_owned(),
         )),
     }
+}
+
+fn optional_idempotency_key(
+    arguments: &JsonMap<String, Value>,
+) -> Result<Option<String>, RpcError> {
+    let value = optional_string(arguments, "idempotency_key")?;
+    if value
+        .as_ref()
+        .is_some_and(|value| value.is_empty() || value.len() > 128)
+    {
+        return Err(invalid_argument(
+            "'idempotency_key' must contain between 1 and 128 UTF-8 bytes".to_owned(),
+        ));
+    }
+    Ok(value)
 }
 
 fn optional_nonnegative_i64(
@@ -1189,6 +1220,12 @@ fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) -> Value {
                         "description": "Compact summary. The server enforces max_summary_bytes as UTF-8 bytes; put full context in artifacts."
                     },
                     "context_refs": { "type": "array", "items": { "type": "object" } },
+                    "idempotency_key": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Optional actor-scoped retry key. Reuse requires an identical payload."
+                    },
                     "audit_work_items": {
                         "type": "array",
                         "minItems": 1,
@@ -1554,6 +1591,7 @@ fn ask_repository_schema(max_summary_bytes: u16, max_artifact_bytes: u32) -> Val
         "context_refs".to_owned(),
         json!({ "type": "array", "items": { "type": "object" } }),
     );
+    properties.insert("idempotency_key".to_owned(), idempotency_key_schema());
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -1682,6 +1720,7 @@ fn publish_message_schema(max_summary_bytes: u16, max_artifact_bytes: u32) -> Va
             "in_reply_to".to_owned(),
             json!({ "type": "string", "format": "uuid" }),
         ),
+        ("idempotency_key".to_owned(), idempotency_key_schema()),
     ]));
     json!({
         "type": "object",
@@ -1702,6 +1741,15 @@ fn publish_message_schema(max_summary_bytes: u16, max_artifact_bytes: u32) -> Va
                 ]
             }
         ]
+    })
+}
+
+fn idempotency_key_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "description": "Optional actor-scoped retry key. Reuse requires an identical payload."
     })
 }
 
@@ -1917,5 +1965,29 @@ mod tests {
             arguments.insert("context_refs".to_owned(), invalid);
             assert!(validated_context_refs(&arguments).is_err());
         }
+    }
+
+    #[test]
+    fn idempotency_key_runtime_validation_matches_creation_schemas() {
+        let mut arguments = JsonMap::new();
+        assert_eq!(optional_idempotency_key(&arguments).unwrap(), None);
+        arguments.insert("idempotency_key".to_owned(), json!("retry-1"));
+        assert_eq!(
+            optional_idempotency_key(&arguments).unwrap().as_deref(),
+            Some("retry-1")
+        );
+        for invalid in [json!(""), json!("x".repeat(129)), json!(42)] {
+            arguments.insert("idempotency_key".to_owned(), invalid);
+            assert!(optional_idempotency_key(&arguments).is_err());
+        }
+
+        assert_eq!(
+            ask_repository_schema(1024, 4096)["properties"]["idempotency_key"]["maxLength"],
+            128
+        );
+        assert_eq!(
+            publish_message_schema(1024, 4096)["properties"]["idempotency_key"]["maxLength"],
+            128
+        );
     }
 }

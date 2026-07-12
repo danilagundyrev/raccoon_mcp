@@ -171,6 +171,16 @@ CREATE INDEX IF NOT EXISTS requests_target_status_idx
 CREATE INDEX IF NOT EXISTS requests_requester_status_idx
     ON requests(requester_repository_id, status, created_at);
 
+CREATE TABLE IF NOT EXISTS idempotency_records (
+    actor_key TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    result_entity_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(actor_key, operation, idempotency_key)
+);
+
 CREATE TABLE IF NOT EXISTS events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
