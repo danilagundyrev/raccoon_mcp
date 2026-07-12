@@ -19,7 +19,7 @@ pub(super) async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. Roles are executor, butler and auditor. An auditor receives one or more audit_work_items with a bounded max_iterations policy and publishes an audit_report artifact. If findings require remediation, create exactly one executor with addresses_audit_run_id for the complete audit report; do not create one executor per finding. The child activates and completes/fails its run through MCP and never registers as a repository. Use ask_repository plus claim/renew/release/answer/fail for durable questions that require exclusive handling. Use an idempotency_key when create_worker_run, publish_message or ask_repository may be retried after transport uncertainty. Use publish_message for ordinary delivery, wait_for_events for efficient repository-scoped waiting, list_inbox for compact headers, read_artifact only when full content is needed, and ack_message after processing. An active wait renews its actor lease and any unexpired request claim owned by it; omit timeout_seconds for no server-side timeout.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Model shared work with create_feature/create_work_item, use expected_revision for updates, and claim an owner-repository item before creating its executor worker run. Dependencies unlock automatically after completion with an implementation_report artifact. Roles are executor, butler and auditor. Auditor scope contains completed work_item_ids; max audit depth comes from each work-item card, and the auditor publishes one audit_report. If findings require remediation, create exactly one executor with addresses_audit_run_id for the complete audit report. Workers activate and complete/fail through MCP and never register as repositories. Use ask_repository plus claim/renew/release/answer/fail for durable questions. Use an idempotency_key when create_feature, create_work_item, create_worker_run, publish_message or ask_repository may be retried after transport uncertainty. Use wait_for_events for repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. Omit timeout_seconds for no server-side timeout.",
         })),
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
         "ping" => Ok(json!({})),
@@ -122,6 +122,9 @@ pub(super) async fn call_tool(
                         )?
                         .map(|value| WorkerRunId::parse(&value).map_err(invalid_uuid))
                         .transpose()?,
+                        work_item_id: optional_string(&arguments, "work_item_id")?
+                            .map(|value| WorkItemId::parse(&value).map_err(invalid_uuid))
+                            .transpose()?,
                     },
                     idempotency_key.as_deref(),
                 )
@@ -165,6 +168,143 @@ pub(super) async fn call_tool(
                 .get_worker_run(worker_run_id)
                 .await
                 .map(|value| json!(value))
+        }
+        "create_feature" => {
+            let parent_instance_id = parse_instance_id(&arguments)?;
+            let title = validated_summary(&arguments, "title", max_summary_bytes)?;
+            let summary = validated_summary(&arguments, "summary", max_summary_bytes)?;
+            let idempotency_key = optional_idempotency_key(&arguments)?;
+            store
+                .create_feature_idempotent(
+                    CreateFeature {
+                        parent_instance_id,
+                        title,
+                        summary,
+                    },
+                    idempotency_key.as_deref(),
+                )
+                .await
+                .map(|value| json!(value))
+        }
+        "get_feature" => {
+            let feature_id = parse_feature_id(&arguments)?;
+            store
+                .get_feature(feature_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "list_features" => {
+            let project_id = parse_project_id(&arguments)?;
+            store
+                .list_features(project_id)
+                .await
+                .map(|features| json!({ "project_id": project_id, "features": features }))
+        }
+        "create_work_item" => {
+            let parent_instance_id = parse_instance_id(&arguments)?;
+            let feature_id = parse_feature_id(&arguments)?;
+            let owner_repository_id =
+                RepositoryId::parse(&require_string(&arguments, "owner_repository_id")?)
+                    .map_err(invalid_uuid)?;
+            let idempotency_key = optional_idempotency_key(&arguments)?;
+            store
+                .create_work_item_idempotent(
+                    CreateWorkItem {
+                        parent_instance_id,
+                        feature_id,
+                        parent_work_item_id: optional_work_item_id(
+                            &arguments,
+                            "parent_work_item_id",
+                        )?,
+                        owner_repository_id,
+                        title: validated_summary(&arguments, "title", max_summary_bytes)?,
+                        summary: validated_summary(&arguments, "summary", max_summary_bytes)?,
+                        dependency_ids: optional_work_item_ids(&arguments, "dependency_ids")?
+                            .unwrap_or_default(),
+                        priority: optional_i16(&arguments, "priority")?.unwrap_or(0),
+                        max_audit_iterations: optional_bounded_u8(
+                            &arguments,
+                            "max_audit_iterations",
+                            1,
+                            10,
+                        )?
+                        .unwrap_or(1),
+                    },
+                    idempotency_key.as_deref(),
+                )
+                .await
+                .map(|value| json!(value))
+        }
+        "get_work_item" => {
+            let work_item_id = parse_work_item_id(&arguments)?;
+            store
+                .get_work_item(work_item_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "list_work_items" => {
+            let feature_id = parse_feature_id(&arguments)?;
+            store
+                .list_work_items(feature_id)
+                .await
+                .map(|items| json!({ "feature_id": feature_id, "work_items": items }))
+        }
+        "update_work_item" => {
+            let parent_instance_id = parse_instance_id(&arguments)?;
+            let work_item_id = parse_work_item_id(&arguments)?;
+            let expected_revision = required_revision(&arguments)?;
+            let status = optional_string(&arguments, "status")?
+                .map(|value| value.parse::<WorkItemStatus>().map_err(invalid_argument))
+                .transpose()?;
+            let owner_repository_id = optional_string(&arguments, "owner_repository_id")?
+                .map(|value| RepositoryId::parse(&value).map_err(invalid_uuid))
+                .transpose()?;
+            let implementation_artifact_id =
+                optional_string(&arguments, "implementation_artifact_id")?
+                    .map(|value| ArtifactId::parse(&value).map_err(invalid_uuid))
+                    .transpose()?;
+            store
+                .update_work_item(UpdateWorkItem {
+                    parent_instance_id,
+                    work_item_id,
+                    expected_revision,
+                    title: optional_validated_summary(&arguments, "title", max_summary_bytes)?,
+                    summary: optional_validated_summary(&arguments, "summary", max_summary_bytes)?,
+                    owner_repository_id,
+                    parent_work_item_id: optional_nullable_work_item_id(
+                        &arguments,
+                        "parent_work_item_id",
+                    )?,
+                    dependency_ids: optional_work_item_ids(&arguments, "dependency_ids")?,
+                    priority: optional_i16(&arguments, "priority")?,
+                    status,
+                    implementation_artifact_id,
+                })
+                .await
+                .map(|value| json!(value))
+        }
+        "claim_work_item" | "renew_work_item_claim" | "release_work_item_claim" => {
+            let instance_id = parse_instance_id(&arguments)?;
+            let work_item_id = parse_work_item_id(&arguments)?;
+            let expected_revision = required_revision(&arguments)?;
+            match tool_name.as_str() {
+                "claim_work_item" => {
+                    store
+                        .claim_work_item(instance_id, work_item_id, expected_revision)
+                        .await
+                }
+                "renew_work_item_claim" => {
+                    store
+                        .renew_work_item_claim(instance_id, work_item_id, expected_revision)
+                        .await
+                }
+                _ => {
+                    store
+                        .release_work_item_claim(instance_id, work_item_id, expected_revision)
+                        .await
+                }
+            }
+            .map(|value| json!(value))
         }
         "publish_message" => {
             let actor = parse_actor(&arguments)?;
@@ -426,6 +566,12 @@ pub(super) async fn read_resource(
                     "The child calls complete_worker_run or fail_worker_run before exiting.",
                     "A worker never calls connect_orchestrator and never creates a repository identity."
                 ],
+                "work_flow": [
+                    "Create a project feature and repository-owned work items; dependencies remain planned until all prerequisites complete.",
+                    "Claim a ready item with expected_revision, then create an executor worker run linked by work_item_id.",
+                    "Publish an implementation_report artifact and complete the item through update_work_item with its latest revision.",
+                    "Every mutation increments revision and emits project-wide compact work_item_updated events; stale writes return the current card."
+                ],
                 "audit_flow": [
                     "Create one auditor run for one or more work_item_ids; max_iterations defaults to one and is fixed per item.",
                     "The auditor publishes one audit_report artifact covering its complete scope.",
@@ -446,7 +592,7 @@ pub(super) async fn read_resource(
                     "Use read_message/read_artifact only for selected items.",
                     "Call ack_message after processing; broadcast recipients acknowledge independently."
                 ],
-                "current_scope": "Project/repository presence, worker runs, immutable messaging, artifacts, reliable per-repository delivery, cursor-based event waiting and claimed repository requests.",
+                "current_scope": "Project/repository presence, feature/work graph with optimistic revisions and claims, linked worker/audit runs, immutable messaging/artifacts, reliable delivery, event waiting and claimed repository requests.",
             }),
         ));
     }

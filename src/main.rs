@@ -22,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
         args.lease_seconds,
         args.worker_lease_seconds,
         args.request_claim_lease_seconds,
+        args.work_item_claim_lease_seconds,
     )
     .await
     .with_context(|| {

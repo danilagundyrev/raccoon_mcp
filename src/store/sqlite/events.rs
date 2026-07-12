@@ -28,8 +28,14 @@ impl SqliteStore {
             ActorRef::Worker(_) => self.worker_lease_duration.num_seconds(),
         };
         let claim_seconds = self.request_claim_lease_duration.num_seconds();
+        let renewal_seconds = match actor_ref {
+            ActorRef::Orchestrator(_) => {
+                claim_seconds.min(self.work_item_claim_lease_duration.num_seconds())
+            }
+            ActorRef::Worker(_) => claim_seconds,
+        };
         let heartbeat_every =
-            Duration::from_secs((lease_seconds.min(claim_seconds) / 3).max(1) as u64);
+            Duration::from_secs((lease_seconds.min(renewal_seconds) / 3).max(1) as u64);
         let mut heartbeat = interval_at(Instant::now() + heartbeat_every, heartbeat_every);
         let deadline = timeout.map(|duration| Instant::now() + duration);
 

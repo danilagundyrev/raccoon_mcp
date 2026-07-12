@@ -77,8 +77,7 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
                             "type": "object",
                             "additionalProperties": false,
                             "properties": {
-                                "work_item_id": { "type": "string", "format": "uuid" },
-                                "max_iterations": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 }
+                                "work_item_id": { "type": "string", "format": "uuid" }
                             },
                             "required": ["work_item_id"]
                         }
@@ -87,6 +86,11 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
                         "type": "string",
                         "format": "uuid",
                         "description": "Only for one executor run that remediates the complete report of a completed auditor run."
+                    },
+                    "work_item_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Optional claimed work item for a normal executor run."
                     }
                 },
                 "required": ["instance_id", "role", "task_summary"]
@@ -152,6 +156,66 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
                 "idempotentHint": true,
                 "openWorldHint": false
             }
+        },
+        {
+            "name": "create_feature",
+            "description": "Create a project-scoped root feature card.",
+            "inputSchema": create_feature_schema(max_summary_bytes),
+            "annotations": mutation_annotations(false)
+        },
+        {
+            "name": "get_feature",
+            "description": "Read one compact feature card.",
+            "inputSchema": id_schema("feature_id"),
+            "annotations": mutation_annotations(true)
+        },
+        {
+            "name": "list_features",
+            "description": "List compact feature cards in one project.",
+            "inputSchema": id_schema("project_id"),
+            "annotations": mutation_annotations(true)
+        },
+        {
+            "name": "create_work_item",
+            "description": "Create a repository-owned work item with dependencies and audit policy.",
+            "inputSchema": create_work_item_schema(max_summary_bytes),
+            "annotations": mutation_annotations(false)
+        },
+        {
+            "name": "get_work_item",
+            "description": "Read one work item with dependencies, revision, claim and artifact links.",
+            "inputSchema": id_schema("work_item_id"),
+            "annotations": mutation_annotations(true)
+        },
+        {
+            "name": "list_work_items",
+            "description": "List all work items for one feature in priority order.",
+            "inputSchema": id_schema("feature_id"),
+            "annotations": mutation_annotations(true)
+        },
+        {
+            "name": "update_work_item",
+            "description": "Update a work item using optimistic expected_revision. Completion requires an implementation_report artifact.",
+            "inputSchema": update_work_item_schema(max_summary_bytes),
+            "annotations": mutation_annotations(false)
+        },
+        {
+            "name": "claim_work_item",
+            "description": "Atomically claim a ready work item for its owner repository.",
+            "inputSchema": work_item_claim_schema(),
+            "annotations": mutation_annotations(false)
+        },
+        {
+            "name": "renew_work_item_claim",
+            "description": "Renew an unexpired work-item claim owned by this orchestrator instance.",
+            "inputSchema": work_item_claim_schema(),
+            "annotations": mutation_annotations(false)
+        },
+        {
+            "name": "release_work_item_claim",
+            "description": "Release an owned work-item claim back to ready.",
+            "inputSchema": work_item_claim_schema(),
+            "annotations": mutation_annotations(false)
         },
         {
             "name": "publish_message",
@@ -297,6 +361,90 @@ pub(super) fn id_schema(field_name: &str) -> Value {
     })
 }
 
+pub(super) fn create_feature_schema(max_summary_bytes: u16) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "instance_id": { "type": "string", "format": "uuid" },
+            "title": { "type": "string", "maxLength": max_summary_bytes },
+            "summary": { "type": "string", "maxLength": max_summary_bytes },
+            "idempotency_key": idempotency_key_schema()
+        },
+        "required": ["instance_id", "title", "summary"]
+    })
+}
+
+pub(super) fn create_work_item_schema(max_summary_bytes: u16) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "instance_id": { "type": "string", "format": "uuid" },
+            "feature_id": { "type": "string", "format": "uuid" },
+            "parent_work_item_id": { "type": "string", "format": "uuid" },
+            "owner_repository_id": { "type": "string", "format": "uuid" },
+            "title": { "type": "string", "maxLength": max_summary_bytes },
+            "summary": { "type": "string", "maxLength": max_summary_bytes },
+            "dependency_ids": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": { "type": "string", "format": "uuid" }
+            },
+            "priority": { "type": "integer", "minimum": -32768, "maximum": 32767, "default": 0 },
+            "max_audit_iterations": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
+            "idempotency_key": idempotency_key_schema()
+        },
+        "required": ["instance_id", "feature_id", "owner_repository_id", "title", "summary"]
+    })
+}
+
+pub(super) fn update_work_item_schema(max_summary_bytes: u16) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "instance_id": { "type": "string", "format": "uuid" },
+            "work_item_id": { "type": "string", "format": "uuid" },
+            "expected_revision": { "type": "integer", "minimum": 1 },
+            "parent_work_item_id": {
+                "oneOf": [
+                    { "type": "string", "format": "uuid" },
+                    { "type": "null" }
+                ]
+            },
+            "owner_repository_id": { "type": "string", "format": "uuid" },
+            "title": { "type": "string", "maxLength": max_summary_bytes },
+            "summary": { "type": "string", "maxLength": max_summary_bytes },
+            "dependency_ids": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": { "type": "string", "format": "uuid" }
+            },
+            "priority": { "type": "integer", "minimum": -32768, "maximum": 32767 },
+            "status": {
+                "type": "string",
+                "enum": ["planned", "ready", "claimed", "in_progress", "blocked", "completed", "failed", "cancelled"]
+            },
+            "implementation_artifact_id": { "type": "string", "format": "uuid" }
+        },
+        "required": ["instance_id", "work_item_id", "expected_revision"]
+    })
+}
+
+pub(super) fn work_item_claim_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "instance_id": { "type": "string", "format": "uuid" },
+            "work_item_id": { "type": "string", "format": "uuid" },
+            "expected_revision": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["instance_id", "work_item_id", "expected_revision"]
+    })
+}
+
 pub(super) fn worker_finish_schema(summary_field: &str, max_summary_bytes: u16) -> Value {
     json!({
         "type": "object",
@@ -387,7 +535,10 @@ pub(super) fn wait_for_events_schema() -> Value {
                     "request_available",
                     "request_claimed",
                     "request_answered",
-                    "request_failed"
+                    "request_failed",
+                    "feature_created",
+                    "work_item_created",
+                    "work_item_updated"
                 ]
             }
         }),

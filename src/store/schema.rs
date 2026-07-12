@@ -43,6 +43,58 @@ CREATE TABLE IF NOT EXISTS agent_instances (
 CREATE INDEX IF NOT EXISTS agent_instances_presence_idx
     ON agent_instances(repository_id, status, lease_expires_at);
 
+CREATE TABLE IF NOT EXISTS features (
+    feature_id TEXT PRIMARY KEY NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    created_by_instance_id TEXT NOT NULL REFERENCES agent_instances(instance_id) ON DELETE RESTRICT,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS features_project_created_idx
+    ON features(project_id, created_at);
+
+CREATE TABLE IF NOT EXISTS work_items (
+    work_item_id TEXT PRIMARY KEY NOT NULL,
+    feature_id TEXT NOT NULL REFERENCES features(feature_id) ON DELETE CASCADE,
+    parent_work_item_id TEXT REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+    owner_repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE RESTRICT,
+    assignee_instance_id TEXT REFERENCES agent_instances(instance_id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    priority INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'planned', 'ready', 'claimed', 'in_progress',
+        'blocked', 'completed', 'failed', 'cancelled'
+    )),
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    max_audit_iterations INTEGER NOT NULL CHECK(max_audit_iterations BETWEEN 1 AND 10),
+    claim_expires_at TEXT,
+    implementation_artifact_id TEXT REFERENCES artifacts(artifact_id) ON DELETE SET NULL,
+    latest_audit_artifact_id TEXT REFERENCES artifacts(artifact_id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS work_items_feature_status_idx
+    ON work_items(feature_id, status, priority, created_at);
+
+CREATE INDEX IF NOT EXISTS work_items_owner_status_idx
+    ON work_items(owner_repository_id, status, priority, created_at);
+
+CREATE TABLE IF NOT EXISTS work_item_dependencies (
+    work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE CASCADE,
+    dependency_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+    PRIMARY KEY(work_item_id, dependency_work_item_id),
+    CHECK(work_item_id <> dependency_work_item_id)
+);
+
+CREATE INDEX IF NOT EXISTS work_item_dependencies_reverse_idx
+    ON work_item_dependencies(dependency_work_item_id, work_item_id);
+
 CREATE TABLE IF NOT EXISTS worker_runs (
     worker_run_id TEXT PRIMARY KEY NOT NULL,
     repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
@@ -54,6 +106,7 @@ CREATE TABLE IF NOT EXISTS worker_runs (
     result_summary TEXT,
     error_summary TEXT,
     addresses_audit_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE RESTRICT,
+    work_item_id TEXT REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
     created_at TEXT NOT NULL,
     activated_at TEXT,
     last_heartbeat_at TEXT NOT NULL,
@@ -73,7 +126,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS worker_runs_one_remediation_per_audit_idx
 
 CREATE TABLE IF NOT EXISTS worker_run_audit_items (
     worker_run_id TEXT NOT NULL REFERENCES worker_runs(worker_run_id) ON DELETE CASCADE,
-    work_item_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
     audit_iteration INTEGER NOT NULL CHECK(audit_iteration BETWEEN 1 AND 10),
     max_iterations INTEGER NOT NULL CHECK(max_iterations BETWEEN 1 AND 10),
     PRIMARY KEY(worker_run_id, work_item_id),
@@ -194,9 +247,14 @@ CREATE TABLE IF NOT EXISTS events (
         'request_available',
         'request_claimed',
         'request_answered',
-        'request_failed'
+        'request_failed',
+        'feature_created',
+        'work_item_created',
+        'work_item_updated'
     )),
-    entity_type TEXT NOT NULL CHECK(entity_type IN ('message', 'worker_run', 'request')),
+    entity_type TEXT NOT NULL CHECK(entity_type IN (
+        'message', 'worker_run', 'request', 'feature', 'work_item'
+    )),
     entity_id TEXT NOT NULL,
     created_at TEXT NOT NULL
 );

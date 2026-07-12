@@ -24,6 +24,16 @@ pub(super) fn parse_request_id(arguments: &JsonMap<String, Value>) -> Result<Req
     RequestId::parse(&require_string(arguments, "request_id")?).map_err(invalid_uuid)
 }
 
+pub(super) fn parse_feature_id(arguments: &JsonMap<String, Value>) -> Result<FeatureId, RpcError> {
+    FeatureId::parse(&require_string(arguments, "feature_id")?).map_err(invalid_uuid)
+}
+
+pub(super) fn parse_work_item_id(
+    arguments: &JsonMap<String, Value>,
+) -> Result<WorkItemId, RpcError> {
+    WorkItemId::parse(&require_string(arguments, "work_item_id")?).map_err(invalid_uuid)
+}
+
 pub(super) fn parse_actor(arguments: &JsonMap<String, Value>) -> Result<ActorRef, RpcError> {
     let instance_id = optional_string(arguments, "instance_id")?
         .map(|value| InstanceId::parse(&value).map_err(invalid_uuid))
@@ -128,6 +138,109 @@ pub(super) fn optional_nonnegative_i64(
     }
 }
 
+pub(super) fn required_revision(arguments: &JsonMap<String, Value>) -> Result<u64, RpcError> {
+    match optional_nonnegative_i64(arguments, "expected_revision")? {
+        Some(value @ 1..) => Ok(value as u64),
+        _ => Err(invalid_argument(
+            "'expected_revision' is required and must be a positive integer".to_owned(),
+        )),
+    }
+}
+
+pub(super) fn optional_i16(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<i16>, RpcError> {
+    match arguments.get(field_name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .and_then(|value| i16::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| invalid_argument(format!("'{field_name}' must be a 16-bit integer"))),
+        Some(_) => Err(invalid_argument(format!(
+            "'{field_name}' must be a 16-bit integer"
+        ))),
+    }
+}
+
+pub(super) fn optional_bounded_u8(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+    minimum: u8,
+    maximum: u8,
+) -> Result<Option<u8>, RpcError> {
+    match optional_nonnegative_i64(arguments, field_name)? {
+        None => Ok(None),
+        Some(value) if (i64::from(minimum)..=i64::from(maximum)).contains(&value) => {
+            Ok(Some(value as u8))
+        }
+        Some(_) => Err(invalid_argument(format!(
+            "'{field_name}' must be between {minimum} and {maximum}"
+        ))),
+    }
+}
+
+pub(super) fn optional_work_item_id(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<WorkItemId>, RpcError> {
+    optional_string(arguments, field_name)?
+        .map(|value| WorkItemId::parse(&value).map_err(invalid_uuid))
+        .transpose()
+}
+
+pub(super) fn optional_nullable_work_item_id(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<Option<WorkItemId>>, RpcError> {
+    match arguments.get(field_name) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(value)) => WorkItemId::parse(value)
+            .map(|id| Some(Some(id)))
+            .map_err(invalid_uuid),
+        Some(_) => Err(invalid_argument(format!(
+            "'{field_name}' must be a UUID string or null"
+        ))),
+    }
+}
+
+pub(super) fn optional_work_item_ids(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<Vec<WorkItemId>>, RpcError> {
+    match arguments.get(field_name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                let value = value.as_str().ok_or_else(|| {
+                    invalid_argument(format!("every {field_name} entry must be a UUID string"))
+                })?;
+                WorkItemId::parse(value).map_err(invalid_uuid)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err(invalid_argument(format!("'{field_name}' must be an array"))),
+    }
+}
+
+pub(super) fn optional_validated_summary(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+    max_summary_bytes: u16,
+) -> Result<Option<String>, RpcError> {
+    match optional_string(arguments, field_name)? {
+        Some(value) => {
+            let mut single = JsonMap::new();
+            single.insert(field_name.to_owned(), Value::String(value));
+            validated_summary(&single, field_name, max_summary_bytes).map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
 pub(super) fn optional_limit(arguments: &JsonMap<String, Value>) -> Result<Option<u8>, RpcError> {
     match optional_nonnegative_i64(arguments, "limit")? {
         None => Ok(None),
@@ -217,19 +330,15 @@ pub(super) fn optional_audit_work_items(
                 let object = value.as_object().ok_or_else(|| {
                     invalid_argument("every audit_work_item must be an object".to_owned())
                 })?;
-                let work_item_id = WorkItemId::parse(&require_string(object, "work_item_id")?)
-                    .map_err(invalid_uuid)?;
-                let max_iterations =
-                    optional_nonnegative_i64(object, "max_iterations")?.unwrap_or(1);
-                if !(1..=10).contains(&max_iterations) {
+                if object.keys().any(|key| key != "work_item_id") {
                     return Err(invalid_argument(
-                        "audit_work_item.max_iterations must be between 1 and 10".to_owned(),
+                        "audit_work_item only accepts work_item_id; audit depth is stored on the work-item card"
+                            .to_owned(),
                     ));
                 }
-                Ok(AuditWorkItemInput {
-                    work_item_id,
-                    max_iterations: max_iterations as u8,
-                })
+                let work_item_id = WorkItemId::parse(&require_string(object, "work_item_id")?)
+                    .map_err(invalid_uuid)?;
+                Ok(AuditWorkItemInput { work_item_id })
             })
             .collect(),
         Some(_) => Err(invalid_argument(
@@ -315,14 +424,35 @@ pub(super) fn store_rpc_error(error: StoreError) -> RpcError {
         StoreError::Conflict(message) => {
             RpcError::new(-32602, "Invalid state").with_data(json!(message))
         }
+        StoreError::RevisionConflict { current, .. } => {
+            RpcError::new(-32602, "Revision conflict").with_data(json!({ "current": current }))
+        }
         other => RpcError::new(-32603, "Internal error").with_data(json!(other.to_string())),
     }
 }
 
 pub(super) fn store_error_payload(error: &StoreError) -> Value {
+    if let StoreError::RevisionConflict {
+        expected,
+        actual,
+        current,
+        ..
+    } = error
+    {
+        return json!({
+            "error": {
+                "code": "revision_conflict",
+                "message": error.to_string(),
+                "expected_revision": expected,
+                "actual_revision": actual,
+                "current": current,
+            }
+        });
+    }
     let code = match error {
         StoreError::NotFound(_) => "not_found",
         StoreError::Conflict(_) => "conflict",
+        StoreError::RevisionConflict { .. } => unreachable!("handled above"),
         StoreError::Database(_)
         | StoreError::Io(_)
         | StoreError::Json(_)

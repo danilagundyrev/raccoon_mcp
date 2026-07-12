@@ -141,3 +141,53 @@ fn idempotency_key_runtime_validation_matches_creation_schemas() {
         128
     );
 }
+
+#[test]
+fn work_graph_tools_publish_revision_and_dependency_contracts() {
+    let tools = tool_definitions(2048, 65_536);
+    let names = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<HashSet<_>>();
+    for expected in [
+        "create_feature",
+        "get_feature",
+        "list_features",
+        "create_work_item",
+        "get_work_item",
+        "list_work_items",
+        "update_work_item",
+        "claim_work_item",
+        "renew_work_item_claim",
+        "release_work_item_claim",
+    ] {
+        assert!(names.contains(expected));
+    }
+    let update = update_work_item_schema(2048);
+    assert!(
+        update["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("expected_revision"))
+    );
+    let create = create_work_item_schema(2048);
+    assert_eq!(create["properties"]["dependency_ids"]["uniqueItems"], true);
+    assert_eq!(create["properties"]["max_audit_iterations"]["maximum"], 10);
+
+    let mut audit_arguments = JsonMap::new();
+    audit_arguments.insert(
+        "audit_work_items".to_owned(),
+        json!([{ "work_item_id": WorkItemId::new() }]),
+    );
+    assert_eq!(
+        optional_audit_work_items(&audit_arguments).unwrap().len(),
+        1
+    );
+    audit_arguments.insert(
+        "audit_work_items".to_owned(),
+        json!([{ "work_item_id": WorkItemId::new(), "max_iterations": 3 }]),
+    );
+    assert!(optional_audit_work_items(&audit_arguments).is_err());
+}

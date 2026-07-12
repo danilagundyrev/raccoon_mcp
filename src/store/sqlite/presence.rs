@@ -32,6 +32,13 @@ impl SqliteStore {
             &now,
         )
         .await?;
+        renew_work_item_claims_for_owner(
+            &mut transaction,
+            instance.instance_id,
+            self.work_item_claim_lease_duration,
+            &now,
+        )
+        .await?;
 
         transaction.commit().await?;
         let repositories = self.list_repositories(project.project_id).await?;
@@ -86,6 +93,13 @@ impl SqliteStore {
             "claimed_by_instance_id",
             &instance_id.to_string(),
             self.request_claim_lease_duration,
+            &now,
+        )
+        .await?;
+        renew_work_item_claims_for_owner(
+            &mut transaction,
+            instance_id,
+            self.work_item_claim_lease_duration,
             &now,
         )
         .await?;

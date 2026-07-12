@@ -106,6 +106,11 @@ impl SqliteStore {
         } else {
             None
         };
+        let work_event_recipients = if let Some(artifact) = &artifact {
+            super::work::link_audit_report(&mut transaction, &actor, artifact, &now).await?
+        } else {
+            Vec::new()
+        };
 
         let message = Message {
             message_id: MessageId::new(),
@@ -164,6 +169,9 @@ impl SqliteStore {
         transaction.commit().await?;
         for recipient_id in &recipient_ids {
             self.notifications.notify(*recipient_id);
+        }
+        for recipient_id in work_event_recipients {
+            self.notifications.notify(recipient_id);
         }
         Ok(PublishResult {
             message,

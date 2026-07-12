@@ -59,6 +59,13 @@ impl SqliteStore {
             &now,
         )
         .await?;
+        renew_work_item_claims_for_owner(
+            &mut transaction,
+            command.parent_instance_id,
+            self.work_item_claim_lease_duration,
+            &now,
+        )
+        .await?;
         if let Some(existing_id) = find_idempotent_result(
             &mut transaction,
             &actor_key,
@@ -79,6 +86,14 @@ impl SqliteStore {
                 .try_get("project_id")?,
         )?;
         let audit_scope = prepare_audit_scope(&mut transaction, &command).await?;
+        let work_item_recipients = super::work::attach_worker_to_work_item(
+            &mut transaction,
+            &command,
+            repository_id,
+            project_id,
+            &now,
+        )
+        .await?;
         if let Some(audit_run_id) = command.addresses_audit_run_id {
             validate_remediation_audit(&mut transaction, repository_id, audit_run_id).await?;
         }
@@ -87,8 +102,9 @@ impl SqliteStore {
             "INSERT INTO worker_runs(
                  worker_run_id, repository_id, parent_instance_id, role, status,
                  task_summary, context_refs_json, result_summary, error_summary, addresses_audit_run_id,
+                 work_item_id,
                  created_at, activated_at, last_heartbeat_at, lease_expires_at, finished_at
-             ) VALUES (?, ?, ?, ?, 'created', ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, NULL)",
+             ) VALUES (?, ?, ?, ?, 'created', ?, ?, NULL, NULL, ?, ?, ?, NULL, ?, ?, NULL)",
         )
         .bind(worker_run_id.to_string())
         .bind(repository_id.to_string())
@@ -97,6 +113,7 @@ impl SqliteStore {
         .bind(&command.task_summary)
         .bind(&context_refs_json)
         .bind(command.addresses_audit_run_id.map(|id| id.to_string()))
+        .bind(command.work_item_id.map(|id| id.to_string()))
         .bind(&now)
         .bind(&now)
         .bind(&worker_lease_expires_at)
@@ -140,6 +157,9 @@ impl SqliteStore {
 
         transaction.commit().await?;
         self.notifications.notify(repository_id);
+        for recipient_id in work_item_recipients {
+            self.notifications.notify(recipient_id);
+        }
         self.get_worker_run(worker_run_id).await
     }
 
@@ -321,6 +341,31 @@ impl SqliteStore {
                 worker.status,
                 target_status.as_str(),
             ));
+        }
+
+        if target_status == WorkerRunStatus::Completed {
+            let required_artifact_kind = match (worker.role, worker.work_item_id) {
+                (WorkerRole::Auditor, _) => Some("audit_report"),
+                (WorkerRole::Executor, Some(_)) => Some("implementation_report"),
+                _ => None,
+            };
+            if let Some(required_artifact_kind) = required_artifact_kind {
+                let artifact_exists: i64 = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM artifacts
+                         WHERE producer_worker_run_id = ? AND kind = ?
+                     )",
+                )
+                .bind(worker_run_id.to_string())
+                .bind(required_artifact_kind)
+                .fetch_one(&self.pool)
+                .await?;
+                if artifact_exists == 0 {
+                    return Err(StoreError::Conflict(format!(
+                        "completing this worker run requires a {required_artifact_kind} artifact"
+                    )));
+                }
+            }
         }
 
         let now = utc_now();

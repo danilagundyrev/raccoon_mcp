@@ -23,9 +23,10 @@ use tokio::net::TcpListener;
 use crate::{
     domain::{
         ActorRef, AnswerRequest, ArtifactId, ArtifactKind, AskRepository, AuditWorkItemInput,
-        ConnectOrchestrator, CreateWorkerRun, EventKind, FailRequest, InstanceId, MessageId,
-        MessageKind, MessageTarget, ProjectId, PublishMessage, RepositoryId, RequestId, ThreadId,
-        WorkItemId, WorkerRole, WorkerRunId, validate_key,
+        ConnectOrchestrator, CreateFeature, CreateWorkItem, CreateWorkerRun, EventKind,
+        FailRequest, FeatureId, InstanceId, MessageId, MessageKind, MessageTarget, ProjectId,
+        PublishMessage, RepositoryId, RequestId, ThreadId, UpdateWorkItem, WorkItemId,
+        WorkItemStatus, WorkerRole, WorkerRunId, validate_key,
     },
     store::{SqliteStore, StoreError},
 };

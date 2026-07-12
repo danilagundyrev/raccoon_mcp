@@ -16,6 +16,9 @@ pub enum EventKind {
     RequestClaimed,
     RequestAnswered,
     RequestFailed,
+    FeatureCreated,
+    WorkItemCreated,
+    WorkItemUpdated,
 }
 
 impl EventKind {
@@ -30,6 +33,9 @@ impl EventKind {
             Self::RequestClaimed => "request_claimed",
             Self::RequestAnswered => "request_answered",
             Self::RequestFailed => "request_failed",
+            Self::FeatureCreated => "feature_created",
+            Self::WorkItemCreated => "work_item_created",
+            Self::WorkItemUpdated => "work_item_updated",
         }
     }
 }
@@ -48,6 +54,9 @@ impl FromStr for EventKind {
             "request_claimed" => Ok(Self::RequestClaimed),
             "request_answered" => Ok(Self::RequestAnswered),
             "request_failed" => Ok(Self::RequestFailed),
+            "feature_created" => Ok(Self::FeatureCreated),
+            "work_item_created" => Ok(Self::WorkItemCreated),
+            "work_item_updated" => Ok(Self::WorkItemUpdated),
             _ => Err(format!("unknown event kind '{value}'")),
         }
     }
@@ -59,6 +68,8 @@ pub enum EventEntityType {
     Message,
     WorkerRun,
     Request,
+    Feature,
+    WorkItem,
 }
 
 impl EventEntityType {
@@ -67,6 +78,8 @@ impl EventEntityType {
             Self::Message => "message",
             Self::WorkerRun => "worker_run",
             Self::Request => "request",
+            Self::Feature => "feature",
+            Self::WorkItem => "work_item",
         }
     }
 }
@@ -79,6 +92,8 @@ impl FromStr for EventEntityType {
             "message" => Ok(Self::Message),
             "worker_run" => Ok(Self::WorkerRun),
             "request" => Ok(Self::Request),
+            "feature" => Ok(Self::Feature),
+            "work_item" => Ok(Self::WorkItem),
             _ => Err(format!("unknown event entity type '{value}'")),
         }
     }

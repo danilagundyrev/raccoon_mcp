@@ -50,3 +50,4 @@ uuid_id!(ArtifactId);
 uuid_id!(ThreadId);
 uuid_id!(WorkItemId);
 uuid_id!(RequestId);
+uuid_id!(FeatureId);

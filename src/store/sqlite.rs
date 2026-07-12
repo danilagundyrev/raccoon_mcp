@@ -22,11 +22,12 @@ use tokio::{
 use crate::domain::{
     ActorRef, AgentInstance, AnswerRequest, AnswerRequestResult, Artifact, ArtifactId,
     ArtifactKind, AskRepository, AuditScopeItem, ConnectOrchestrator, ConnectResult,
-    CoordinationRequest, CreateWorkerRun, DeliveryAck, EventBatch, EventEntityType, EventKind,
-    FailRequest, HubEvent, InboxItem, InboxPage, InstanceId, Message, MessageId, MessageKind,
-    MessageTarget, PresenceStatus, Project, ProjectId, ProjectOverview, PublishMessage,
-    PublishResult, Repository, RepositoryId, RepositoryPresence, RequestId, RequestStatus,
-    ThreadId, WaitOutcome, WorkItemId, WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
+    CoordinationRequest, CreateFeature, CreateWorkItem, CreateWorkerRun, DeliveryAck, EventBatch,
+    EventEntityType, EventKind, FailRequest, Feature, FeatureId, HubEvent, InboxItem, InboxPage,
+    InstanceId, Message, MessageId, MessageKind, MessageTarget, PresenceStatus, Project, ProjectId,
+    ProjectOverview, PublishMessage, PublishResult, Repository, RepositoryId, RepositoryPresence,
+    RequestId, RequestStatus, ThreadId, UpdateWorkItem, WaitOutcome, WorkItem, WorkItemId,
+    WorkItemStatus, WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
 };
 
 use super::schema::{CREATE_SCHEMA, SCHEMA_VERSION};
@@ -35,6 +36,7 @@ mod events;
 mod messages;
 mod presence;
 mod requests;
+mod work;
 mod workers;
 
 #[derive(Debug, Error)]
@@ -43,6 +45,13 @@ pub enum StoreError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("work item {work_item_id} revision conflict: expected {expected}, actual {actual}")]
+    RevisionConflict {
+        work_item_id: WorkItemId,
+        expected: u64,
+        actual: u64,
+        current: Box<WorkItem>,
+    },
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("filesystem error: {0}")]
@@ -59,6 +68,7 @@ pub struct SqliteStore {
     lease_duration: chrono::Duration,
     worker_lease_duration: chrono::Duration,
     request_claim_lease_duration: chrono::Duration,
+    work_item_claim_lease_duration: chrono::Duration,
     write_lock: Arc<Mutex<()>>,
     notifications: Arc<NotificationHub>,
 }
@@ -97,6 +107,7 @@ impl SqliteStore {
         lease_seconds: u16,
         worker_lease_seconds: u16,
         request_claim_lease_seconds: u16,
+        work_item_claim_lease_seconds: u16,
     ) -> Result<Self, StoreError> {
         if let Some(parent) = database_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -129,6 +140,9 @@ impl SqliteStore {
             worker_lease_duration: chrono::Duration::seconds(worker_lease_seconds as i64),
             request_claim_lease_duration: chrono::Duration::seconds(
                 request_claim_lease_seconds as i64,
+            ),
+            work_item_claim_lease_duration: chrono::Duration::seconds(
+                work_item_claim_lease_seconds as i64,
             ),
             write_lock: Arc::new(Mutex::new(())),
             notifications: Arc::new(NotificationHub::default()),
@@ -184,6 +198,13 @@ impl SqliteStore {
                     transaction,
                     &actor,
                     self.request_claim_lease_duration,
+                    now,
+                )
+                .await?;
+                renew_work_item_claims_for_owner(
+                    transaction,
+                    instance_id,
+                    self.work_item_claim_lease_duration,
                     now,
                 )
                 .await?;
@@ -430,7 +451,6 @@ fn worker_run_fingerprint(command: &CreateWorkerRun) -> Result<String, StoreErro
         .map(|item| {
             serde_json::json!({
                 "work_item_id": item.work_item_id,
-                "max_iterations": item.max_iterations,
             })
         })
         .collect::<Vec<_>>();
@@ -440,6 +460,7 @@ fn worker_run_fingerprint(command: &CreateWorkerRun) -> Result<String, StoreErro
         "context_refs": command.context_refs,
         "audit_work_items": audit_items,
         "addresses_audit_run_id": command.addresses_audit_run_id,
+        "work_item_id": command.work_item_id,
     }))?)
 }
 
@@ -543,6 +564,28 @@ async fn renew_request_claims_for_owner(
     Ok(())
 }
 
+async fn renew_work_item_claims_for_owner(
+    transaction: &mut Transaction<'_, Sqlite>,
+    instance_id: InstanceId,
+    claim_duration: chrono::Duration,
+    now: &str,
+) -> Result<(), StoreError> {
+    let claim_expires_at =
+        (Utc::now() + claim_duration).to_rfc3339_opts(SecondsFormat::Micros, true);
+    sqlx::query(
+        "UPDATE work_items SET claim_expires_at = ?, updated_at = ?
+         WHERE status IN ('claimed', 'in_progress', 'blocked')
+           AND assignee_instance_id = ? AND claim_expires_at > ?",
+    )
+    .bind(claim_expires_at)
+    .bind(now)
+    .bind(instance_id.to_string())
+    .bind(now)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 fn ensure_active_request_claim(
     request: &CoordinationRequest,
     actor: &ResolvedActor,
@@ -587,6 +630,11 @@ fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreErr
                     "auditor run cannot address another audit run".to_owned(),
                 ));
             }
+            if command.work_item_id.is_some() {
+                return Err(StoreError::Conflict(
+                    "auditor run uses audit_work_items, not work_item_id".to_owned(),
+                ));
+            }
         }
         WorkerRole::Executor => {
             if has_audit_scope {
@@ -596,7 +644,10 @@ fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreErr
             }
         }
         WorkerRole::Butler => {
-            if has_audit_scope || command.addresses_audit_run_id.is_some() {
+            if has_audit_scope
+                || command.addresses_audit_run_id.is_some()
+                || command.work_item_id.is_some()
+            {
                 return Err(StoreError::Conflict(
                     "butler run cannot declare audit scope or remediation link".to_owned(),
                 ));
@@ -606,12 +657,6 @@ fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreErr
 
     let mut unique_work_items = BTreeSet::new();
     for item in &command.audit_work_items {
-        if !(1..=10).contains(&item.max_iterations) {
-            return Err(StoreError::Conflict(format!(
-                "max_iterations for work item {} must be between 1 and 10",
-                item.work_item_id
-            )));
-        }
         if !unique_work_items.insert(item.work_item_id.to_string()) {
             return Err(StoreError::Conflict(format!(
                 "work item {} appears more than once in audit scope",
@@ -632,6 +677,21 @@ async fn prepare_audit_scope(
 
     let mut scope = Vec::with_capacity(command.audit_work_items.len());
     for item in &command.audit_work_items {
+        let work_item = sqlx::query(
+            "SELECT status, max_audit_iterations FROM work_items WHERE work_item_id = ?",
+        )
+        .bind(item.work_item_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("work item {}", item.work_item_id)))?;
+        let status: String = work_item.try_get("status")?;
+        if status != "completed" {
+            return Err(StoreError::Conflict(format!(
+                "work item {} must be completed before audit",
+                item.work_item_id
+            )));
+        }
+        let max_iterations = work_item.try_get::<i64, _>("max_audit_iterations")? as u8;
         let row = sqlx::query(
             "SELECT MAX(audit_iteration) AS current_iteration,
                     MIN(max_iterations) AS min_max_iterations,
@@ -646,9 +706,7 @@ async fn prepare_audit_scope(
         let stored_min: Option<i64> = row.try_get("min_max_iterations")?;
         let stored_max: Option<i64> = row.try_get("max_max_iterations")?;
         if let (Some(stored_min), Some(stored_max)) = (stored_min, stored_max) {
-            if stored_min != i64::from(item.max_iterations)
-                || stored_max != i64::from(item.max_iterations)
-            {
+            if stored_min != i64::from(max_iterations) || stored_max != i64::from(max_iterations) {
                 return Err(StoreError::Conflict(format!(
                     "work item {} audit depth is already fixed at {stored_min}",
                     item.work_item_id
@@ -656,16 +714,16 @@ async fn prepare_audit_scope(
             }
         }
         let iteration = current_iteration.unwrap_or(0) + 1;
-        if iteration > i64::from(item.max_iterations) {
+        if iteration > i64::from(max_iterations) {
             return Err(StoreError::Conflict(format!(
                 "work item {} exhausted audit depth {}",
-                item.work_item_id, item.max_iterations
+                item.work_item_id, max_iterations
             )));
         }
         scope.push(AuditScopeItem {
             work_item_id: item.work_item_id,
             iteration: iteration as u8,
-            max_iterations: item.max_iterations,
+            max_iterations,
         });
     }
     Ok(scope)
@@ -1075,6 +1133,7 @@ fn worker_run_from_row(row: &SqliteRow) -> Result<WorkerRun, StoreError> {
             row.try_get("addresses_audit_run_id")?,
             WorkerRunId::parse,
         )?,
+        work_item_id: parse_optional_id(row.try_get("work_item_id")?, WorkItemId::parse)?,
         created_at: row.try_get("created_at")?,
         activated_at: row.try_get("activated_at")?,
         last_heartbeat_at: row.try_get("last_heartbeat_at")?,

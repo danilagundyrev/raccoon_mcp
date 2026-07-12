@@ -89,12 +89,12 @@ pub struct CreateWorkerRun {
     pub context_refs: Value,
     pub audit_work_items: Vec<AuditWorkItemInput>,
     pub addresses_audit_run_id: Option<WorkerRunId>,
+    pub work_item_id: Option<WorkItemId>,
 }
 
 #[derive(Clone, Debug)]
 pub struct AuditWorkItemInput {
     pub work_item_id: WorkItemId,
-    pub max_iterations: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -117,6 +117,7 @@ pub struct WorkerRun {
     pub error_summary: Option<String>,
     pub audit_scope: Vec<AuditScopeItem>,
     pub addresses_audit_run_id: Option<WorkerRunId>,
+    pub work_item_id: Option<WorkItemId>,
     pub created_at: String,
     pub activated_at: Option<String>,
     pub last_heartbeat_at: String,
