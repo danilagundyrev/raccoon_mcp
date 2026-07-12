@@ -1,0 +1,483 @@
+use super::*;
+
+pub(super) async fn dispatch(
+    store: &SqliteStore,
+    max_summary_bytes: u16,
+    max_artifact_bytes: u32,
+    method: &str,
+    params: &JsonMap<String, Value>,
+) -> Result<Value, RpcError> {
+    match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {
+                "tools": { "listChanged": false },
+                "resources": { "listChanged": false },
+            },
+            "serverInfo": {
+                "name": SERVER_NAME,
+                "title": SERVER_TITLE,
+                "version": SERVER_VERSION,
+            },
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Keep the returned instance lease alive with heartbeat. Use list_repositories or hub://project/{project_id}/overview to discover peers. Before spawning a child, call create_worker_run and pass its worker_run_id to the child. Roles are executor, butler and auditor. An auditor receives one or more audit_work_items with a bounded max_iterations policy and publishes an audit_report artifact. If findings require remediation, create exactly one executor with addresses_audit_run_id for the complete audit report; do not create one executor per finding. The child activates and completes/fails its run through MCP and never registers as a repository. Use ask_repository plus claim/renew/release/answer/fail for durable questions that require exclusive handling. Use an idempotency_key when create_worker_run, publish_message or ask_repository may be retried after transport uncertainty. Use publish_message for ordinary delivery, wait_for_events for efficient repository-scoped waiting, list_inbox for compact headers, read_artifact only when full content is needed, and ack_message after processing. An active wait renews its actor lease and any unexpired request claim owned by it; omit timeout_seconds for no server-side timeout.",
+        })),
+        "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({
+            "tools": tool_definitions(max_summary_bytes, max_artifact_bytes)
+        })),
+        "tools/call" => call_tool(store, max_summary_bytes, max_artifact_bytes, params).await,
+        "resources/list" => Ok(json!({ "resources": list_resources() })),
+        "resources/templates/list" => Ok(json!({
+            "resourceTemplates": list_resource_templates(),
+        })),
+        "resources/read" => {
+            let uri = require_string(params, "uri")?;
+            read_resource(store, max_summary_bytes, max_artifact_bytes, &uri).await
+        }
+        _ => Err(RpcError::new(-32601, "Method not found")
+            .with_status(StatusCode::NOT_FOUND)
+            .with_data(json!(format!("Unsupported method: {method}")))),
+    }
+}
+
+pub(super) async fn call_tool(
+    store: &SqliteStore,
+    max_summary_bytes: u16,
+    max_artifact_bytes: u32,
+    params: &JsonMap<String, Value>,
+) -> Result<Value, RpcError> {
+    let tool_name = require_string(params, "name")?;
+    let arguments = optional_arguments(params)?;
+    let result = match tool_name.as_str() {
+        "connect_orchestrator" => {
+            let project_key =
+                validate_key("project_key", &require_string(&arguments, "project_key")?)
+                    .map_err(invalid_argument)?;
+            let repository_key = validate_key(
+                "repository_key",
+                &require_string(&arguments, "repository_key")?,
+            )
+            .map_err(invalid_argument)?;
+            let repository_path = require_string(&arguments, "repository_path")?;
+            let canonical_path = canonical_repository_path(&repository_path)?;
+            let instance_id = optional_string(&arguments, "instance_id")?
+                .map(|value| InstanceId::parse(&value).map_err(invalid_uuid))
+                .transpose()?;
+            let capabilities = arguments
+                .get("capabilities")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if !capabilities.is_object() {
+                return Err(invalid_argument(
+                    "capabilities must be an object".to_owned(),
+                ));
+            }
+            store
+                .connect_orchestrator(ConnectOrchestrator {
+                    project_key,
+                    project_display_name: optional_string(&arguments, "project_display_name")?,
+                    repository_key,
+                    repository_display_name: optional_string(
+                        &arguments,
+                        "repository_display_name",
+                    )?,
+                    canonical_path,
+                    instance_id,
+                    capabilities,
+                })
+                .await
+                .map(|value| json!(value))
+        }
+        "heartbeat" => {
+            let instance_id = parse_instance_id(&arguments)?;
+            store.heartbeat(instance_id).await.map(|value| json!(value))
+        }
+        "disconnect_orchestrator" => {
+            let instance_id = parse_instance_id(&arguments)?;
+            store
+                .disconnect_orchestrator(instance_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "create_worker_run" => {
+            let parent_instance_id = parse_instance_id(&arguments)?;
+            let role = require_string(&arguments, "role")?
+                .parse::<WorkerRole>()
+                .map_err(invalid_argument)?;
+            let task_summary = validated_summary(&arguments, "task_summary", max_summary_bytes)?;
+            let context_refs = validated_context_refs(&arguments)?;
+            let idempotency_key = optional_idempotency_key(&arguments)?;
+            store
+                .create_worker_run_idempotent(
+                    CreateWorkerRun {
+                        parent_instance_id,
+                        role,
+                        task_summary,
+                        context_refs,
+                        audit_work_items: optional_audit_work_items(&arguments)?,
+                        addresses_audit_run_id: optional_string(
+                            &arguments,
+                            "addresses_audit_run_id",
+                        )?
+                        .map(|value| WorkerRunId::parse(&value).map_err(invalid_uuid))
+                        .transpose()?,
+                    },
+                    idempotency_key.as_deref(),
+                )
+                .await
+                .map(|value| json!(value))
+        }
+        "activate_worker_run" => {
+            let worker_run_id = parse_worker_run_id(&arguments)?;
+            store
+                .activate_worker_run(worker_run_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "heartbeat_worker_run" => {
+            let worker_run_id = parse_worker_run_id(&arguments)?;
+            store
+                .heartbeat_worker_run(worker_run_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "complete_worker_run" => {
+            let worker_run_id = parse_worker_run_id(&arguments)?;
+            let result_summary =
+                validated_summary(&arguments, "result_summary", max_summary_bytes)?;
+            store
+                .complete_worker_run(worker_run_id, &result_summary)
+                .await
+                .map(|value| json!(value))
+        }
+        "fail_worker_run" => {
+            let worker_run_id = parse_worker_run_id(&arguments)?;
+            let error_summary = validated_summary(&arguments, "error_summary", max_summary_bytes)?;
+            store
+                .fail_worker_run(worker_run_id, &error_summary)
+                .await
+                .map(|value| json!(value))
+        }
+        "get_worker_run" => {
+            let worker_run_id = parse_worker_run_id(&arguments)?;
+            store
+                .get_worker_run(worker_run_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "publish_message" => {
+            let actor = parse_actor(&arguments)?;
+            let kind = require_string(&arguments, "kind")?
+                .parse::<MessageKind>()
+                .map_err(invalid_argument)?;
+            let broadcast = optional_bool(&arguments, "broadcast")?.unwrap_or(false);
+            let target_repository_ids = optional_repository_ids(&arguments)?;
+            let target = match (broadcast, target_repository_ids) {
+                (true, None) => MessageTarget::Broadcast,
+                (false, Some(repository_ids)) if !repository_ids.is_empty() => {
+                    MessageTarget::Repositories(repository_ids)
+                }
+                (true, Some(_)) => {
+                    return Err(invalid_argument(
+                        "use either broadcast=true or target_repository_ids, not both".to_owned(),
+                    ));
+                }
+                _ => {
+                    return Err(invalid_argument(
+                        "provide broadcast=true or at least one target_repository_id".to_owned(),
+                    ));
+                }
+            };
+            let summary = validated_summary(&arguments, "summary", max_summary_bytes)?;
+            let body = optional_string(&arguments, "body")?;
+            if body
+                .as_ref()
+                .is_some_and(|body| body.len() > max_artifact_bytes as usize)
+            {
+                return Err(invalid_argument(format!(
+                    "'body' must not exceed {max_artifact_bytes} UTF-8 bytes"
+                )));
+            }
+            let artifact_kind = optional_string(&arguments, "artifact_kind")?
+                .unwrap_or_else(|| "note".to_owned())
+                .parse::<ArtifactKind>()
+                .map_err(invalid_argument)?;
+            let thread_id = optional_string(&arguments, "thread_id")?
+                .map(|value| ThreadId::parse(&value).map_err(invalid_uuid))
+                .transpose()?;
+            let in_reply_to = optional_string(&arguments, "in_reply_to")?
+                .map(|value| MessageId::parse(&value).map_err(invalid_uuid))
+                .transpose()?;
+            let correlation_id = optional_string(&arguments, "correlation_id")?;
+            if correlation_id
+                .as_ref()
+                .is_some_and(|value| value.len() > 128)
+            {
+                return Err(invalid_argument(
+                    "'correlation_id' must not exceed 128 UTF-8 bytes".to_owned(),
+                ));
+            }
+            let idempotency_key = optional_idempotency_key(&arguments)?;
+            store
+                .publish_message_idempotent(
+                    PublishMessage {
+                        actor,
+                        kind,
+                        target,
+                        summary,
+                        body,
+                        artifact_kind,
+                        artifact_title: optional_string(&arguments, "artifact_title")?,
+                        content_type: optional_string(&arguments, "content_type")?
+                            .unwrap_or_else(|| "text/markdown".to_owned()),
+                        thread_id,
+                        correlation_id,
+                        in_reply_to,
+                    },
+                    idempotency_key.as_deref(),
+                )
+                .await
+                .map(|value| json!(value))
+        }
+        "wait_for_events" => {
+            let actor = parse_actor(&arguments)?;
+            let cursor = optional_nonnegative_i64(&arguments, "cursor")?.unwrap_or(0);
+            let kinds = optional_event_kinds(&arguments)?;
+            let timeout = optional_timeout_seconds(&arguments)?.map(Duration::from_secs);
+            let limit = optional_event_limit(&arguments)?.unwrap_or(20);
+            store
+                .wait_for_events(actor, cursor, &kinds, timeout, limit)
+                .await
+                .map(|value| json!(value))
+        }
+        "ask_repository" => {
+            let actor = parse_actor(&arguments)?;
+            let target_repository_id =
+                RepositoryId::parse(&require_string(&arguments, "target_repository_id")?)
+                    .map_err(invalid_uuid)?;
+            let question_summary =
+                validated_summary(&arguments, "question_summary", max_summary_bytes)?;
+            let body = validated_optional_body(&arguments, max_artifact_bytes)?;
+            let context_refs = validated_context_refs(&arguments)?;
+            let idempotency_key = optional_idempotency_key(&arguments)?;
+            store
+                .ask_repository_idempotent(
+                    AskRepository {
+                        actor,
+                        target_repository_id,
+                        question_summary,
+                        body,
+                        context_refs,
+                    },
+                    idempotency_key.as_deref(),
+                )
+                .await
+                .map(|value| json!(value))
+        }
+        "read_request" => {
+            let actor = parse_actor(&arguments)?;
+            let request_id = parse_request_id(&arguments)?;
+            store
+                .read_request(actor, request_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "claim_request" => {
+            let actor = parse_actor(&arguments)?;
+            let request_id = parse_request_id(&arguments)?;
+            store
+                .claim_request(actor, request_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "renew_request_claim" => {
+            let actor = parse_actor(&arguments)?;
+            let request_id = parse_request_id(&arguments)?;
+            store
+                .renew_request_claim(actor, request_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "release_request_claim" => {
+            let actor = parse_actor(&arguments)?;
+            let request_id = parse_request_id(&arguments)?;
+            store
+                .release_request_claim(actor, request_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "answer_request" => {
+            let actor = parse_actor(&arguments)?;
+            let request_id = parse_request_id(&arguments)?;
+            let answer_summary =
+                validated_summary(&arguments, "answer_summary", max_summary_bytes)?;
+            let body = validated_optional_body(&arguments, max_artifact_bytes)?;
+            let content_type = optional_string(&arguments, "content_type")?
+                .unwrap_or_else(|| "text/markdown".to_owned());
+            store
+                .answer_request(AnswerRequest {
+                    actor,
+                    request_id,
+                    answer_summary,
+                    body,
+                    content_type,
+                })
+                .await
+                .map(|value| json!(value))
+        }
+        "fail_request" => {
+            let actor = parse_actor(&arguments)?;
+            let request_id = parse_request_id(&arguments)?;
+            let retryable = optional_bool(&arguments, "retryable")?.ok_or_else(|| {
+                invalid_argument("'retryable' is required and must be a boolean".to_owned())
+            })?;
+            let summary = validated_summary(&arguments, "summary", max_summary_bytes)?;
+            store
+                .fail_request(FailRequest {
+                    actor,
+                    request_id,
+                    retryable,
+                    summary,
+                })
+                .await
+                .map(|value| json!(value))
+        }
+        "list_inbox" => {
+            let actor = parse_actor(&arguments)?;
+            let after_delivery_id = optional_nonnegative_i64(&arguments, "after_delivery_id")?;
+            let limit = optional_limit(&arguments)?.unwrap_or(20);
+            store
+                .list_inbox(actor, after_delivery_id, limit)
+                .await
+                .map(|value| json!(value))
+        }
+        "read_message" => {
+            let actor = parse_actor(&arguments)?;
+            let message_id = parse_message_id(&arguments)?;
+            store
+                .read_message(actor, message_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "read_artifact" => {
+            let actor = parse_actor(&arguments)?;
+            let artifact_id = ArtifactId::parse(&require_string(&arguments, "artifact_id")?)
+                .map_err(invalid_uuid)?;
+            store
+                .read_artifact(actor, artifact_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "ack_message" => {
+            let actor = parse_actor(&arguments)?;
+            let message_id = parse_message_id(&arguments)?;
+            store
+                .ack_message(actor, message_id)
+                .await
+                .map(|value| json!(value))
+        }
+        "list_repositories" => {
+            let project_id = parse_project_id(&arguments)?;
+            store.list_repositories(project_id).await.map(
+                |repositories| json!({ "project_id": project_id, "repositories": repositories }),
+            )
+        }
+        "get_project_overview" => {
+            let project_id = parse_project_id(&arguments)?;
+            store
+                .project_overview(project_id)
+                .await
+                .map(|value| json!(value))
+        }
+        _ => {
+            return Err(RpcError::new(-32602, "Invalid params")
+                .with_data(json!(format!("Unknown tool: {tool_name}"))));
+        }
+    };
+
+    Ok(match result {
+        Ok(payload) => tool_result(payload, false),
+        Err(error) => tool_result(store_error_payload(&error), true),
+    })
+}
+
+pub(super) async fn read_resource(
+    store: &SqliteStore,
+    max_summary_bytes: u16,
+    max_artifact_bytes: u32,
+    uri: &str,
+) -> Result<Value, RpcError> {
+    if uri == "hub://guide" {
+        return Ok(resource_contents(
+            uri,
+            json!({
+                "server": SERVER_NAME,
+                "workflow": "multi-repository coordination hub",
+                "recommended_entrypoint": "connect_orchestrator",
+                "identity": ["project", "repository", "orchestrator instance"],
+                "lease_note": "Call heartbeat before lease_expires_at. Repository identity and future mailbox state remain stable across orchestrator instances.",
+                "max_summary_bytes": max_summary_bytes,
+                "max_artifact_bytes": max_artifact_bytes,
+                "summary_note": "Summary fields are compact UTF-8 indexes. Put full context in an artifact instead of enlarging every inbox/event payload.",
+                "worker_flow": [
+                    "The orchestrator calls create_worker_run before spawning a child.",
+                    "The child receives worker_run_id and calls activate_worker_run.",
+                    "The child calls complete_worker_run or fail_worker_run before exiting.",
+                    "A worker never calls connect_orchestrator and never creates a repository identity."
+                ],
+                "audit_flow": [
+                    "Create one auditor run for one or more work_item_ids; max_iterations defaults to one and is fixed per item.",
+                    "The auditor publishes one audit_report artifact covering its complete scope.",
+                    "If remediation is needed, create at most one executor run with addresses_audit_run_id; that executor addresses the whole report.",
+                    "A later audit increments each item's iteration independently and is rejected after that item's depth is exhausted."
+                ],
+                "request_flow": [
+                    "Create a durable directed question with ask_repository; the target receives request_available.",
+                    "One target actor atomically claims it; explicit renew, heartbeat, mutating actor activity and active event waiting extend only an unexpired claim.",
+                    "answer_request atomically closes the request and delivers an answer message/artifact to the requester.",
+                    "A retryable failure returns the request to pending; a terminal failure closes it and notifies the requester."
+                ],
+                "messaging_flow": [
+                    "Publish an immutable summary and optional artifact with publish_message.",
+                    "Supply an actor-scoped idempotency_key to creation calls that may be retried; the same key requires an identical payload.",
+                    "Call wait_for_events with the last event cursor; omit timeout_seconds for an unbounded server wait. The server renews the waiting actor lease.",
+                    "Use list_inbox to read pending headers without artifact bodies.",
+                    "Use read_message/read_artifact only for selected items.",
+                    "Call ack_message after processing; broadcast recipients acknowledge independently."
+                ],
+                "current_scope": "Project/repository presence, worker runs, immutable messaging, artifacts, reliable per-repository delivery, cursor-based event waiting and claimed repository requests.",
+            }),
+        ));
+    }
+
+    if let Some(project_id) = uri
+        .strip_prefix("hub://project/")
+        .and_then(|suffix| suffix.strip_suffix("/overview"))
+    {
+        let project_id = ProjectId::parse(project_id).map_err(invalid_uuid)?;
+        let overview = store
+            .project_overview(project_id)
+            .await
+            .map_err(store_rpc_error)?;
+        return Ok(resource_contents(uri, json!(overview)));
+    }
+
+    if let Some(project_id) = uri
+        .strip_prefix("hub://project/")
+        .and_then(|suffix| suffix.strip_suffix("/repositories"))
+    {
+        let project_id = ProjectId::parse(project_id).map_err(invalid_uuid)?;
+        let repositories = store
+            .list_repositories(project_id)
+            .await
+            .map_err(store_rpc_error)?;
+        return Ok(resource_contents(
+            uri,
+            json!({ "project_id": project_id, "repositories": repositories }),
+        ));
+    }
+
+    Err(RpcError::new(-32602, "Invalid params")
+        .with_data(json!(format!("Unsupported resource URI: {uri}"))))
+}
