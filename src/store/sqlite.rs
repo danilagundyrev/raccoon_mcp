@@ -7,6 +7,7 @@ use std::{
 };
 
 use chrono::{SecondsFormat, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::{
     QueryBuilder, Row, Sqlite, SqlitePool, Transaction,
     sqlite::{
@@ -377,14 +378,14 @@ async fn find_idempotent_result(
     actor_key: &str,
     operation: &str,
     idempotency_key: Option<&str>,
-    request_fingerprint: &str,
+    request_digest: &str,
 ) -> Result<Option<String>, StoreError> {
     let Some(idempotency_key) = idempotency_key else {
         return Ok(None);
     };
     validate_idempotency_key(idempotency_key)?;
     let row = sqlx::query(
-        "SELECT request_fingerprint, result_entity_id
+        "SELECT request_digest, result_entity_id
          FROM idempotency_records
          WHERE actor_key = ? AND operation = ? AND idempotency_key = ?",
     )
@@ -396,8 +397,8 @@ async fn find_idempotent_result(
     let Some(row) = row else {
         return Ok(None);
     };
-    let stored_fingerprint: String = row.try_get("request_fingerprint")?;
-    if stored_fingerprint != request_fingerprint {
+    let stored_digest: String = row.try_get("request_digest")?;
+    if stored_digest != request_digest {
         return Err(StoreError::Conflict(format!(
             "idempotency key '{idempotency_key}' was already used for a different {operation} payload"
         )));
@@ -410,7 +411,7 @@ async fn record_idempotent_result(
     actor_key: &str,
     operation: &str,
     idempotency_key: Option<&str>,
-    request_fingerprint: &str,
+    request_digest: &str,
     result_entity_id: &str,
     created_at: &str,
 ) -> Result<(), StoreError> {
@@ -420,14 +421,14 @@ async fn record_idempotent_result(
     validate_idempotency_key(idempotency_key)?;
     sqlx::query(
         "INSERT INTO idempotency_records(
-             actor_key, operation, idempotency_key, request_fingerprint,
+             actor_key, operation, idempotency_key, request_digest,
              result_entity_id, created_at
          ) VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(actor_key)
     .bind(operation)
     .bind(idempotency_key)
-    .bind(request_fingerprint)
+    .bind(request_digest)
     .bind(result_entity_id)
     .bind(created_at)
     .execute(&mut **transaction)
@@ -454,14 +455,14 @@ fn worker_run_fingerprint(command: &CreateWorkerRun) -> Result<String, StoreErro
             })
         })
         .collect::<Vec<_>>();
-    Ok(serde_json::to_string(&serde_json::json!({
+    payload_digest(&serde_json::json!({
         "role": command.role.as_str(),
         "task_summary": command.task_summary,
         "context_refs": command.context_refs,
         "audit_work_items": audit_items,
         "addresses_audit_run_id": command.addresses_audit_run_id,
         "work_item_id": command.work_item_id,
-    }))?)
+    }))
 }
 
 fn publish_message_fingerprint(command: &PublishMessage) -> Result<String, StoreError> {
@@ -471,7 +472,7 @@ fn publish_message_fingerprint(command: &PublishMessage) -> Result<String, Store
         }),
         MessageTarget::Broadcast => serde_json::json!({ "broadcast": true }),
     };
-    Ok(serde_json::to_string(&serde_json::json!({
+    payload_digest(&serde_json::json!({
         "kind": command.kind.as_str(),
         "target": target,
         "summary": command.summary,
@@ -482,16 +483,21 @@ fn publish_message_fingerprint(command: &PublishMessage) -> Result<String, Store
         "thread_id": command.thread_id,
         "correlation_id": command.correlation_id,
         "in_reply_to": command.in_reply_to,
-    }))?)
+    }))
 }
 
 fn ask_repository_fingerprint(command: &AskRepository) -> Result<String, StoreError> {
-    Ok(serde_json::to_string(&serde_json::json!({
+    payload_digest(&serde_json::json!({
         "target_repository_id": command.target_repository_id,
         "question_summary": command.question_summary,
         "body": command.body,
         "context_refs": command.context_refs,
-    }))?)
+    }))
+}
+
+fn payload_digest(payload: &serde_json::Value) -> Result<String, StoreError> {
+    let encoded = serde_json::to_vec(payload)?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
 async fn insert_delivery(
@@ -670,6 +676,7 @@ fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreErr
 async fn prepare_audit_scope(
     transaction: &mut Transaction<'_, Sqlite>,
     command: &CreateWorkerRun,
+    project_id: ProjectId,
 ) -> Result<Vec<AuditScopeItem>, StoreError> {
     if command.role != WorkerRole::Auditor {
         return Ok(Vec::new());
@@ -678,9 +685,13 @@ async fn prepare_audit_scope(
     let mut scope = Vec::with_capacity(command.audit_work_items.len());
     for item in &command.audit_work_items {
         let work_item = sqlx::query(
-            "SELECT status, max_audit_iterations FROM work_items WHERE work_item_id = ?",
+            "SELECT work_items.status, work_items.max_audit_iterations
+             FROM work_items
+             JOIN features ON features.feature_id = work_items.feature_id
+             WHERE work_items.work_item_id = ? AND features.project_id = ?",
         )
         .bind(item.work_item_id.to_string())
+        .bind(project_id.to_string())
         .fetch_optional(&mut **transaction)
         .await?
         .ok_or_else(|| StoreError::NotFound(format!("work item {}", item.work_item_id)))?;
@@ -692,28 +703,50 @@ async fn prepare_audit_scope(
             )));
         }
         let max_iterations = work_item.try_get::<i64, _>("max_audit_iterations")? as u8;
-        let row = sqlx::query(
-            "SELECT MAX(audit_iteration) AS current_iteration,
-                    MIN(max_iterations) AS min_max_iterations,
-                    MAX(max_iterations) AS max_max_iterations
-             FROM worker_run_audit_items
-             WHERE work_item_id = ?",
+        let previous = sqlx::query(
+            "SELECT audit.audit_iteration, audit.max_iterations, run.status,
+                    (SELECT COUNT(*) FROM artifacts
+                     WHERE producer_worker_run_id = run.worker_run_id
+                       AND kind = 'audit_report') AS report_count,
+                    remediation.status AS remediation_status
+             FROM worker_run_audit_items audit
+             JOIN worker_runs run ON run.worker_run_id = audit.worker_run_id
+             LEFT JOIN worker_runs remediation
+               ON remediation.addresses_audit_run_id = run.worker_run_id
+             WHERE audit.work_item_id = ?
+             ORDER BY audit.audit_iteration DESC
+             LIMIT 1",
         )
         .bind(item.work_item_id.to_string())
-        .fetch_one(&mut **transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
-        let current_iteration: Option<i64> = row.try_get("current_iteration")?;
-        let stored_min: Option<i64> = row.try_get("min_max_iterations")?;
-        let stored_max: Option<i64> = row.try_get("max_max_iterations")?;
-        if let (Some(stored_min), Some(stored_max)) = (stored_min, stored_max) {
-            if stored_min != i64::from(max_iterations) || stored_max != i64::from(max_iterations) {
+        let current_iteration = if let Some(previous) = previous {
+            let stored_max = previous.try_get::<i64, _>("max_iterations")?;
+            if stored_max != i64::from(max_iterations) {
                 return Err(StoreError::Conflict(format!(
-                    "work item {} audit depth is already fixed at {stored_min}",
+                    "work item {} audit depth is already fixed at {stored_max}",
                     item.work_item_id
                 )));
             }
-        }
-        let iteration = current_iteration.unwrap_or(0) + 1;
+            let status: String = previous.try_get("status")?;
+            let report_count: i64 = previous.try_get("report_count")?;
+            let remediation_status: Option<String> = previous.try_get("remediation_status")?;
+            if status != "completed"
+                || report_count != 1
+                || remediation_status
+                    .as_deref()
+                    .is_some_and(|value| value != "completed")
+            {
+                return Err(StoreError::Conflict(format!(
+                    "work item {} cannot start its next audit until the previous audit has exactly one report and any remediation is completed",
+                    item.work_item_id
+                )));
+            }
+            previous.try_get::<i64, _>("audit_iteration")?
+        } else {
+            0
+        };
+        let iteration = current_iteration + 1;
         if iteration > i64::from(max_iterations) {
             return Err(StoreError::Conflict(format!(
                 "work item {} exhausted audit depth {}",

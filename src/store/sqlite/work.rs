@@ -16,7 +16,7 @@ impl SqliteStore {
         let _write_guard = self.write_lock.lock().await;
         let now = utc_now();
         let feature_id = FeatureId::new();
-        let fingerprint = serde_json::to_string(&serde_json::json!({
+        let fingerprint = payload_digest(&serde_json::json!({
             "title": command.title,
             "summary": command.summary,
         }))?;
@@ -110,7 +110,7 @@ impl SqliteStore {
         let _write_guard = self.write_lock.lock().await;
         let now = utc_now();
         let work_item_id = WorkItemId::new();
-        let fingerprint = serde_json::to_string(&serde_json::json!({
+        let fingerprint = payload_digest(&serde_json::json!({
             "feature_id": command.feature_id,
             "parent_work_item_id": command.parent_work_item_id,
             "owner_repository_id": command.owner_repository_id,
@@ -254,6 +254,21 @@ impl SqliteStore {
                 "completed and cancelled work items are immutable".to_owned(),
             ));
         }
+        if matches!(
+            current.status,
+            WorkItemStatus::Claimed | WorkItemStatus::InProgress | WorkItemStatus::Blocked
+        ) && (current.owner_repository_id != actor.repository_id
+            || current.assignee_instance_id != Some(command.parent_instance_id)
+            || current
+                .claim_expires_at
+                .as_deref()
+                .is_none_or(|expires| expires <= now.as_str()))
+        {
+            return Err(StoreError::Conflict(
+                "active work item updates require its owner repository, assigned orchestrator and an unexpired claim"
+                    .to_owned(),
+            ));
+        }
 
         let next_owner = command
             .owner_repository_id
@@ -303,8 +318,10 @@ impl SqliteStore {
             validate_implementation_artifact(
                 &mut transaction,
                 artifact_id,
+                current.work_item_id,
                 actor.project_id,
                 current.owner_repository_id,
+                current.assignee_instance_id,
             )
             .await?;
         } else if command.implementation_artifact_id.is_some() {
@@ -871,24 +888,50 @@ async fn replace_dependencies(
 async fn validate_implementation_artifact(
     transaction: &mut Transaction<'_, Sqlite>,
     artifact_id: ArtifactId,
+    work_item_id: WorkItemId,
     project_id: ProjectId,
     owner_repository_id: RepositoryId,
+    assignee_instance_id: Option<InstanceId>,
 ) -> Result<(), StoreError> {
+    let assignee_instance_id = assignee_instance_id.ok_or_else(|| {
+        StoreError::Conflict(
+            "completed work item must still be owned by its claimed orchestrator".to_owned(),
+        )
+    })?;
     let exists: i64 = sqlx::query_scalar(
         "SELECT EXISTS(
-             SELECT 1 FROM artifacts
-             WHERE artifact_id = ? AND project_id = ? AND producer_repository_id = ?
-               AND kind = 'implementation_report'
+             SELECT 1
+             FROM artifacts artifact
+             JOIN worker_runs worker
+               ON worker.worker_run_id = artifact.producer_worker_run_id
+             WHERE artifact.artifact_id = ?
+               AND artifact.project_id = ?
+               AND artifact.producer_repository_id = ?
+               AND artifact.kind = 'implementation_report'
+               AND worker.role = 'executor'
+               AND worker.status = 'completed'
+               AND worker.work_item_id = ?
+               AND worker.parent_instance_id = ?
+               AND worker.worker_run_id = (
+                   SELECT latest.worker_run_id
+                   FROM worker_runs latest
+                   WHERE latest.work_item_id = ? AND latest.role = 'executor'
+                   ORDER BY latest.rowid DESC
+                   LIMIT 1
+               )
          )",
     )
     .bind(artifact_id.to_string())
     .bind(project_id.to_string())
     .bind(owner_repository_id.to_string())
+    .bind(work_item_id.to_string())
+    .bind(assignee_instance_id.to_string())
+    .bind(work_item_id.to_string())
     .fetch_one(&mut **transaction)
     .await?;
     if exists == 0 {
         return Err(StoreError::Conflict(
-            "implementation artifact must be an implementation_report produced by the owner repository"
+            "implementation artifact must be produced by the completed current executor for this work item"
                 .to_owned(),
         ));
     }
@@ -1058,11 +1101,17 @@ pub(super) async fn link_audit_report(
             "audit_report must be published by an auditor run".to_owned(),
         ));
     }
-    let rows =
-        sqlx::query("SELECT work_item_id FROM worker_run_audit_items WHERE worker_run_id = ?")
-            .bind(worker_run_id.to_string())
-            .fetch_all(&mut **transaction)
-            .await?;
+    let rows = sqlx::query(
+        "SELECT audit.work_item_id
+         FROM worker_run_audit_items audit
+         JOIN work_items item ON item.work_item_id = audit.work_item_id
+         JOIN features feature ON feature.feature_id = item.feature_id
+         WHERE audit.worker_run_id = ? AND feature.project_id = ?",
+    )
+    .bind(worker_run_id.to_string())
+    .bind(actor.project_id.to_string())
+    .fetch_all(&mut **transaction)
+    .await?;
     let mut work_item_ids = Vec::with_capacity(rows.len());
     for row in rows {
         let work_item_id = WorkItemId::parse(row.try_get("work_item_id")?)?;
@@ -1079,4 +1128,31 @@ pub(super) async fn link_audit_report(
         work_item_ids.push(work_item_id);
     }
     append_work_item_events(transaction, actor.project_id, &work_item_ids, now).await
+}
+
+pub(super) async fn validate_audit_report_publication(
+    transaction: &mut Transaction<'_, Sqlite>,
+    actor: &ResolvedActor,
+) -> Result<(), StoreError> {
+    let worker_run_id = actor.worker_run_id.ok_or_else(|| {
+        StoreError::Conflict("audit_report must be published by an active auditor run".to_owned())
+    })?;
+    let row = sqlx::query(
+        "SELECT role,
+                (SELECT COUNT(*) FROM artifacts
+                 WHERE producer_worker_run_id = worker_runs.worker_run_id
+                   AND kind = 'audit_report') AS report_count
+         FROM worker_runs WHERE worker_run_id = ?",
+    )
+    .bind(worker_run_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    let role: String = row.try_get("role")?;
+    let report_count: i64 = row.try_get("report_count")?;
+    if role != "auditor" || report_count != 0 {
+        return Err(StoreError::Conflict(
+            "an auditor run can publish exactly one audit_report".to_owned(),
+        ));
+    }
+    Ok(())
 }

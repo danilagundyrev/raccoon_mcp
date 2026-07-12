@@ -136,6 +136,23 @@ CREATE TABLE IF NOT EXISTS worker_run_audit_items (
 CREATE INDEX IF NOT EXISTS worker_run_audit_items_work_item_idx
     ON worker_run_audit_items(work_item_id, audit_iteration);
 
+CREATE TRIGGER IF NOT EXISTS worker_run_audit_items_same_project
+BEFORE INSERT ON worker_run_audit_items
+WHEN (
+    SELECT repositories.project_id
+    FROM worker_runs
+    JOIN repositories ON repositories.repository_id = worker_runs.repository_id
+    WHERE worker_runs.worker_run_id = NEW.worker_run_id
+) <> (
+    SELECT features.project_id
+    FROM work_items
+    JOIN features ON features.feature_id = work_items.feature_id
+    WHERE work_items.work_item_id = NEW.work_item_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'audit worker and work item must belong to the same project');
+END;
+
 CREATE TABLE IF NOT EXISTS artifacts (
     artifact_id TEXT PRIMARY KEY NOT NULL,
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
@@ -151,6 +168,10 @@ CREATE TABLE IF NOT EXISTS artifacts (
 
 CREATE INDEX IF NOT EXISTS artifacts_project_created_idx
     ON artifacts(project_id, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS artifacts_one_audit_report_per_worker_idx
+    ON artifacts(producer_worker_run_id)
+    WHERE kind = 'audit_report' AND producer_worker_run_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS messages (
     message_id TEXT PRIMARY KEY NOT NULL,
@@ -228,7 +249,7 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
     actor_key TEXT NOT NULL,
     operation TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
-    request_fingerprint TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
     result_entity_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY(actor_key, operation, idempotency_key)

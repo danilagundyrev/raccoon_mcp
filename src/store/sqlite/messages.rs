@@ -86,6 +86,10 @@ impl SqliteStore {
         let recipient_ids =
             resolve_recipients(&mut transaction, actor.project_id, command.target).await?;
 
+        if command.body.is_some() && command.artifact_kind == ArtifactKind::AuditReport {
+            super::work::validate_audit_report_publication(&mut transaction, &actor).await?;
+        }
+
         let artifact = if let Some(content) = command.body {
             let artifact = Artifact {
                 artifact_id: ArtifactId::new(),

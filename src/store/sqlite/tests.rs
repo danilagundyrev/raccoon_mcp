@@ -820,6 +820,20 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
             .iter()
             .all(|item| item.iteration == 1 && item.max_iterations == 2)
     );
+    assert!(matches!(
+        store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: connected.instance.instance_id,
+                role: WorkerRole::Auditor,
+                task_summary: "Cannot overlap audit iterations".to_owned(),
+                context_refs: json!([]),
+                audit_work_items: audit_items(),
+                addresses_audit_run_id: None,
+                work_item_id: None,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
     store
         .activate_worker_run(first_audit.worker_run_id)
         .await
@@ -842,6 +856,24 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
         .unwrap()
         .artifact
         .unwrap();
+    assert!(matches!(
+        store
+            .publish_message(PublishMessage {
+                actor: ActorRef::Worker(first_audit.worker_run_id),
+                kind: crate::domain::MessageKind::Report,
+                target: MessageTarget::Broadcast,
+                summary: "Duplicate audit report".to_owned(),
+                body: Some("Must be rejected".to_owned()),
+                artifact_kind: crate::domain::ArtifactKind::AuditReport,
+                artifact_title: None,
+                content_type: "text/markdown".to_owned(),
+                thread_id: None,
+                correlation_id: None,
+                in_reply_to: None,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
     assert_eq!(
         store
             .get_work_item(first_item)
@@ -894,6 +926,29 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
         Err(StoreError::Conflict(_))
     ));
 
+    assert!(matches!(
+        store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: connected.instance.instance_id,
+                role: WorkerRole::Auditor,
+                task_summary: "Cannot audit before remediation finishes".to_owned(),
+                context_refs: json!([]),
+                audit_work_items: audit_items(),
+                addresses_audit_run_id: None,
+                work_item_id: None,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    store
+        .activate_worker_run(remediation.worker_run_id)
+        .await
+        .unwrap();
+    store
+        .complete_worker_run(remediation.worker_run_id, "Remediation complete")
+        .await
+        .unwrap();
+
     let second_audit = store
         .create_worker_run(CreateWorkerRun {
             parent_instance_id: connected.instance.instance_id,
@@ -926,6 +981,74 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
             .await,
         Err(StoreError::Conflict(_))
     ));
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn auditor_cannot_scope_work_items_from_another_project() {
+    let (store, path) = test_store(90).await;
+    let first = store
+        .connect_orchestrator(connect_command("first", "backend", "C:/first/backend"))
+        .await
+        .unwrap();
+    let second = store
+        .connect_orchestrator(connect_command("second", "backend", "C:/second/backend"))
+        .await
+        .unwrap();
+    let foreign_feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: second.instance.instance_id,
+            title: "Foreign feature".to_owned(),
+            summary: "Must remain isolated".to_owned(),
+        })
+        .await
+        .unwrap();
+    let foreign_item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: second.instance.instance_id,
+            feature_id: foreign_feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: second.repository.repository_id,
+            title: "Foreign item".to_owned(),
+            summary: "Must not be audited by the first project".to_owned(),
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE work_items SET status = 'completed' WHERE work_item_id = ?")
+        .bind(foreign_item.work_item_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: first.instance.instance_id,
+                role: WorkerRole::Auditor,
+                task_summary: "Cross-project audit".to_owned(),
+                context_refs: json!([]),
+                audit_work_items: vec![AuditWorkItemInput {
+                    work_item_id: foreign_item.work_item_id,
+                }],
+                addresses_audit_run_id: None,
+                work_item_id: None,
+            })
+            .await,
+        Err(StoreError::NotFound(_)) | Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        store
+            .get_work_item(foreign_item.work_item_id)
+            .await
+            .unwrap()
+            .latest_audit_artifact_id,
+        None
+    );
 
     store.pool.close().await;
     remove_database(&path);
@@ -1513,6 +1636,13 @@ async fn creation_idempotency_replays_result_and_rejects_changed_payload() {
         .await
         .unwrap();
     assert_eq!((request_count, message_count, worker_count), (1, 1, 1));
+    let digest_lengths: Vec<i64> =
+        sqlx::query_scalar("SELECT LENGTH(request_digest) FROM idempotency_records")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(digest_lengths.len(), 5);
+    assert!(digest_lengths.iter().all(|length| *length == 64));
 
     store.pool.close().await;
     remove_database(&path);
@@ -1761,6 +1891,24 @@ async fn work_graph_unlocks_dependency_and_links_worker_report() {
     let in_progress = store.get_work_item(api.work_item_id).await.unwrap();
     assert_eq!(in_progress.status, WorkItemStatus::InProgress);
     assert!(in_progress.revision > claimed.revision);
+    let unrelated_report = store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Orchestrator(backend.instance.instance_id),
+            kind: crate::domain::MessageKind::Report,
+            target: MessageTarget::Repositories(vec![web.repository.repository_id]),
+            summary: "Unrelated implementation report".to_owned(),
+            body: Some("Not produced by the linked executor".to_owned()),
+            artifact_kind: crate::domain::ArtifactKind::ImplementationReport,
+            artifact_title: None,
+            content_type: "text/markdown".to_owned(),
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
     let report = store
         .publish_message(PublishMessage {
             actor: ActorRef::Worker(worker.worker_run_id),
@@ -1781,6 +1929,24 @@ async fn work_graph_unlocks_dependency_and_links_worker_report() {
         .complete_worker_run(worker.worker_run_id, "API complete")
         .await
         .unwrap();
+    assert!(matches!(
+        store
+            .update_work_item(UpdateWorkItem {
+                parent_instance_id: backend.instance.instance_id,
+                work_item_id: api.work_item_id,
+                expected_revision: in_progress.revision,
+                title: None,
+                summary: None,
+                owner_repository_id: None,
+                parent_work_item_id: None,
+                dependency_ids: None,
+                priority: None,
+                status: Some(WorkItemStatus::Completed),
+                implementation_artifact_id: Some(unrelated_report.artifact_id),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
     let completed = store
         .update_work_item(UpdateWorkItem {
             parent_instance_id: backend.instance.instance_id,
@@ -1909,6 +2075,24 @@ async fn work_item_claim_and_dependency_cycle_are_conflict_safe() {
         _ => unreachable!("exactly one concurrent work-item claim succeeds"),
     };
     assert!(matches!(loser, StoreError::RevisionConflict { .. }));
+    assert!(matches!(
+        store
+            .update_work_item(UpdateWorkItem {
+                parent_instance_id: takeover_instance_id,
+                work_item_id: root.work_item_id,
+                expected_revision: claimed.revision,
+                title: None,
+                summary: None,
+                owner_repository_id: None,
+                parent_work_item_id: None,
+                dependency_ids: None,
+                priority: None,
+                status: Some(WorkItemStatus::Cancelled),
+                implementation_artifact_id: None,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
     let short_expiry =
         (Utc::now() + chrono::Duration::seconds(2)).to_rfc3339_opts(SecondsFormat::Micros, true);
     sqlx::query("UPDATE work_items SET claim_expires_at = ? WHERE work_item_id = ?")

@@ -85,15 +85,7 @@ impl SqliteStore {
                 .await?
                 .try_get("project_id")?,
         )?;
-        let audit_scope = prepare_audit_scope(&mut transaction, &command).await?;
-        let work_item_recipients = super::work::attach_worker_to_work_item(
-            &mut transaction,
-            &command,
-            repository_id,
-            project_id,
-            &now,
-        )
-        .await?;
+        let audit_scope = prepare_audit_scope(&mut transaction, &command, project_id).await?;
         if let Some(audit_run_id) = command.addresses_audit_run_id {
             validate_remediation_audit(&mut transaction, repository_id, audit_run_id).await?;
         }
@@ -118,6 +110,15 @@ impl SqliteStore {
         .bind(&now)
         .bind(&worker_lease_expires_at)
         .execute(&mut *transaction)
+        .await?;
+
+        let work_item_recipients = super::work::attach_worker_to_work_item(
+            &mut transaction,
+            &command,
+            repository_id,
+            project_id,
+            &now,
+        )
         .await?;
 
         for scope_item in &audit_scope {
