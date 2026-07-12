@@ -19,7 +19,7 @@ pub(super) async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key. Model shared work with create_feature/create_work_item, use expected_revision for updates, and claim an owner-repository item before creating its executor worker run. Dependencies unlock automatically after completion with an implementation_report artifact. Roles are executor, butler and auditor. Auditor scope contains completed work_item_ids; max audit depth comes from each work-item card, and the auditor publishes one audit_report. If findings require remediation, create exactly one executor with addresses_audit_run_id for the complete audit report. Workers activate and complete/fail through MCP and never register as repositories. Use ask_repository plus claim/renew/release/answer/fail for durable questions. Use an idempotency_key when create_feature, create_work_item, create_worker_run, publish_message or ask_repository may be retried after transport uncertainty. Use wait_for_events for repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. Omit timeout_seconds for no server-side timeout.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use expected_revision for updates, and claim an owner-repository item before creating its executor worker run. The current linked executor must publish an implementation_report and complete before its orchestrator completes the item. Roles are executor, butler and auditor. Auditor scope contains completed work_item_ids and publishes exactly one audit_report; a later iteration waits for the previous audit and any created remediation executor to complete. Workers never register as repositories. Use ask_repository for durable questions and actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. Omit timeout_seconds for no server-side timeout. JSON-RPC batches are not supported.",
         })),
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
         "ping" => Ok(json!({})),
@@ -37,7 +37,10 @@ pub(super) async fn dispatch(
         }
         _ => Err(RpcError::new(-32601, "Method not found")
             .with_status(StatusCode::NOT_FOUND)
-            .with_data(json!(format!("Unsupported method: {method}")))),
+            .with_data(machine_error_data(
+                "method_not_found",
+                format!("Unsupported method: {method}"),
+            ))),
     }
 }
 
@@ -531,8 +534,12 @@ pub(super) async fn call_tool(
                 .map(|value| json!(value))
         }
         _ => {
-            return Err(RpcError::new(-32602, "Invalid params")
-                .with_data(json!(format!("Unknown tool: {tool_name}"))));
+            return Err(
+                RpcError::new(-32602, "Invalid params").with_data(machine_error_data(
+                    "unknown_tool",
+                    format!("Unknown tool: {tool_name}"),
+                )),
+            );
         }
     };
 
@@ -560,6 +567,12 @@ pub(super) async fn read_resource(
                 "max_summary_bytes": max_summary_bytes,
                 "max_artifact_bytes": max_artifact_bytes,
                 "summary_note": "Summary fields are compact UTF-8 indexes. Put full context in an artifact instead of enlarging every inbox/event payload.",
+                "protocol_behavior": {
+                    "json_rpc_batching": "unsupported",
+                    "notifications": "accepted without a response body",
+                    "errors": "JSON-RPC error.data and tool structuredContent contain stable machine-readable codes",
+                    "cancellation": "session-scoped cancellation of long waits is not implemented yet"
+                },
                 "worker_flow": [
                     "The orchestrator calls create_worker_run before spawning a child.",
                     "The child receives worker_run_id and calls activate_worker_run.",
@@ -569,14 +582,15 @@ pub(super) async fn read_resource(
                 "work_flow": [
                     "Create a project feature and repository-owned work items; dependencies remain planned until all prerequisites complete.",
                     "Claim a ready item with expected_revision, then create an executor worker run linked by work_item_id.",
-                    "Publish an implementation_report artifact and complete the item through update_work_item with its latest revision.",
+                    "The latest executor linked to the item publishes an implementation_report and completes its worker run.",
+                    "Its assigned orchestrator then completes the item through update_work_item while the claim is still active.",
                     "Every mutation increments revision and emits project-wide compact work_item_updated events; stale writes return the current card."
                 ],
                 "audit_flow": [
                     "Create one auditor run for one or more work_item_ids; max_iterations defaults to one and is fixed per item.",
                     "The auditor publishes one audit_report artifact covering its complete scope.",
                     "If remediation is needed, create at most one executor run with addresses_audit_run_id; that executor addresses the whole report.",
-                    "A later audit increments each item's iteration independently and is rejected after that item's depth is exhausted."
+                    "A later audit waits for the previous auditor and any created remediation executor to complete, increments each item's iteration independently, and is rejected after depth is exhausted."
                 ],
                 "request_flow": [
                     "Create a durable directed question with ask_repository; the target receives request_available.",
@@ -624,6 +638,10 @@ pub(super) async fn read_resource(
         ));
     }
 
-    Err(RpcError::new(-32602, "Invalid params")
-        .with_data(json!(format!("Unsupported resource URI: {uri}"))))
+    Err(
+        RpcError::new(-32602, "Invalid params").with_data(machine_error_data(
+            "unknown_resource",
+            format!("Unsupported resource URI: {uri}"),
+        )),
+    )
 }

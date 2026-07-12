@@ -33,7 +33,7 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
             "annotations": {
                 "readOnlyHint": false,
                 "destructiveHint": false,
-                "idempotentHint": true,
+                "idempotentHint": false,
                 "openWorldHint": false
             }
         },
@@ -109,7 +109,7 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
             "annotations": {
                 "readOnlyHint": false,
                 "destructiveHint": false,
-                "idempotentHint": true,
+                "idempotentHint": false,
                 "openWorldHint": false
             }
         },
@@ -120,7 +120,7 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
             "annotations": {
                 "readOnlyHint": false,
                 "destructiveHint": false,
-                "idempotentHint": true,
+                "idempotentHint": false,
                 "openWorldHint": false
             }
         },
@@ -235,7 +235,7 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
             "annotations": {
                 "readOnlyHint": false,
                 "destructiveHint": false,
-                "idempotentHint": true,
+                "idempotentHint": false,
                 "openWorldHint": false
             }
         },

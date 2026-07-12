@@ -44,7 +44,126 @@ fn event_wait_schema_has_explicit_unbounded_timeout_contract() {
     assert!(tools.as_array().unwrap().iter().any(|tool| {
         tool["name"] == "wait_for_events"
             && tool["annotations"]["readOnlyHint"] == Value::Bool(false)
+            && tool["annotations"]["idempotentHint"] == Value::Bool(false)
     }));
+}
+
+#[test]
+fn tool_annotations_match_lease_mutation_semantics() {
+    let tools = tool_definitions(1024, 524_288);
+    for name in [
+        "heartbeat",
+        "activate_worker_run",
+        "heartbeat_worker_run",
+        "wait_for_events",
+    ] {
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], false, "{name}");
+        assert_eq!(tool["annotations"]["idempotentHint"], false, "{name}");
+    }
+    for name in [
+        "get_worker_run",
+        "read_request",
+        "list_inbox",
+        "read_message",
+    ] {
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], true, "{name}");
+        assert_eq!(tool["annotations"]["idempotentHint"], true, "{name}");
+    }
+}
+
+#[test]
+fn rpc_errors_expose_machine_readable_data_codes() {
+    let invalid = invalid_argument("missing actor identity".to_owned());
+    assert_eq!(invalid.data.as_ref().unwrap()["code"], "invalid_params");
+    assert_eq!(
+        invalid.data.as_ref().unwrap()["message"],
+        "missing actor identity"
+    );
+
+    let missing = store_rpc_error(StoreError::NotFound("work item x".to_owned()));
+    assert_eq!(missing.data.as_ref().unwrap()["code"], "not_found");
+
+    let conflict = store_rpc_error(StoreError::Conflict("claim expired".to_owned()));
+    assert_eq!(conflict.data.as_ref().unwrap()["code"], "conflict");
+}
+
+#[tokio::test]
+async fn protocol_rejects_batches_and_never_responds_to_notifications() {
+    let path = std::env::temp_dir()
+        .join("agent-sync-mcp-server-tests")
+        .join(format!("{}.sqlite3", uuid::Uuid::new_v4()));
+    let store = SqliteStore::open(&path, 1, 90, 3600, 600, 3600)
+        .await
+        .unwrap();
+
+    let (batch_status, batch_body) = handle_rpc_payload(
+        &store,
+        1024,
+        524_288,
+        json!([{ "jsonrpc": "2.0", "id": 1, "method": "ping" }]),
+    )
+    .await;
+    assert_eq!(batch_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        batch_body.unwrap()["error"]["data"]["code"],
+        "batch_not_supported"
+    );
+
+    let (notification_status, notification_body) = handle_rpc_payload(
+        &store,
+        1024,
+        524_288,
+        json!({ "jsonrpc": "2.0", "method": "ping" }),
+    )
+    .await;
+    assert_eq!(notification_status, StatusCode::ACCEPTED);
+    assert!(notification_body.is_none());
+
+    let initialize = dispatch(&store, 1024, 524_288, "initialize", &JsonMap::new())
+        .await
+        .unwrap();
+    assert!(
+        initialize["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("hub://guide")
+    );
+    let guide = dispatch(
+        &store,
+        1024,
+        524_288,
+        "resources/read",
+        &JsonMap::from_iter([("uri".to_owned(), json!("hub://guide"))]),
+    )
+    .await
+    .unwrap();
+    let guide_payload: Value =
+        serde_json::from_str(guide["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        guide_payload["protocol_behavior"]["json_rpc_batching"],
+        "unsupported"
+    );
+    assert_eq!(
+        guide_payload["protocol_behavior"]["notifications"],
+        "accepted without a response body"
+    );
+
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
 }
 
 #[test]

@@ -231,7 +231,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                     Value::Null,
                     -32700,
                     "Parse error",
-                    Some(json!(error.to_string())),
+                    Some(machine_error_data("parse_error", error.to_string())),
                 ),
             );
         }
@@ -263,7 +263,10 @@ async fn handle_rpc_payload(
                 Value::Null,
                 -32600,
                 "Invalid Request",
-                Some(json!("JSON-RPC batching is not supported by MCP.")),
+                Some(machine_error_data(
+                    "batch_not_supported",
+                    "JSON-RPC batching is not supported by MCP.",
+                )),
             )),
         );
     }
@@ -294,7 +297,10 @@ async fn handle_single_request(
         return rpc_request_error(
             request_id,
             is_notification,
-            RpcError::new(-32600, "Invalid Request").with_data(json!("Expected jsonrpc='2.0'.")),
+            RpcError::new(-32600, "Invalid Request").with_data(machine_error_data(
+                "invalid_request",
+                "Expected jsonrpc='2.0'.",
+            )),
         );
     }
     let Some(method) = request
@@ -305,7 +311,8 @@ async fn handle_single_request(
         return rpc_request_error(
             request_id,
             is_notification,
-            RpcError::new(-32600, "Invalid Request").with_data(json!("Missing method.")),
+            RpcError::new(-32600, "Invalid Request")
+                .with_data(machine_error_data("invalid_request", "Missing method.")),
         );
     };
     let params = match request.get("params") {
@@ -315,8 +322,10 @@ async fn handle_single_request(
             return rpc_request_error(
                 request_id,
                 is_notification,
-                RpcError::new(-32602, "Invalid params")
-                    .with_data(json!("Expected params to be an object.")),
+                RpcError::new(-32602, "Invalid params").with_data(machine_error_data(
+                    "invalid_params",
+                    "Expected params to be an object.",
+                )),
             );
         }
     };

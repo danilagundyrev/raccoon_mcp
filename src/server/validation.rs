@@ -409,7 +409,7 @@ pub(super) fn optional_string(
 }
 
 pub(super) fn invalid_argument(message: String) -> RpcError {
-    RpcError::new(-32602, "Invalid params").with_data(json!(message))
+    RpcError::new(-32602, "Invalid params").with_data(machine_error_data("invalid_params", message))
 }
 
 pub(super) fn invalid_uuid(error: uuid::Error) -> RpcError {
@@ -419,16 +419,32 @@ pub(super) fn invalid_uuid(error: uuid::Error) -> RpcError {
 pub(super) fn store_rpc_error(error: StoreError) -> RpcError {
     match error {
         StoreError::NotFound(message) => {
-            RpcError::new(-32602, "Not found").with_data(json!(message))
+            RpcError::new(-32602, "Not found").with_data(machine_error_data("not_found", message))
         }
-        StoreError::Conflict(message) => {
-            RpcError::new(-32602, "Invalid state").with_data(json!(message))
-        }
-        StoreError::RevisionConflict { current, .. } => {
-            RpcError::new(-32602, "Revision conflict").with_data(json!({ "current": current }))
-        }
-        other => RpcError::new(-32603, "Internal error").with_data(json!(other.to_string())),
+        StoreError::Conflict(message) => RpcError::new(-32602, "Invalid state")
+            .with_data(machine_error_data("conflict", message)),
+        StoreError::RevisionConflict {
+            work_item_id,
+            expected,
+            actual,
+            current,
+        } => RpcError::new(-32602, "Revision conflict").with_data(json!({
+            "code": "revision_conflict",
+            "message": format!(
+                "work item {work_item_id} revision conflict: expected {expected}, actual {actual}"
+            ),
+            "work_item_id": work_item_id,
+            "expected_revision": expected,
+            "actual_revision": actual,
+            "current": current,
+        })),
+        other => RpcError::new(-32603, "Internal error")
+            .with_data(machine_error_data("internal_error", other.to_string())),
     }
+}
+
+pub(super) fn machine_error_data(code: &str, message: impl Into<String>) -> Value {
+    json!({ "code": code, "message": message.into() })
 }
 
 pub(super) fn store_error_payload(error: &StoreError) -> Value {
