@@ -76,6 +76,30 @@ pub struct Args {
 
     #[arg(
         long,
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u16).range(1..=3600),
+        help = "Interval between maintenance passes in seconds."
+    )]
+    pub maintenance_interval_seconds: u16,
+
+    #[arg(
+        long,
+        default_value_t = 3600,
+        value_parser = clap::value_parser!(u16).range(60..=65535),
+        help = "Interval between bounded retention passes in seconds."
+    )]
+    pub retention_interval_seconds: u16,
+
+    #[arg(
+        long,
+        default_value_t = 604_800,
+        value_parser = clap::value_parser!(u32).range(3600..=31_536_000),
+        help = "Retention for append-only events and idempotency records in seconds."
+    )]
+    pub retention_seconds: u32,
+
+    #[arg(
+        long,
         default_value = "INFO",
         value_parser = ["DEBUG", "INFO", "WARNING", "ERROR"],
         help = "Logging level."

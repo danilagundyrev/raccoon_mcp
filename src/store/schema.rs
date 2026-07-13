@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS agent_instances (
 CREATE INDEX IF NOT EXISTS agent_instances_presence_idx
     ON agent_instances(repository_id, status, lease_expires_at);
 
+CREATE INDEX IF NOT EXISTS agent_instances_expiry_idx
+    ON agent_instances(status, lease_expires_at)
+    WHERE status = 'online';
+
 CREATE TABLE IF NOT EXISTS features (
     feature_id TEXT PRIMARY KEY NOT NULL,
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
@@ -119,6 +123,10 @@ CREATE INDEX IF NOT EXISTS worker_runs_repository_status_idx
 
 CREATE INDEX IF NOT EXISTS worker_runs_parent_status_idx
     ON worker_runs(parent_instance_id, status);
+
+CREATE INDEX IF NOT EXISTS worker_runs_expiry_idx
+    ON worker_runs(status, lease_expires_at)
+    WHERE status IN ('created', 'active');
 
 CREATE UNIQUE INDEX IF NOT EXISTS worker_runs_one_remediation_per_audit_idx
     ON worker_runs(addresses_audit_run_id)
@@ -245,6 +253,10 @@ CREATE INDEX IF NOT EXISTS requests_target_status_idx
 CREATE INDEX IF NOT EXISTS requests_requester_status_idx
     ON requests(requester_repository_id, status, created_at);
 
+CREATE INDEX IF NOT EXISTS requests_claim_expiry_idx
+    ON requests(status, claim_expires_at)
+    WHERE status = 'claimed';
+
 CREATE TABLE IF NOT EXISTS idempotency_records (
     actor_key TEXT NOT NULL,
     operation TEXT NOT NULL,
@@ -282,4 +294,10 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS events_repository_cursor_idx
     ON events(recipient_repository_id, event_id);
+
+CREATE INDEX IF NOT EXISTS events_retention_idx
+    ON events(created_at, event_id);
+
+CREATE INDEX IF NOT EXISTS idempotency_records_retention_idx
+    ON idempotency_records(created_at);
 "#;

@@ -18,7 +18,7 @@ use axum::{
     routing::get,
 };
 use serde_json::{Map as JsonMap, Value, json};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch, time::MissedTickBehavior};
 
 use crate::{
     domain::{
@@ -45,6 +45,14 @@ const PROTOCOL_VERSION: &str = "2025-11-25";
 const SERVER_NAME: &str = "agent-sync-mcp";
 const SERVER_TITLE: &str = "Agent Coordination Hub";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub struct RuntimeConfig {
+    pub max_summary_bytes: u16,
+    pub max_artifact_bytes: u32,
+    pub maintenance_interval: Duration,
+    pub retention_interval: Duration,
+    pub retention: Duration,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -90,19 +98,20 @@ pub async fn run_server(
     port: u16,
     store: SqliteStore,
     database_path: PathBuf,
-    max_summary_bytes: u16,
-    max_artifact_bytes: u32,
+    config: RuntimeConfig,
     allow_hosts: Vec<String>,
 ) -> anyhow::Result<()> {
     let mut allowed_hosts = HashSet::from(["127.0.0.1".to_owned(), "localhost".to_owned()]);
     allowed_hosts.extend(allow_hosts.into_iter().map(|host| host.to_lowercase()));
 
+    let sessions = SessionRegistry::default();
     let app = router(
-        store,
+        store.clone(),
         database_path.clone(),
-        max_summary_bytes,
-        max_artifact_bytes,
+        config.max_summary_bytes,
+        config.max_artifact_bytes,
         allowed_hosts,
+        sessions.clone(),
     );
     let listener = TcpListener::bind((host.as_str(), port))
         .await
@@ -115,9 +124,21 @@ pub async fn run_server(
         database_path.display()
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let maintenance = tokio::spawn(maintenance_loop(
+        store.clone(),
+        config.maintenance_interval,
+        config.retention_interval,
+        config.retention,
+        shutdown_rx,
+    ));
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(sessions, shutdown_tx.clone()))
+        .await;
+    let _ = shutdown_tx.send(true);
+    maintenance.await?;
+    store.expire_local_leases().await?;
+    serve_result?;
     Ok(())
 }
 
@@ -127,10 +148,13 @@ fn router(
     max_summary_bytes: u16,
     max_artifact_bytes: u32,
     allowed_hosts: HashSet<String>,
+    sessions: SessionRegistry,
 ) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
@@ -140,13 +164,74 @@ fn router(
             database_path: Arc::new(database_path),
             max_summary_bytes,
             max_artifact_bytes,
-            sessions: SessionRegistry::default(),
+            sessions,
         })
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(sessions: SessionRegistry, shutdown: watch::Sender<bool>) {
     let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("Shutdown signal received");
+    tracing::info!("shutdown signal received; cancelling waiters and stopping maintenance");
+    let cancelled_sessions = sessions.terminate_all();
+    let _ = shutdown.send(true);
+    tracing::info!(cancelled_sessions, "graceful shutdown signal propagated");
+}
+
+#[cfg(test)]
+async fn prepare_shutdown(
+    store: &SqliteStore,
+    sessions: &SessionRegistry,
+) -> Result<(), StoreError> {
+    let cancelled_sessions = sessions.terminate_all();
+    store.expire_local_leases().await?;
+    tracing::info!(cancelled_sessions, "sessions cancelled during shutdown");
+    Ok(())
+}
+
+async fn maintenance_loop(
+    store: SqliteStore,
+    lease_interval: Duration,
+    retention_interval: Duration,
+    retention: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut lease_ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + lease_interval, lease_interval);
+    lease_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut retention_ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + retention_interval,
+        retention_interval,
+    );
+    retention_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = lease_ticker.tick() => {
+                match store.run_lease_maintenance().await {
+                    Ok(report) => tracing::info!(
+                        disconnected_orchestrators = report.disconnected_orchestrators,
+                        abandoned_workers = report.abandoned_workers,
+                        requeued_requests = report.requeued_requests,
+                        "lease maintenance pass completed"
+                    ),
+                    Err(error) => tracing::error!(error = %error, "lease maintenance pass failed"),
+                }
+            }
+            _ = retention_ticker.tick() => {
+                match store.run_retention(retention, 1000).await {
+                    Ok(report) => tracing::info!(
+                        deleted_events = report.deleted_events,
+                        deleted_idempotency_records = report.deleted_idempotency_records,
+                        "bounded retention pass completed"
+                    ),
+                    Err(error) => tracing::error!(error = %error, "retention pass failed"),
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 async fn root(State(state): State<AppState>) -> Response {
@@ -162,12 +247,25 @@ async fn root(State(state): State<AppState>) -> Response {
             "max_artifact_bytes": state.max_artifact_bytes,
             "mcp_endpoint": "/mcp",
             "health_endpoint": "/healthz",
+            "readiness_endpoint": "/readyz",
+            "metrics_endpoint": "/metrics",
         }),
     )
 }
 
-async fn healthz(State(state): State<AppState>) -> Response {
-    match state.store.health_check().await {
+async fn healthz() -> Response {
+    json_response(
+        StatusCode::OK,
+        json!({
+            "status": "ok",
+            "server": SERVER_NAME,
+            "version": SERVER_VERSION,
+        }),
+    )
+}
+
+async fn readyz(State(state): State<AppState>) -> Response {
+    match state.store.readiness_check().await {
         Ok(()) => json_response(
             StatusCode::OK,
             json!({
@@ -184,6 +282,16 @@ async fn healthz(State(state): State<AppState>) -> Response {
                 "server": SERVER_NAME,
                 "error": error.to_string(),
             }),
+        ),
+    }
+}
+
+async fn metrics(State(state): State<AppState>) -> Response {
+    match state.store.operational_metrics().await {
+        Ok(metrics) => json_response(StatusCode::OK, json!(metrics)),
+        Err(error) => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": { "code": "metrics_unavailable", "message": error.to_string() } }),
         ),
     }
 }
@@ -475,6 +583,28 @@ async fn handle_single_request(
             );
         }
     };
+    let arguments = params.get("arguments").and_then(Value::as_object);
+    let trace_field = |name: &str| {
+        arguments
+            .and_then(|arguments| arguments.get(name))
+            .or_else(|| params.get(name))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    tracing::info!(
+        method,
+        tool_name = params
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default(),
+        project_id = trace_field("project_id"),
+        repository_id = trace_field("repository_id"),
+        instance_id = trace_field("instance_id"),
+        worker_run_id = trace_field("worker_run_id"),
+        request_id = trace_field("request_id"),
+        work_item_id = trace_field("work_item_id"),
+        "MCP request"
+    );
 
     let dispatched = dispatch(
         store,

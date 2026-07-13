@@ -1236,6 +1236,147 @@ async fn wait_timeout_preserves_cursor_and_renews_lease() {
 }
 
 #[tokio::test]
+async fn maintenance_reaps_expired_runtime_state_and_reports_metrics() {
+    let (store, path) = test_store(90).await;
+    store.readiness_check().await.unwrap();
+    let requester = store
+        .connect_orchestrator(connect_command("operations", "web", "C:/operations/web"))
+        .await
+        .unwrap();
+    let target = store
+        .connect_orchestrator(connect_command(
+            "operations",
+            "backend",
+            "C:/operations/backend",
+        ))
+        .await
+        .unwrap();
+    let request = store
+        .ask_repository(AskRepository {
+            actor: ActorRef::Orchestrator(requester.instance.instance_id),
+            target_repository_id: target.repository.repository_id,
+            question_summary: "Operational request".to_owned(),
+            body: None,
+            context_refs: json!([]),
+        })
+        .await
+        .unwrap();
+    store
+        .claim_request(
+            ActorRef::Orchestrator(target.instance.instance_id),
+            request.request_id,
+        )
+        .await
+        .unwrap();
+    store
+        .publish_message(publish_command(
+            ActorRef::Orchestrator(requester.instance.instance_id),
+            MessageTarget::Repositories(vec![target.repository.repository_id]),
+            "Pending delivery",
+            None,
+        ))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_instances SET lease_expires_at = ? WHERE instance_id = ?")
+        .bind("2000-01-01T00:00:00.000000Z")
+        .bind(target.instance.instance_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE requests SET claim_expires_at = ? WHERE request_id = ?")
+        .bind("2000-01-01T00:00:00.000000Z")
+        .bind(request.request_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    let before = store.operational_metrics().await.unwrap();
+    assert_eq!(before.pending_deliveries, 1);
+    assert_eq!(before.online_repositories, 1);
+    assert_eq!(before.expired_request_claims, 1);
+    assert!(before.oldest_pending_delivery_at.is_some());
+    assert!(before.oldest_pending_delivery_age_seconds.is_some());
+    let report = store.run_lease_maintenance().await.unwrap();
+    assert_eq!(report.disconnected_orchestrators, 1);
+    assert_eq!(report.requeued_requests, 1);
+    assert_eq!(
+        store.get_request(request.request_id).await.unwrap().status,
+        RequestStatus::Pending
+    );
+    let after = store.operational_metrics().await.unwrap();
+    assert_eq!(after.expired_request_claims, 0);
+
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 1005
+         )
+         INSERT INTO events(
+             project_id, recipient_repository_id, kind, entity_type, entity_id, created_at
+         )
+         SELECT ?, ?, 'request_available', 'request', 'retained-' || value,
+                '2000-01-01T00:00:00.000000Z'
+         FROM sequence",
+    )
+    .bind(requester.project.project_id.to_string())
+    .bind(requester.repository.repository_id.to_string())
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 1005
+         )
+         INSERT INTO idempotency_records(
+             actor_key, operation, idempotency_key, request_digest,
+             result_entity_id, created_at
+         )
+         SELECT 'retention-test', 'test', 'key-' || value,
+                'digest', 'result', '2000-01-01T00:00:00.000000Z'
+         FROM sequence",
+    )
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    let retention = store
+        .run_retention(Duration::from_secs(7 * 24 * 60 * 60), 1000)
+        .await
+        .unwrap();
+    assert_eq!(retention.deleted_events, 1000);
+    assert_eq!(retention.deleted_idempotency_records, 1000);
+    let remaining_old_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE created_at < '2001-01-01'")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining_old_events, 5);
+    let maintenance_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name IN (
+             'agent_instances_expiry_idx', 'worker_runs_expiry_idx',
+             'requests_claim_expiry_idx', 'events_retention_idx',
+             'idempotency_records_retention_idx'
+         )",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    assert_eq!(maintenance_indexes, 5);
+
+    store.expire_local_leases().await.unwrap();
+    assert_eq!(
+        store
+            .operational_metrics()
+            .await
+            .unwrap()
+            .online_orchestrators,
+        0
+    );
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn only_one_actor_can_claim_the_same_request() {
     let (store, path) = test_store(90).await;
     let requester = store

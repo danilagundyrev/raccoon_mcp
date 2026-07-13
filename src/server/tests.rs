@@ -404,6 +404,21 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
     .await;
     assert_eq!(after_delete.status(), StatusCode::NOT_FOUND);
 
+    assert_eq!(healthz().await.status(), StatusCode::OK);
+    assert_eq!(readyz(State(state.clone())).await.status(), StatusCode::OK);
+    assert_eq!(metrics(State(state.clone())).await.status(), StatusCode::OK);
+    let shutdown_session = state.sessions.create(PROTOCOL_VERSION);
+    prepare_shutdown(&store, &state.sessions).await.unwrap();
+    assert!(!state.sessions.contains(&shutdown_session));
+    assert_eq!(
+        store
+            .operational_metrics()
+            .await
+            .unwrap()
+            .online_orchestrators,
+        0
+    );
+
     drop(state);
     drop(store);
     let _ = std::fs::remove_file(&path);

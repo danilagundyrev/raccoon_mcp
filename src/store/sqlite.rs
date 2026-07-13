@@ -25,16 +25,18 @@ use crate::domain::{
     ArtifactKind, AskRepository, AuditScopeItem, ConnectOrchestrator, ConnectResult,
     CoordinationRequest, CreateFeature, CreateWorkItem, CreateWorkerRun, DeliveryAck, EventBatch,
     EventEntityType, EventKind, FailRequest, Feature, FeatureId, HubEvent, InboxItem, InboxPage,
-    InstanceId, Message, MessageId, MessageKind, MessageTarget, PresenceStatus, Project, ProjectId,
-    ProjectOverview, PublishMessage, PublishResult, Repository, RepositoryId, RepositoryPresence,
-    RequestId, RequestStatus, ThreadId, UpdateWorkItem, WaitOutcome, WorkItem, WorkItemId,
-    WorkItemStatus, WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
+    InstanceId, LeaseMaintenanceReport, Message, MessageId, MessageKind, MessageTarget,
+    OperationalMetrics, PresenceStatus, Project, ProjectId, ProjectOverview, PublishMessage,
+    PublishResult, Repository, RepositoryId, RepositoryPresence, RequestId, RequestStatus,
+    RetentionReport, ThreadId, UpdateWorkItem, WaitOutcome, WorkItem, WorkItemId, WorkItemStatus,
+    WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
 };
 
 use super::schema::{CREATE_SCHEMA, SCHEMA_VERSION};
 
 mod events;
 mod messages;
+mod operations;
 mod presence;
 mod requests;
 mod work;
@@ -159,7 +161,9 @@ impl SqliteStore {
     }
 
     pub async fn health_check(&self) -> Result<(), StoreError> {
-        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT 1").execute(&mut *transaction).await?;
+        transaction.rollback().await?;
         Ok(())
     }
 
@@ -217,6 +221,7 @@ impl SqliteStore {
                     now,
                 )
                 .await?;
+                trace_resolved_actor(&actor);
                 Ok(actor)
             }
             ActorRef::Worker(worker_run_id) => {
@@ -263,6 +268,7 @@ impl SqliteStore {
                     now,
                 )
                 .await?;
+                trace_resolved_actor(&actor);
                 Ok(actor)
             }
         }
@@ -291,12 +297,14 @@ impl SqliteStore {
                         "instance {instance_id} is disconnected"
                     )));
                 }
-                Ok(ResolvedActor {
+                let actor = ResolvedActor {
                     project_id: ProjectId::parse(row.try_get("project_id")?)?,
                     repository_id: RepositoryId::parse(row.try_get("repository_id")?)?,
                     instance_id: Some(instance_id),
                     worker_run_id: None,
-                })
+                };
+                trace_resolved_actor(&actor);
+                Ok(actor)
             }
             ActorRef::Worker(worker_run_id) => {
                 let row = sqlx::query(
@@ -319,15 +327,27 @@ impl SqliteStore {
                 if lease_expires_at.as_str() <= now {
                     return Err(expired_worker_lease(worker_run_id));
                 }
-                Ok(ResolvedActor {
+                let actor = ResolvedActor {
                     project_id: ProjectId::parse(row.try_get("project_id")?)?,
                     repository_id: RepositoryId::parse(row.try_get("repository_id")?)?,
                     instance_id: None,
                     worker_run_id: Some(worker_run_id),
-                })
+                };
+                trace_resolved_actor(&actor);
+                Ok(actor)
             }
         }
     }
+}
+
+fn trace_resolved_actor(actor: &ResolvedActor) {
+    tracing::debug!(
+        project_id = %actor.project_id,
+        repository_id = %actor.repository_id,
+        instance_id = actor.instance_id.map(|id| id.to_string()).unwrap_or_default(),
+        worker_run_id = actor.worker_run_id.map(|id| id.to_string()).unwrap_or_default(),
+        "actor resolved"
+    );
 }
 
 async fn wait_until(deadline: Option<Instant>) {

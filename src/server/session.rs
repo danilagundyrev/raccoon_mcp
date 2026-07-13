@@ -66,6 +66,22 @@ impl SessionRegistry {
         }
     }
 
+    pub(super) fn terminate_all(&self) -> usize {
+        let sessions = std::mem::take(
+            &mut *self
+                .sessions
+                .lock()
+                .expect("session registry mutex poisoned"),
+        );
+        let count = sessions.len();
+        for session in sessions.into_values() {
+            for cancellation in session.requests.into_values() {
+                cancellation.notify_one();
+            }
+        }
+        count
+    }
+
     pub(super) fn register(&self, session_id: &str, request_id: &Value) -> Option<InFlightRequest> {
         let request_key = request_key(request_id)?;
         let cancellation = Arc::new(Notify::new());

@@ -623,6 +623,13 @@ pub(super) async fn read_resource(
                     "Use read_message/read_artifact only for selected items.",
                     "Call ack_message after processing; broadcast recipients acknowledge independently."
                 ],
+                "operations": {
+                    "health": "GET /healthz checks the HTTP process without depending on SQLite.",
+                    "readiness": "GET /readyz verifies that a SQLite transaction can begin and roll back.",
+                    "metrics": "GET /metrics returns compact counters without message or artifact bodies.",
+                    "maintenance": "A frequent indexed lease sweep disconnects expired orchestrators, abandons expired workers and requeues expired request claims. A separate slower retention schedule deletes at most 1000 old events and 1000 idempotency records per pass.",
+                    "shutdown": "Graceful shutdown stops accepting calls, cancels session waiters and expires local actor and claim leases."
+                },
                 "current_scope": "Project/repository presence, feature/work graph with optimistic revisions and claims, linked worker/audit runs, immutable messaging/artifacts, reliable delivery, event waiting and claimed repository requests.",
             }),
         ));

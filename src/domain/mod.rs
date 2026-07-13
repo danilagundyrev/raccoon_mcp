@@ -1,6 +1,7 @@
 mod events;
 mod ids;
 mod messaging;
+mod operations;
 mod presence;
 mod project;
 mod requests;
@@ -16,6 +17,7 @@ pub use messaging::{
     ActorRef, Artifact, ArtifactKind, DeliveryAck, InboxItem, InboxPage, Message, MessageKind,
     MessageTarget, PublishMessage, PublishResult,
 };
+pub use operations::{LeaseMaintenanceReport, OperationalMetrics, RetentionReport};
 pub use presence::{AgentInstance, ConnectOrchestrator, ConnectResult, PresenceStatus};
 pub use project::{Project, ProjectOverview, Repository, RepositoryPresence};
 pub use requests::{

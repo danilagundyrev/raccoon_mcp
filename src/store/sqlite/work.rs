@@ -540,7 +540,7 @@ impl SqliteStore {
         self.get_work_item(work_item_id).await
     }
 
-    fn notify_repositories(&self, repositories: &[RepositoryId]) {
+    pub(super) fn notify_repositories(&self, repositories: &[RepositoryId]) {
         for repository_id in repositories {
             self.notifications.notify(*repository_id);
         }

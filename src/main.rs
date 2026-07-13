@@ -37,8 +37,17 @@ async fn main() -> anyhow::Result<()> {
         args.port,
         store,
         args.database,
-        args.max_summary_bytes,
-        args.max_artifact_bytes,
+        server::RuntimeConfig {
+            max_summary_bytes: args.max_summary_bytes,
+            max_artifact_bytes: args.max_artifact_bytes,
+            maintenance_interval: std::time::Duration::from_secs(u64::from(
+                args.maintenance_interval_seconds,
+            )),
+            retention_interval: std::time::Duration::from_secs(u64::from(
+                args.retention_interval_seconds,
+            )),
+            retention: std::time::Duration::from_secs(u64::from(args.retention_seconds)),
+        },
         args.allow_hosts,
     )
     .await
