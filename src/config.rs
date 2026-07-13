@@ -84,9 +84,9 @@ pub struct Args {
 
     #[arg(
         long,
-        default_value_t = 3600,
-        value_parser = clap::value_parser!(u16).range(60..=65535),
-        help = "Interval between bounded retention passes in seconds."
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u16).range(0..=65535),
+        help = "Interval between bounded retention passes in seconds; 0 disables retention."
     )]
     pub retention_interval_seconds: u16,
 
@@ -97,6 +97,29 @@ pub struct Args {
         help = "Retention for append-only events and idempotency records in seconds."
     )]
     pub retention_seconds: u32,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Expose the optional GET /metrics endpoint."
+    )]
+    pub enable_metrics: bool,
+
+    #[arg(
+        long,
+        default_value_t = 3600,
+        value_parser = clap::value_parser!(u16).range(60..=65535),
+        help = "Idle MCP session timeout in seconds."
+    )]
+    pub session_idle_timeout_seconds: u16,
+
+    #[arg(
+        long,
+        default_value_t = 128,
+        value_parser = clap::value_parser!(u16).range(1..=4096),
+        help = "Maximum number of in-memory MCP sessions."
+    )]
+    pub max_sessions: u16,
 
     #[arg(
         long,
@@ -111,4 +134,18 @@ pub struct Args {
         help = "Extra Origin hostnames to allow if the request includes an Origin header."
     )]
     pub allow_hosts: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_defaults_keep_optional_operations_disabled() {
+        let args = Args::try_parse_from(["agent-sync-mcp"]).unwrap();
+        assert!(!args.enable_metrics);
+        assert_eq!(args.retention_interval_seconds, 0);
+        assert_eq!(args.maintenance_interval_seconds, 30);
+        assert_eq!(args.max_sessions, 128);
+    }
 }

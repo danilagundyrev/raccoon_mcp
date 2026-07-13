@@ -15,11 +15,14 @@ pub(super) async fn dispatch(
                     "'capabilities' is required and must be an object".to_owned(),
                 ));
             }
-            if !params.get("clientInfo").is_some_and(Value::is_object) {
-                return Err(invalid_argument(
-                    "'clientInfo' is required and must be an object".to_owned(),
-                ));
-            }
+            let client_info = params
+                .get("clientInfo")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    invalid_argument("'clientInfo' is required and must be an object".to_owned())
+                })?;
+            require_string(client_info, "name")?;
+            require_string(client_info, "version")?;
             Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {
@@ -585,7 +588,7 @@ pub(super) async fn read_resource(
                     "json_rpc_batching": "unsupported",
                     "notifications": "accepted without a response body",
                     "errors": "JSON-RPC error.data and tool structuredContent contain stable machine-readable codes; active claim conflicts include retry_at and retry_after_seconds",
-                    "sessions": "initialize returns Mcp-Session-Id; every subsequent HTTP request must include that header",
+                    "sessions": "initialize returns Mcp-Session-Id; every subsequent HTTP request must include that header. Idle sessions are reaped and the in-memory registry has a configured hard limit.",
                     "protocol_header": "every request after initialize must include MCP-Protocol-Version matching the negotiated session version",
                     "cancellation": "notifications/cancelled stops an in-flight request only inside the same MCP session and the cancelled request receives no response",
                     "session_termination": "DELETE /mcp with session and protocol headers cancels in-flight requests and terminates the session"
@@ -626,8 +629,8 @@ pub(super) async fn read_resource(
                 "operations": {
                     "health": "GET /healthz checks the HTTP process without depending on SQLite.",
                     "readiness": "GET /readyz verifies that a SQLite transaction can begin and roll back.",
-                    "metrics": "GET /metrics returns compact counters without message or artifact bodies.",
-                    "maintenance": "A frequent indexed lease sweep disconnects expired orchestrators, abandons expired workers and requeues expired request claims. A separate slower retention schedule deletes at most 1000 old events and 1000 idempotency records per pass.",
+                    "metrics": "GET /metrics is exposed only with --enable-metrics and computes compact counters on demand without message or artifact bodies.",
+                    "maintenance": "A frequent indexed lease/session sweep disconnects expired actors and requeues expired request claims. Retention is disabled by default; when configured, each pass deletes at most 1000 old events and 1000 idempotency records.",
                     "shutdown": "Graceful shutdown stops accepting calls, cancels session waiters and expires local actor and claim leases."
                 },
                 "current_scope": "Project/repository presence, feature/work graph with optimistic revisions and claims, linked worker/audit runs, immutable messaging/artifacts, reliable delivery, event waiting and claimed repository requests.",

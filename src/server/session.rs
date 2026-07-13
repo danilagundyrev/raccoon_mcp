@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -8,90 +9,97 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 type RequestCancellations = HashMap<String, Arc<Notify>>;
+
 struct Session {
     protocol_version: String,
+    last_activity: Instant,
     requests: RequestCancellations,
 }
-type Sessions = HashMap<String, Session>;
 
-#[derive(Clone, Default)]
+struct RegistryState {
+    sessions: Mutex<HashMap<String, Session>>,
+    max_sessions: usize,
+    idle_timeout: Duration,
+}
+
+#[derive(Clone)]
 pub(super) struct SessionRegistry {
-    sessions: Arc<Mutex<Sessions>>,
+    state: Arc<RegistryState>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum SessionAccessError {
+    NotFound,
+    VersionMismatch { expected: String },
+    InvalidRequestId,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self::new(128, Duration::from_secs(3600))
+    }
 }
 
 impl SessionRegistry {
+    pub(super) fn new(max_sessions: usize, idle_timeout: Duration) -> Self {
+        Self {
+            state: Arc::new(RegistryState {
+                sessions: Mutex::new(HashMap::new()),
+                max_sessions: max_sessions.max(1),
+                idle_timeout,
+            }),
+        }
+    }
+
     pub(super) fn create(&self, protocol_version: &str) -> String {
-        let session_id = Uuid::new_v4().to_string();
-        self.sessions
+        let now = Instant::now();
+        let mut sessions = self
+            .state
+            .sessions
             .lock()
-            .expect("session registry mutex poisoned")
-            .insert(
-                session_id.clone(),
-                Session {
-                    protocol_version: protocol_version.to_owned(),
-                    requests: HashMap::new(),
-                },
-            );
+            .expect("session registry mutex poisoned");
+        reap_idle_locked(&mut sessions, self.state.idle_timeout, now);
+        while sessions.len() >= self.state.max_sessions {
+            let Some(oldest_id) = sessions
+                .iter()
+                .min_by_key(|(_, session)| session.last_activity)
+                .map(|(session_id, _)| session_id.clone())
+            else {
+                break;
+            };
+            cancel_session(sessions.remove(&oldest_id));
+        }
+        let session_id = Uuid::new_v4().to_string();
+        sessions.insert(
+            session_id.clone(),
+            Session {
+                protocol_version: protocol_version.to_owned(),
+                last_activity: now,
+                requests: HashMap::new(),
+            },
+        );
         session_id
     }
 
-    pub(super) fn contains(&self, session_id: &str) -> bool {
-        self.sessions
-            .lock()
-            .expect("session registry mutex poisoned")
-            .contains_key(session_id)
-    }
-
-    pub(super) fn protocol_version(&self, session_id: &str) -> Option<String> {
-        self.sessions
-            .lock()
-            .expect("session registry mutex poisoned")
-            .get(session_id)
-            .map(|session| session.protocol_version.clone())
-    }
-
-    pub(super) fn terminate(&self, session_id: &str) -> bool {
-        let session = self
+    pub(super) fn begin_request(
+        &self,
+        session_id: &str,
+        protocol_version: &str,
+        request_id: &Value,
+    ) -> Result<InFlightRequest, SessionAccessError> {
+        let request_key = request_key(request_id).ok_or(SessionAccessError::InvalidRequestId)?;
+        let cancellation = Arc::new(Notify::new());
+        let mut sessions = self
+            .state
             .sessions
             .lock()
-            .expect("session registry mutex poisoned")
-            .remove(session_id);
-        if let Some(session) = session {
-            for cancellation in session.requests.into_values() {
-                cancellation.notify_one();
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    pub(super) fn terminate_all(&self) -> usize {
-        let sessions = std::mem::take(
-            &mut *self
-                .sessions
-                .lock()
-                .expect("session registry mutex poisoned"),
-        );
-        let count = sessions.len();
-        for session in sessions.into_values() {
-            for cancellation in session.requests.into_values() {
-                cancellation.notify_one();
-            }
-        }
-        count
-    }
-
-    pub(super) fn register(&self, session_id: &str, request_id: &Value) -> Option<InFlightRequest> {
-        let request_key = request_key(request_id)?;
-        let cancellation = Arc::new(Notify::new());
-        self.sessions
-            .lock()
-            .expect("session registry mutex poisoned")
-            .get_mut(session_id)?
+            .expect("session registry mutex poisoned");
+        let session = validated_session(&mut sessions, session_id, protocol_version)?;
+        session.last_activity = Instant::now();
+        session
             .requests
             .insert(request_key.clone(), cancellation.clone());
-        Some(InFlightRequest {
+        Ok(InFlightRequest {
             registry: self.clone(),
             session_id: session_id.to_owned(),
             request_key,
@@ -99,26 +107,103 @@ impl SessionRegistry {
         })
     }
 
-    pub(super) fn cancel(&self, session_id: &str, request_id: &Value) {
-        let Some(request_key) = request_key(request_id) else {
-            return;
-        };
-        let cancellation = self
+    pub(super) fn validate(
+        &self,
+        session_id: &str,
+        protocol_version: &str,
+    ) -> Result<(), SessionAccessError> {
+        let mut sessions = self
+            .state
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        validated_session(&mut sessions, session_id, protocol_version)?.last_activity =
+            Instant::now();
+        Ok(())
+    }
+
+    pub(super) fn cancel(
+        &self,
+        session_id: &str,
+        protocol_version: &str,
+        request_id: &Value,
+    ) -> Result<(), SessionAccessError> {
+        let request_key = request_key(request_id).ok_or(SessionAccessError::InvalidRequestId)?;
+        let mut sessions = self
+            .state
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let session = validated_session(&mut sessions, session_id, protocol_version)?;
+        session.last_activity = Instant::now();
+        if let Some(cancellation) = session.requests.get(&request_key) {
+            cancellation.notify_one();
+        }
+        Ok(())
+    }
+
+    pub(super) fn terminate(
+        &self,
+        session_id: &str,
+        protocol_version: &str,
+    ) -> Result<(), SessionAccessError> {
+        let mut sessions = self
+            .state
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        validated_session(&mut sessions, session_id, protocol_version)?;
+        cancel_session(sessions.remove(session_id));
+        Ok(())
+    }
+
+    pub(super) fn reap_idle(&self) -> usize {
+        let mut sessions = self
+            .state
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        reap_idle_locked(&mut sessions, self.state.idle_timeout, Instant::now())
+    }
+
+    pub(super) fn terminate_all(&self) -> usize {
+        let sessions = std::mem::take(
+            &mut *self
+                .state
+                .sessions
+                .lock()
+                .expect("session registry mutex poisoned"),
+        );
+        let count = sessions.len();
+        for session in sessions.into_values() {
+            cancel_session(Some(session));
+        }
+        count
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains(&self, session_id: &str) -> bool {
+        self.state
             .sessions
             .lock()
             .expect("session registry mutex poisoned")
-            .get(session_id)
-            .and_then(|session| session.requests.get(&request_key))
-            .cloned();
-        if let Some(cancellation) = cancellation {
-            cancellation.notify_one();
-        }
+            .contains_key(session_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.state
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .len()
     }
 
     #[cfg(test)]
     pub(super) fn has_in_flight_request(&self, session_id: &str, request_id: &Value) -> bool {
         request_key(request_id).is_some_and(|request_key| {
-            self.sessions
+            self.state
+                .sessions
                 .lock()
                 .expect("session registry mutex poisoned")
                 .get(session_id)
@@ -144,6 +229,7 @@ impl Drop for InFlightRequest {
     fn drop(&mut self) {
         let mut sessions = self
             .registry
+            .state
             .sessions
             .lock()
             .expect("session registry mutex poisoned");
@@ -156,6 +242,49 @@ impl Drop for InFlightRequest {
             .is_some_and(|current| Arc::ptr_eq(current, &self.cancellation))
         {
             session.requests.remove(&self.request_key);
+        }
+    }
+}
+
+fn validated_session<'a>(
+    sessions: &'a mut HashMap<String, Session>,
+    session_id: &str,
+    protocol_version: &str,
+) -> Result<&'a mut Session, SessionAccessError> {
+    let session = sessions
+        .get_mut(session_id)
+        .ok_or(SessionAccessError::NotFound)?;
+    if session.protocol_version != protocol_version {
+        return Err(SessionAccessError::VersionMismatch {
+            expected: session.protocol_version.clone(),
+        });
+    }
+    Ok(session)
+}
+
+fn reap_idle_locked(
+    sessions: &mut HashMap<String, Session>,
+    idle_timeout: Duration,
+    now: Instant,
+) -> usize {
+    let expired_ids = sessions
+        .iter()
+        .filter(|(_, session)| {
+            session.requests.is_empty() && now.duration_since(session.last_activity) >= idle_timeout
+        })
+        .map(|(session_id, _)| session_id.clone())
+        .collect::<Vec<_>>();
+    let count = expired_ids.len();
+    for session_id in expired_ids {
+        cancel_session(sessions.remove(&session_id));
+    }
+    count
+}
+
+fn cancel_session(session: Option<Session>) {
+    if let Some(session) = session {
+        for cancellation in session.requests.into_values() {
+            cancellation.notify_one();
         }
     }
 }

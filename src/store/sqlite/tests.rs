@@ -1361,6 +1361,35 @@ async fn maintenance_reaps_expired_runtime_state_and_reports_metrics() {
     .await
     .unwrap();
     assert_eq!(maintenance_indexes, 5);
+    for (query, expected_index) in [
+        (
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM deliveries WHERE status = 'pending'",
+            "deliveries_pending_metrics_idx",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM requests WHERE status IN ('pending', 'claimed')",
+            "requests_open_metrics_idx",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM work_items WHERE status IN ('claimed', 'in_progress', 'blocked') AND claim_expires_at > '2020-01-01'",
+            "work_items_active_claim_metrics_idx",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM worker_runs WHERE status = 'active' AND lease_expires_at > '2020-01-01'",
+            "worker_runs_active_metrics_idx",
+        ),
+    ] {
+        let plan_rows = sqlx::query(query).fetch_all(&store.pool).await.unwrap();
+        let plan = plan_rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("detail").unwrap())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            plan.contains(expected_index),
+            "unexpected query plan: {plan}"
+        );
+    }
 
     store.expire_local_leases().await.unwrap();
     assert_eq!(

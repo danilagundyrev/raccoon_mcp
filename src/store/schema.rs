@@ -47,6 +47,10 @@ CREATE INDEX IF NOT EXISTS agent_instances_expiry_idx
     ON agent_instances(status, lease_expires_at)
     WHERE status = 'online';
 
+CREATE INDEX IF NOT EXISTS agent_instances_online_metrics_idx
+    ON agent_instances(status, lease_expires_at, repository_id)
+    WHERE status = 'online';
+
 CREATE TABLE IF NOT EXISTS features (
     feature_id TEXT PRIMARY KEY NOT NULL,
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
@@ -89,6 +93,10 @@ CREATE INDEX IF NOT EXISTS work_items_feature_status_idx
 CREATE INDEX IF NOT EXISTS work_items_owner_status_idx
     ON work_items(owner_repository_id, status, priority, created_at);
 
+CREATE INDEX IF NOT EXISTS work_items_active_claim_metrics_idx
+    ON work_items(status, claim_expires_at)
+    WHERE status IN ('claimed', 'in_progress', 'blocked');
+
 CREATE TABLE IF NOT EXISTS work_item_dependencies (
     work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE CASCADE,
     dependency_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
@@ -127,6 +135,10 @@ CREATE INDEX IF NOT EXISTS worker_runs_parent_status_idx
 CREATE INDEX IF NOT EXISTS worker_runs_expiry_idx
     ON worker_runs(status, lease_expires_at)
     WHERE status IN ('created', 'active');
+
+CREATE INDEX IF NOT EXISTS worker_runs_active_metrics_idx
+    ON worker_runs(status, lease_expires_at)
+    WHERE status = 'active';
 
 CREATE UNIQUE INDEX IF NOT EXISTS worker_runs_one_remediation_per_audit_idx
     ON worker_runs(addresses_audit_run_id)
@@ -223,6 +235,10 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE INDEX IF NOT EXISTS deliveries_inbox_idx
     ON deliveries(recipient_repository_id, status, delivery_id);
 
+CREATE INDEX IF NOT EXISTS deliveries_pending_metrics_idx
+    ON deliveries(created_at)
+    WHERE status = 'pending';
+
 CREATE TABLE IF NOT EXISTS requests (
     request_id TEXT PRIMARY KEY NOT NULL,
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
@@ -256,6 +272,10 @@ CREATE INDEX IF NOT EXISTS requests_requester_status_idx
 CREATE INDEX IF NOT EXISTS requests_claim_expiry_idx
     ON requests(status, claim_expires_at)
     WHERE status = 'claimed';
+
+CREATE INDEX IF NOT EXISTS requests_open_metrics_idx
+    ON requests(status, claim_expires_at)
+    WHERE status IN ('pending', 'claimed');
 
 CREATE TABLE IF NOT EXISTS idempotency_records (
     actor_key TEXT NOT NULL,

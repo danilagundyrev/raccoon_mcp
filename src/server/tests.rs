@@ -178,6 +178,21 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
     .await
     .unwrap();
     assert!(
+        dispatch(
+            &store,
+            1024,
+            524_288,
+            "initialize",
+            &JsonMap::from_iter([
+                ("protocolVersion".to_owned(), json!(PROTOCOL_VERSION)),
+                ("capabilities".to_owned(), json!({})),
+                ("clientInfo".to_owned(), json!({})),
+            ]),
+        )
+        .await
+        .is_err()
+    );
+    assert!(
         initialize["instructions"]
             .as_str()
             .unwrap()
@@ -215,12 +230,14 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
     let first_session = isolated_registry.create(PROTOCOL_VERSION);
     let second_session = isolated_registry.create(PROTOCOL_VERSION);
     let first_request = isolated_registry
-        .register(&first_session, &json!(7))
+        .begin_request(&first_session, PROTOCOL_VERSION, &json!(7))
         .unwrap();
     let second_request = isolated_registry
-        .register(&second_session, &json!(7))
+        .begin_request(&second_session, PROTOCOL_VERSION, &json!(7))
         .unwrap();
-    isolated_registry.cancel(&first_session, &json!(7));
+    isolated_registry
+        .cancel(&first_session, PROTOCOL_VERSION, &json!(7))
+        .unwrap();
     tokio::time::timeout(
         Duration::from_millis(100),
         first_request.cancellation().notified(),
@@ -235,6 +252,30 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
         .await
         .is_err()
     );
+    isolated_registry
+        .terminate(&first_session, PROTOCOL_VERSION)
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        first_request.cancellation().notified(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        isolated_registry.begin_request(&first_session, PROTOCOL_VERSION, &json!(8)),
+        Err(SessionAccessError::NotFound)
+    ));
+
+    let bounded_registry = SessionRegistry::new(2, Duration::from_secs(3600));
+    let oldest = bounded_registry.create(PROTOCOL_VERSION);
+    bounded_registry.create(PROTOCOL_VERSION);
+    bounded_registry.create(PROTOCOL_VERSION);
+    assert_eq!(bounded_registry.len(), 2);
+    assert!(!bounded_registry.contains(&oldest));
+    let idle_registry = SessionRegistry::new(2, Duration::ZERO);
+    let idle = idle_registry.create(PROTOCOL_VERSION);
+    assert_eq!(idle_registry.reap_idle(), 1);
+    assert!(!idle_registry.contains(&idle));
 
     let path = std::env::temp_dir()
         .join("agent-sync-mcp-server-tests")
@@ -261,6 +302,7 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
         max_summary_bytes: 1024,
         max_artifact_bytes: 524_288,
         sessions: SessionRegistry::default(),
+        metrics_enabled: true,
     };
 
     let initialize = mcp_post(
@@ -305,6 +347,10 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
         "mcp-session-id",
         axum::http::HeaderValue::from_static("00000000-0000-0000-0000-000000000000"),
     );
+    unknown_headers.insert(
+        "mcp-protocol-version",
+        axum::http::HeaderValue::from_static(PROTOCOL_VERSION),
+    );
     let unknown_session = mcp_post(
         State(state.clone()),
         unknown_headers,
@@ -343,6 +389,39 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
     )
     .await;
     assert_eq!(wrong_version.status(), StatusCode::BAD_REQUEST);
+
+    let request_only_notification = mcp_post(
+        State(state.clone()),
+        session_headers.clone(),
+        Bytes::from(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": "disconnect_orchestrator",
+                    "arguments": { "instance_id": connected.instance.instance_id }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(request_only_notification.status(), StatusCode::ACCEPTED);
+    assert_ne!(
+        store
+            .get_instance(connected.instance.instance_id)
+            .await
+            .unwrap()
+            .status,
+        crate::domain::PresenceStatus::Disconnected
+    );
+    let invalid_id = mcp_post(
+        State(state.clone()),
+        session_headers.clone(),
+        Bytes::from(json!({ "jsonrpc": "2.0", "id": {}, "method": "ping" }).to_string()),
+    )
+    .await;
+    assert_eq!(invalid_id.status(), StatusCode::BAD_REQUEST);
     let wait_state = state.clone();
     let wait_headers = session_headers.clone();
     let instance_id = connected.instance.instance_id;

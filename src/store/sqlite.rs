@@ -341,7 +341,7 @@ impl SqliteStore {
 }
 
 fn trace_resolved_actor(actor: &ResolvedActor) {
-    tracing::debug!(
+    tracing::info!(
         project_id = %actor.project_id,
         repository_id = %actor.repository_id,
         instance_id = actor.instance_id.map(|id| id.to_string()).unwrap_or_default(),

@@ -38,7 +38,7 @@ mod validation;
 
 use dispatch::dispatch;
 use schemas::*;
-use session::SessionRegistry;
+use session::{SessionAccessError, SessionRegistry};
 use validation::*;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -50,8 +50,11 @@ pub struct RuntimeConfig {
     pub max_summary_bytes: u16,
     pub max_artifact_bytes: u32,
     pub maintenance_interval: Duration,
-    pub retention_interval: Duration,
+    pub retention_interval: Option<Duration>,
     pub retention: Duration,
+    pub enable_metrics: bool,
+    pub session_idle_timeout: Duration,
+    pub max_sessions: usize,
 }
 
 #[derive(Clone)]
@@ -62,6 +65,7 @@ struct AppState {
     max_summary_bytes: u16,
     max_artifact_bytes: u32,
     sessions: SessionRegistry,
+    metrics_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -104,7 +108,7 @@ pub async fn run_server(
     let mut allowed_hosts = HashSet::from(["127.0.0.1".to_owned(), "localhost".to_owned()]);
     allowed_hosts.extend(allow_hosts.into_iter().map(|host| host.to_lowercase()));
 
-    let sessions = SessionRegistry::default();
+    let sessions = SessionRegistry::new(config.max_sessions, config.session_idle_timeout);
     let app = router(
         store.clone(),
         database_path.clone(),
@@ -112,6 +116,7 @@ pub async fn run_server(
         config.max_artifact_bytes,
         allowed_hosts,
         sessions.clone(),
+        config.enable_metrics,
     );
     let listener = TcpListener::bind((host.as_str(), port))
         .await
@@ -130,6 +135,7 @@ pub async fn run_server(
         config.maintenance_interval,
         config.retention_interval,
         config.retention,
+        sessions.clone(),
         shutdown_rx,
     ));
     let serve_result = axum::serve(listener, app)
@@ -149,23 +155,27 @@ fn router(
     max_artifact_bytes: u32,
     allowed_hosts: HashSet<String>,
     sessions: SessionRegistry,
+    metrics_enabled: bool,
 ) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/", get(root))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics))
         .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
         .fallback(not_found)
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
-        .with_state(AppState {
-            store,
-            allowed_hosts: Arc::new(allowed_hosts),
-            database_path: Arc::new(database_path),
-            max_summary_bytes,
-            max_artifact_bytes,
-            sessions,
-        })
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024));
+    if metrics_enabled {
+        router = router.route("/metrics", get(metrics));
+    }
+    router.with_state(AppState {
+        store,
+        allowed_hosts: Arc::new(allowed_hosts),
+        database_path: Arc::new(database_path),
+        max_summary_bytes,
+        max_artifact_bytes,
+        sessions,
+        metrics_enabled,
+    })
 }
 
 async fn shutdown_signal(sessions: SessionRegistry, shutdown: watch::Sender<bool>) {
@@ -190,23 +200,29 @@ async fn prepare_shutdown(
 async fn maintenance_loop(
     store: SqliteStore,
     lease_interval: Duration,
-    retention_interval: Duration,
+    retention_interval: Option<Duration>,
     retention: Duration,
+    sessions: SessionRegistry,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut lease_ticker =
         tokio::time::interval_at(tokio::time::Instant::now() + lease_interval, lease_interval);
     lease_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut retention_ticker = tokio::time::interval_at(
-        tokio::time::Instant::now() + retention_interval,
-        retention_interval,
-    );
-    retention_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut retention_ticker = retention_interval.map(|retention_interval| {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + retention_interval,
+            retention_interval,
+        );
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ticker
+    });
     loop {
         tokio::select! {
             _ = lease_ticker.tick() => {
+                let reaped_sessions = sessions.reap_idle();
                 match store.run_lease_maintenance().await {
                     Ok(report) => tracing::info!(
+                        reaped_sessions,
                         disconnected_orchestrators = report.disconnected_orchestrators,
                         abandoned_workers = report.abandoned_workers,
                         requeued_requests = report.requeued_requests,
@@ -215,7 +231,7 @@ async fn maintenance_loop(
                     Err(error) => tracing::error!(error = %error, "lease maintenance pass failed"),
                 }
             }
-            _ = retention_ticker.tick() => {
+            _ = optional_interval_tick(&mut retention_ticker) => {
                 match store.run_retention(retention, 1000).await {
                     Ok(report) => tracing::info!(
                         deleted_events = report.deleted_events,
@@ -234,6 +250,15 @@ async fn maintenance_loop(
     }
 }
 
+async fn optional_interval_tick(interval: &mut Option<tokio::time::Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn root(State(state): State<AppState>) -> Response {
     json_response(
         StatusCode::OK,
@@ -248,7 +273,7 @@ async fn root(State(state): State<AppState>) -> Response {
             "mcp_endpoint": "/mcp",
             "health_endpoint": "/healthz",
             "readiness_endpoint": "/readyz",
-            "metrics_endpoint": "/metrics",
+            "metrics_endpoint": state.metrics_enabled.then_some("/metrics"),
         }),
     )
 }
@@ -354,7 +379,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         .as_object()
         .is_some_and(|request| request.get("method").and_then(Value::as_str) == Some("initialize"));
     let session_header = headers.get("mcp-session-id");
-    let session_id = if is_initialize {
+    let (_session_id, in_flight) = if is_initialize {
         if session_header.is_some() {
             return transport_error_response(
                 StatusCode::BAD_REQUEST,
@@ -363,7 +388,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                 "initialize must not include Mcp-Session-Id",
             );
         }
-        None
+        (None, None)
     } else {
         let session_id = match session_header {
             None => {
@@ -384,50 +409,63 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             }
             Some(value) => value.to_str().expect("checked above").to_owned(),
         };
-        if !state.sessions.contains(&session_id) {
-            return transport_error_response(
-                StatusCode::NOT_FOUND,
-                payload.get("id").cloned().unwrap_or(Value::Null),
-                "session_not_found",
-                "MCP session does not exist",
-            );
-        }
-        let expected_version = state
-            .sessions
-            .protocol_version(&session_id)
-            .expect("session existence checked above");
-        let supplied_version = headers
+        let Some(supplied_version) = headers
             .get("mcp-protocol-version")
-            .and_then(|value| value.to_str().ok());
-        if supplied_version != Some(expected_version.as_str()) {
+            .and_then(|value| value.to_str().ok())
+        else {
             return transport_error_response(
                 StatusCode::BAD_REQUEST,
                 payload.get("id").cloned().unwrap_or(Value::Null),
                 "unsupported_protocol_version",
-                &format!("MCP-Protocol-Version must match negotiated version {expected_version}"),
+                "MCP-Protocol-Version is required after initialize",
             );
-        }
-        Some(session_id)
-    };
-    if payload.as_object().is_some_and(|request| {
-        request.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
-            && !request.contains_key("id")
-    }) {
-        if let (Some(session_id), Some(request_id)) = (
-            session_id.as_deref(),
-            payload
+        };
+        let is_cancellation = payload.as_object().is_some_and(|request| {
+            request.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+                && !request.contains_key("id")
+        });
+        let request_id = payload.get("id");
+        let access = if is_cancellation {
+            let cancelled_request_id = payload
                 .get("params")
                 .and_then(Value::as_object)
-                .and_then(|params| params.get("requestId")),
-        ) {
-            state.sessions.cancel(session_id, request_id);
-        }
-    }
-    let in_flight = session_id.as_deref().and_then(|session_id| {
-        payload
-            .get("id")
-            .and_then(|request_id| state.sessions.register(session_id, request_id))
-    });
+                .and_then(|params| params.get("requestId"));
+            match cancelled_request_id {
+                Some(request_id) if is_valid_request_id(request_id) => state
+                    .sessions
+                    .cancel(&session_id, supplied_version, request_id)
+                    .map(|()| None),
+                _ => state
+                    .sessions
+                    .validate(&session_id, supplied_version)
+                    .map(|()| None),
+            }
+        } else if request_id.is_some_and(is_valid_request_id) {
+            state
+                .sessions
+                .begin_request(
+                    &session_id,
+                    supplied_version,
+                    request_id.expect("checked above"),
+                )
+                .map(Some)
+        } else {
+            state
+                .sessions
+                .validate(&session_id, supplied_version)
+                .map(|()| None)
+        };
+        let in_flight = match access {
+            Ok(in_flight) => in_flight,
+            Err(error) => {
+                return session_access_error_response(
+                    error,
+                    payload.get("id").cloned().unwrap_or(Value::Null),
+                );
+            }
+        };
+        (Some(session_id), in_flight)
+    };
 
     let (status, response_body) = handle_rpc_payload(
         &state.store,
@@ -471,28 +509,21 @@ async fn mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> Respon
             "Mcp-Session-Id is required",
         );
     };
-    let Some(expected_version) = state.sessions.protocol_version(session_id) else {
-        return transport_error_response(
-            StatusCode::NOT_FOUND,
-            Value::Null,
-            "session_not_found",
-            "MCP session does not exist",
-        );
-    };
-    if headers
+    let Some(protocol_version) = headers
         .get("mcp-protocol-version")
         .and_then(|value| value.to_str().ok())
-        != Some(expected_version.as_str())
-    {
+    else {
         return transport_error_response(
             StatusCode::BAD_REQUEST,
             Value::Null,
             "unsupported_protocol_version",
-            &format!("MCP-Protocol-Version must match negotiated version {expected_version}"),
+            "MCP-Protocol-Version is required",
         );
+    };
+    match state.sessions.terminate(session_id, protocol_version) {
+        Ok(()) => no_content_response(StatusCode::NO_CONTENT),
+        Err(error) => session_access_error_response(error, Value::Null),
     }
-    state.sessions.terminate(session_id);
-    no_content_response(StatusCode::NO_CONTENT)
 }
 
 async fn handle_rpc_payload(
@@ -545,8 +576,22 @@ async fn handle_single_request(
         );
     };
 
-    let request_id = request.get("id").cloned().unwrap_or(Value::Null);
     let is_notification = !request.contains_key("id");
+    if request.get("id").is_some_and(|id| !is_valid_request_id(id)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Some(json_rpc_error_response(
+                Value::Null,
+                -32600,
+                "Invalid Request",
+                Some(machine_error_data(
+                    "invalid_request_id",
+                    "request id must be a string or number",
+                )),
+            )),
+        );
+    }
+    let request_id = request.get("id").cloned().unwrap_or(Value::Null);
     if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return rpc_request_error(
             request_id,
@@ -569,6 +614,15 @@ async fn handle_single_request(
                 .with_data(machine_error_data("invalid_request", "Missing method.")),
         );
     };
+    if is_notification
+        && !matches!(
+            method,
+            "notifications/initialized" | "notifications/cancelled"
+        )
+    {
+        tracing::warn!(method, "unsupported notification ignored");
+        return (StatusCode::ACCEPTED, None);
+    }
     let params = match request.get("params") {
         None | Some(Value::Null) => JsonMap::new(),
         Some(Value::Object(params)) => params.clone(),
@@ -649,6 +703,33 @@ fn transport_error_response(
             Some(machine_error_data(code, message)),
         ),
     )
+}
+
+fn session_access_error_response(error: SessionAccessError, request_id: Value) -> Response {
+    match error {
+        SessionAccessError::NotFound => transport_error_response(
+            StatusCode::NOT_FOUND,
+            request_id,
+            "session_not_found",
+            "MCP session does not exist",
+        ),
+        SessionAccessError::VersionMismatch { expected } => transport_error_response(
+            StatusCode::BAD_REQUEST,
+            request_id,
+            "unsupported_protocol_version",
+            &format!("MCP-Protocol-Version must match negotiated version {expected}"),
+        ),
+        SessionAccessError::InvalidRequestId => transport_error_response(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            "invalid_request_id",
+            "request id must be a string or number",
+        ),
+    }
+}
+
+fn is_valid_request_id(request_id: &Value) -> bool {
+    matches!(request_id, Value::String(_) | Value::Number(_))
 }
 
 fn rpc_request_error(
