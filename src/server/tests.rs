@@ -113,6 +113,7 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
         1024,
         524_288,
         json!([{ "jsonrpc": "2.0", "id": 1, "method": "ping" }]),
+        None,
     )
     .await;
     assert_eq!(batch_status, StatusCode::BAD_REQUEST);
@@ -126,6 +127,7 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
         1024,
         524_288,
         json!({ "jsonrpc": "2.0", "method": "ping" }),
+        None,
     )
     .await;
     assert_eq!(notification_status, StatusCode::ACCEPTED);
@@ -160,6 +162,172 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
         "accepted without a response body"
     );
 
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+}
+
+#[tokio::test]
+async fn sessions_isolate_cancellation_and_cancel_long_waits() {
+    let isolated_registry = SessionRegistry::default();
+    let first_session = isolated_registry.create();
+    let second_session = isolated_registry.create();
+    let first_request = isolated_registry
+        .register(&first_session, &json!(7))
+        .unwrap();
+    let second_request = isolated_registry
+        .register(&second_session, &json!(7))
+        .unwrap();
+    isolated_registry.cancel(&first_session, &json!(7));
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        first_request.cancellation().notified(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            second_request.cancellation().notified(),
+        )
+        .await
+        .is_err()
+    );
+
+    let path = std::env::temp_dir()
+        .join("agent-sync-mcp-server-tests")
+        .join(format!("{}.sqlite3", uuid::Uuid::new_v4()));
+    let store = SqliteStore::open(&path, 1, 90, 3600, 600, 3600)
+        .await
+        .unwrap();
+    let connected = store
+        .connect_orchestrator(ConnectOrchestrator {
+            project_key: "session-test".to_owned(),
+            project_display_name: None,
+            repository_key: "backend".to_owned(),
+            repository_display_name: None,
+            canonical_path: "C:/session-test/backend".to_owned(),
+            instance_id: None,
+            capabilities: json!({}),
+        })
+        .await
+        .unwrap();
+    let state = AppState {
+        store: store.clone(),
+        allowed_hosts: Arc::new(HashSet::from(["localhost".to_owned()])),
+        database_path: Arc::new(path.clone()),
+        max_summary_bytes: 1024,
+        max_artifact_bytes: 524_288,
+        sessions: SessionRegistry::default(),
+    };
+
+    let initialize = mcp_post(
+        State(state.clone()),
+        HeaderMap::new(),
+        Bytes::from(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "1" }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(initialize.status(), StatusCode::OK);
+    let session_id = initialize
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(session_id.is_ascii());
+
+    let missing_session = mcp_post(
+        State(state.clone()),
+        HeaderMap::new(),
+        Bytes::from(json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }).to_string()),
+    )
+    .await;
+    assert_eq!(missing_session.status(), StatusCode::BAD_REQUEST);
+
+    let mut unknown_headers = HeaderMap::new();
+    unknown_headers.insert(
+        "mcp-session-id",
+        axum::http::HeaderValue::from_static("00000000-0000-0000-0000-000000000000"),
+    );
+    let unknown_session = mcp_post(
+        State(state.clone()),
+        unknown_headers,
+        Bytes::from(json!({ "jsonrpc": "2.0", "id": 3, "method": "ping" }).to_string()),
+    )
+    .await;
+    assert_eq!(unknown_session.status(), StatusCode::NOT_FOUND);
+
+    let mut session_headers = HeaderMap::new();
+    session_headers.insert(
+        "mcp-session-id",
+        axum::http::HeaderValue::from_str(&session_id).unwrap(),
+    );
+    let wait_state = state.clone();
+    let wait_headers = session_headers.clone();
+    let instance_id = connected.instance.instance_id;
+    let wait = tokio::spawn(async move {
+        mcp_post(
+            State(wait_state),
+            wait_headers,
+            Bytes::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "wait-1",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "wait_for_events",
+                        "arguments": { "instance_id": instance_id, "cursor": 0 }
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !state
+            .sessions
+            .has_in_flight_request(&session_id, &json!("wait-1"))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let cancel = mcp_post(
+        State(state.clone()),
+        session_headers,
+        Bytes::from(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": "wait-1", "reason": "test complete" }
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+    let cancelled_wait = wait.await.unwrap();
+    assert_eq!(cancelled_wait.status(), StatusCode::ACCEPTED);
+    assert_eq!(cancelled_wait.headers()[CONTENT_LENGTH], "0");
+
+    drop(state);
     drop(store);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));

@@ -571,7 +571,8 @@ pub(super) async fn read_resource(
                     "json_rpc_batching": "unsupported",
                     "notifications": "accepted without a response body",
                     "errors": "JSON-RPC error.data and tool structuredContent contain stable machine-readable codes",
-                    "cancellation": "session-scoped cancellation of long waits is not implemented yet"
+                    "sessions": "initialize returns Mcp-Session-Id; every subsequent HTTP request must include that header",
+                    "cancellation": "notifications/cancelled stops an in-flight request only inside the same MCP session and the cancelled request receives no response"
                 },
                 "worker_flow": [
                     "The orchestrator calls create_worker_run before spawning a child.",

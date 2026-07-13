@@ -33,10 +33,12 @@ use crate::{
 
 mod dispatch;
 mod schemas;
+mod session;
 mod validation;
 
 use dispatch::dispatch;
 use schemas::*;
+use session::SessionRegistry;
 use validation::*;
 
 const PROTOCOL_VERSION: &str = "2026-06-18";
@@ -51,6 +53,7 @@ struct AppState {
     database_path: Arc<PathBuf>,
     max_summary_bytes: u16,
     max_artifact_bytes: u32,
+    sessions: SessionRegistry,
 }
 
 #[derive(Debug)]
@@ -137,6 +140,7 @@ fn router(
             database_path: Arc::new(database_path),
             max_summary_bytes,
             max_artifact_bytes,
+            sessions: SessionRegistry::default(),
         })
 }
 
@@ -237,17 +241,90 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         }
     };
 
+    let is_initialize = payload
+        .as_object()
+        .is_some_and(|request| request.get("method").and_then(Value::as_str) == Some("initialize"));
+    let session_header = headers.get("mcp-session-id");
+    let session_id = if is_initialize {
+        if session_header.is_some() {
+            return transport_error_response(
+                StatusCode::BAD_REQUEST,
+                payload.get("id").cloned().unwrap_or(Value::Null),
+                "session_not_allowed",
+                "initialize must not include Mcp-Session-Id",
+            );
+        }
+        None
+    } else {
+        let session_id = match session_header {
+            None => {
+                return transport_error_response(
+                    StatusCode::BAD_REQUEST,
+                    payload.get("id").cloned().unwrap_or(Value::Null),
+                    "session_required",
+                    "Mcp-Session-Id is required after initialize",
+                );
+            }
+            Some(value) if value.to_str().is_err() => {
+                return transport_error_response(
+                    StatusCode::BAD_REQUEST,
+                    payload.get("id").cloned().unwrap_or(Value::Null),
+                    "invalid_session",
+                    "Mcp-Session-Id must contain visible ASCII characters",
+                );
+            }
+            Some(value) => value.to_str().expect("checked above").to_owned(),
+        };
+        if !state.sessions.contains(&session_id) {
+            return transport_error_response(
+                StatusCode::NOT_FOUND,
+                payload.get("id").cloned().unwrap_or(Value::Null),
+                "session_not_found",
+                "MCP session does not exist",
+            );
+        }
+        Some(session_id)
+    };
+    if payload.as_object().is_some_and(|request| {
+        request.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+            && !request.contains_key("id")
+    }) {
+        if let (Some(session_id), Some(request_id)) = (
+            session_id.as_deref(),
+            payload
+                .get("params")
+                .and_then(Value::as_object)
+                .and_then(|params| params.get("requestId")),
+        ) {
+            state.sessions.cancel(session_id, request_id);
+        }
+    }
+    let in_flight = session_id.as_deref().and_then(|session_id| {
+        payload
+            .get("id")
+            .and_then(|request_id| state.sessions.register(session_id, request_id))
+    });
+
     let (status, response_body) = handle_rpc_payload(
         &state.store,
         state.max_summary_bytes,
         state.max_artifact_bytes,
         payload,
+        in_flight.as_ref().map(|request| request.cancellation()),
     )
     .await;
-    match response_body {
+    let mut response = match response_body {
         Some(body) => json_response(status, body),
         None => no_content_response(status),
+    };
+    if is_initialize && status == StatusCode::OK {
+        let session_id = state.sessions.create();
+        response.headers_mut().insert(
+            "mcp-session-id",
+            session_id.parse().expect("UUID is a valid header value"),
+        );
     }
+    response
 }
 
 async fn handle_rpc_payload(
@@ -255,6 +332,7 @@ async fn handle_rpc_payload(
     max_summary_bytes: u16,
     max_artifact_bytes: u32,
     payload: Value,
+    cancellation: Option<Arc<tokio::sync::Notify>>,
 ) -> (StatusCode, Option<Value>) {
     if payload.is_array() {
         return (
@@ -270,7 +348,14 @@ async fn handle_rpc_payload(
             )),
         );
     }
-    handle_single_request(store, max_summary_bytes, max_artifact_bytes, payload).await
+    handle_single_request(
+        store,
+        max_summary_bytes,
+        max_artifact_bytes,
+        payload,
+        cancellation,
+    )
+    .await
 }
 
 async fn handle_single_request(
@@ -278,6 +363,7 @@ async fn handle_single_request(
     max_summary_bytes: u16,
     max_artifact_bytes: u32,
     request: Value,
+    cancellation: Option<Arc<tokio::sync::Notify>>,
 ) -> (StatusCode, Option<Value>) {
     let Some(request) = request.as_object() else {
         return (
@@ -330,15 +416,25 @@ async fn handle_single_request(
         }
     };
 
-    match dispatch(
+    let dispatched = dispatch(
         store,
         max_summary_bytes,
         max_artifact_bytes,
         method,
         &params,
-    )
-    .await
-    {
+    );
+    let result = if let Some(cancellation) = cancellation {
+        tokio::select! {
+            result = dispatched => Some(result),
+            _ = cancellation.notified() => None,
+        }
+    } else {
+        Some(dispatched.await)
+    };
+    let Some(result) = result else {
+        return (StatusCode::ACCEPTED, None);
+    };
+    match result {
         Ok(_) if is_notification => (StatusCode::ACCEPTED, None),
         Ok(result) => (
             StatusCode::OK,
@@ -346,6 +442,23 @@ async fn handle_single_request(
         ),
         Err(error) => rpc_request_error(request_id, is_notification, error),
     }
+}
+
+fn transport_error_response(
+    status: StatusCode,
+    request_id: Value,
+    code: &str,
+    message: &str,
+) -> Response {
+    json_response(
+        status,
+        json_rpc_error_response(
+            request_id,
+            -32600,
+            "Invalid Request",
+            Some(machine_error_data(code, message)),
+        ),
+    )
 }
 
 fn rpc_request_error(
