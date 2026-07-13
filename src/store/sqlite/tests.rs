@@ -1273,6 +1273,18 @@ async fn only_one_actor_can_claim_the_same_request() {
     );
 
     assert_ne!(first.is_ok(), second.is_ok());
+    let conflict = match (first, second) {
+        (Ok(_), Err(error)) | (Err(error), Ok(_)) => error,
+        _ => unreachable!("exactly one request claim succeeds"),
+    };
+    assert!(matches!(
+        conflict,
+        StoreError::ClaimConflict {
+            retry_after_seconds,
+            retry_at: Some(_),
+            ..
+        } if retry_after_seconds.is_some_and(|seconds| seconds > 0)
+    ));
     let claimed = store.get_request(request.request_id).await.unwrap();
     assert_eq!(claimed.status, RequestStatus::Claimed);
     assert!(claimed.claim_expires_at.is_some());
@@ -2075,6 +2087,16 @@ async fn work_item_claim_and_dependency_cycle_are_conflict_safe() {
         _ => unreachable!("exactly one concurrent work-item claim succeeds"),
     };
     assert!(matches!(loser, StoreError::RevisionConflict { .. }));
+    assert!(matches!(
+        store
+            .claim_work_item(takeover_instance_id, root.work_item_id, claimed.revision)
+            .await,
+        Err(StoreError::ClaimConflict {
+            resource_type: "work_item",
+            retry_after_seconds: Some(_),
+            ..
+        })
+    ));
     assert!(matches!(
         store
             .update_work_item(UpdateWorkItem {

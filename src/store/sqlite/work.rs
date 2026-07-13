@@ -415,6 +415,22 @@ impl SqliteStore {
                 .as_deref()
                 .is_some_and(|value| value <= now.as_str()));
         if !claimable {
+            if matches!(
+                current.status,
+                WorkItemStatus::Claimed | WorkItemStatus::InProgress | WorkItemStatus::Blocked
+            ) && current
+                .claim_expires_at
+                .as_deref()
+                .is_some_and(|value| value > now.as_str())
+            {
+                return Err(claim_conflict(
+                    "work_item",
+                    work_item_id.to_string(),
+                    "work item is held by an active claim",
+                    current.claim_expires_at.clone(),
+                    &now,
+                ));
+            }
             return Err(StoreError::Conflict(format!(
                 "work item {} is not claimable from '{}'",
                 work_item_id,

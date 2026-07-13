@@ -174,6 +174,27 @@ impl SqliteStore {
         .execute(&mut *transaction)
         .await?;
         if result.rows_affected() != 1 {
+            let current_row = sqlx::query("SELECT * FROM requests WHERE request_id = ?")
+                .bind(request_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("request {request_id}")))?;
+            let current = request_from_row(&current_row)?;
+            if current.target_repository_id == actor.repository_id
+                && current.status == RequestStatus::Claimed
+                && current
+                    .claim_expires_at
+                    .as_deref()
+                    .is_some_and(|expires| expires > now.as_str())
+            {
+                return Err(claim_conflict(
+                    "request",
+                    request_id.to_string(),
+                    "request is held by an active claim",
+                    current.claim_expires_at,
+                    &now,
+                ));
+            }
             return Err(request_transition_conflict(request_id, "claim"));
         }
         append_event(

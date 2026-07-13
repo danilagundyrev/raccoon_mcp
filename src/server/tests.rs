@@ -97,6 +97,20 @@ fn rpc_errors_expose_machine_readable_data_codes() {
 
     let conflict = store_rpc_error(StoreError::Conflict("claim expired".to_owned()));
     assert_eq!(conflict.data.as_ref().unwrap()["code"], "conflict");
+
+    let claim_conflict = StoreError::ClaimConflict {
+        resource_type: "request",
+        resource_id: "request-1".to_owned(),
+        message: "already claimed".to_owned(),
+        retry_at: Some("2026-07-13T10:00:00Z".to_owned()),
+        retry_after_seconds: Some(30),
+    };
+    let tool_claim = store_error_payload(&claim_conflict);
+    assert_eq!(tool_claim["error"]["code"], "claim_conflict");
+    assert_eq!(tool_claim["error"]["retry_after_seconds"], 30);
+    let rpc_claim = store_rpc_error(claim_conflict);
+    assert_eq!(rpc_claim.data.as_ref().unwrap()["code"], "claim_conflict");
+    assert_eq!(rpc_claim.data.as_ref().unwrap()["retry_after_seconds"], 30);
 }
 
 #[tokio::test]
@@ -133,9 +147,36 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
     assert_eq!(notification_status, StatusCode::ACCEPTED);
     assert!(notification_body.is_none());
 
-    let initialize = dispatch(&store, 1024, 524_288, "initialize", &JsonMap::new())
-        .await
-        .unwrap();
+    let (invalid_status, invalid_body) = handle_rpc_payload(
+        &store,
+        1024,
+        524_288,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "ping", "params": [] }),
+        None,
+    )
+    .await;
+    assert_eq!(invalid_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid_body.unwrap()["error"]["data"]["code"],
+        "invalid_params"
+    );
+
+    let initialize = dispatch(
+        &store,
+        1024,
+        524_288,
+        "initialize",
+        &JsonMap::from_iter([
+            ("protocolVersion".to_owned(), json!(PROTOCOL_VERSION)),
+            ("capabilities".to_owned(), json!({})),
+            (
+                "clientInfo".to_owned(),
+                json!({ "name": "test", "version": "1" }),
+            ),
+        ]),
+    )
+    .await
+    .unwrap();
     assert!(
         initialize["instructions"]
             .as_str()
@@ -171,8 +212,8 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
 #[tokio::test]
 async fn sessions_isolate_cancellation_and_cancel_long_waits() {
     let isolated_registry = SessionRegistry::default();
-    let first_session = isolated_registry.create();
-    let second_session = isolated_registry.create();
+    let first_session = isolated_registry.create(PROTOCOL_VERSION);
+    let second_session = isolated_registry.create(PROTOCOL_VERSION);
     let first_request = isolated_registry
         .register(&first_session, &json!(7))
         .unwrap();
@@ -249,6 +290,7 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
         .unwrap()
         .to_owned();
     assert!(session_id.is_ascii());
+    assert_eq!(PROTOCOL_VERSION, "2025-11-25");
 
     let missing_session = mcp_post(
         State(state.clone()),
@@ -276,6 +318,31 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
         "mcp-session-id",
         axum::http::HeaderValue::from_str(&session_id).unwrap(),
     );
+    session_headers.insert(
+        "mcp-protocol-version",
+        axum::http::HeaderValue::from_static(PROTOCOL_VERSION),
+    );
+    let mut missing_version_headers = session_headers.clone();
+    missing_version_headers.remove("mcp-protocol-version");
+    let missing_version = mcp_post(
+        State(state.clone()),
+        missing_version_headers,
+        Bytes::from(json!({ "jsonrpc": "2.0", "id": 4, "method": "ping" }).to_string()),
+    )
+    .await;
+    assert_eq!(missing_version.status(), StatusCode::BAD_REQUEST);
+    let mut wrong_version_headers = session_headers.clone();
+    wrong_version_headers.insert(
+        "mcp-protocol-version",
+        axum::http::HeaderValue::from_static("2025-06-18"),
+    );
+    let wrong_version = mcp_post(
+        State(state.clone()),
+        wrong_version_headers,
+        Bytes::from(json!({ "jsonrpc": "2.0", "id": 5, "method": "ping" }).to_string()),
+    )
+    .await;
+    assert_eq!(wrong_version.status(), StatusCode::BAD_REQUEST);
     let wait_state = state.clone();
     let wait_headers = session_headers.clone();
     let instance_id = connected.instance.instance_id;
@@ -311,7 +378,7 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
 
     let cancel = mcp_post(
         State(state.clone()),
-        session_headers,
+        session_headers.clone(),
         Bytes::from(
             json!({
                 "jsonrpc": "2.0",
@@ -326,6 +393,16 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
     let cancelled_wait = wait.await.unwrap();
     assert_eq!(cancelled_wait.status(), StatusCode::ACCEPTED);
     assert_eq!(cancelled_wait.headers()[CONTENT_LENGTH], "0");
+
+    let deleted = mcp_delete(State(state.clone()), session_headers.clone()).await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    let after_delete = mcp_post(
+        State(state.clone()),
+        session_headers,
+        Bytes::from(json!({ "jsonrpc": "2.0", "id": 6, "method": "ping" }).to_string()),
+    )
+    .await;
+    assert_eq!(after_delete.status(), StatusCode::NOT_FOUND);
 
     drop(state);
     drop(store);

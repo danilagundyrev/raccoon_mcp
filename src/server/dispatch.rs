@@ -8,7 +8,19 @@ pub(super) async fn dispatch(
     params: &JsonMap<String, Value>,
 ) -> Result<Value, RpcError> {
     match method {
-        "initialize" => Ok(json!({
+        "initialize" => {
+            let _requested_protocol_version = require_string(params, "protocolVersion")?;
+            if !params.get("capabilities").is_some_and(Value::is_object) {
+                return Err(invalid_argument(
+                    "'capabilities' is required and must be an object".to_owned(),
+                ));
+            }
+            if !params.get("clientInfo").is_some_and(Value::is_object) {
+                return Err(invalid_argument(
+                    "'clientInfo' is required and must be an object".to_owned(),
+                ));
+            }
+            Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {
                 "tools": { "listChanged": false },
@@ -20,7 +32,8 @@ pub(super) async fn dispatch(
                 "version": SERVER_VERSION,
             },
             "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use expected_revision for updates, and claim an owner-repository item before creating its executor worker run. The current linked executor must publish an implementation_report and complete before its orchestrator completes the item. Roles are executor, butler and auditor. Auditor scope contains completed work_item_ids and publishes exactly one audit_report; a later iteration waits for the previous audit and any created remediation executor to complete. Workers never register as repositories. Use ask_repository for durable questions and actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. Omit timeout_seconds for no server-side timeout. JSON-RPC batches are not supported.",
-        })),
+            }))
+        }
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({
@@ -560,6 +573,7 @@ pub(super) async fn read_resource(
             uri,
             json!({
                 "server": SERVER_NAME,
+                "protocol_version": PROTOCOL_VERSION,
                 "workflow": "multi-repository coordination hub",
                 "recommended_entrypoint": "connect_orchestrator",
                 "identity": ["project", "repository", "orchestrator instance"],
@@ -570,9 +584,11 @@ pub(super) async fn read_resource(
                 "protocol_behavior": {
                     "json_rpc_batching": "unsupported",
                     "notifications": "accepted without a response body",
-                    "errors": "JSON-RPC error.data and tool structuredContent contain stable machine-readable codes",
+                    "errors": "JSON-RPC error.data and tool structuredContent contain stable machine-readable codes; active claim conflicts include retry_at and retry_after_seconds",
                     "sessions": "initialize returns Mcp-Session-Id; every subsequent HTTP request must include that header",
-                    "cancellation": "notifications/cancelled stops an in-flight request only inside the same MCP session and the cancelled request receives no response"
+                    "protocol_header": "every request after initialize must include MCP-Protocol-Version matching the negotiated session version",
+                    "cancellation": "notifications/cancelled stops an in-flight request only inside the same MCP session and the cancelled request receives no response",
+                    "session_termination": "DELETE /mcp with session and protocol headers cancels in-flight requests and terminates the session"
                 },
                 "worker_flow": [
                     "The orchestrator calls create_worker_run before spawning a child.",

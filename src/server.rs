@@ -41,7 +41,7 @@ use schemas::*;
 use session::SessionRegistry;
 use validation::*;
 
-const PROTOCOL_VERSION: &str = "2026-06-18";
+const PROTOCOL_VERSION: &str = "2025-11-25";
 const SERVER_NAME: &str = "agent-sync-mcp";
 const SERVER_TITLE: &str = "Agent Coordination Hub";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -131,7 +131,7 @@ fn router(
     Router::new()
         .route("/", get(root))
         .route("/healthz", get(healthz))
-        .route("/mcp", get(mcp_get).post(mcp_post))
+        .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(AppState {
@@ -156,6 +156,7 @@ async fn root(State(state): State<AppState>) -> Response {
             "server": SERVER_NAME,
             "title": SERVER_TITLE,
             "version": SERVER_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
             "database": state.database_path.to_string_lossy(),
             "max_summary_bytes": state.max_summary_bytes,
             "max_artifact_bytes": state.max_artifact_bytes,
@@ -283,6 +284,21 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                 "MCP session does not exist",
             );
         }
+        let expected_version = state
+            .sessions
+            .protocol_version(&session_id)
+            .expect("session existence checked above");
+        let supplied_version = headers
+            .get("mcp-protocol-version")
+            .and_then(|value| value.to_str().ok());
+        if supplied_version != Some(expected_version.as_str()) {
+            return transport_error_response(
+                StatusCode::BAD_REQUEST,
+                payload.get("id").cloned().unwrap_or(Value::Null),
+                "unsupported_protocol_version",
+                &format!("MCP-Protocol-Version must match negotiated version {expected_version}"),
+            );
+        }
         Some(session_id)
     };
     if payload.as_object().is_some_and(|request| {
@@ -318,13 +334,57 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         None => no_content_response(status),
     };
     if is_initialize && status == StatusCode::OK {
-        let session_id = state.sessions.create();
+        let session_id = state.sessions.create(PROTOCOL_VERSION);
         response.headers_mut().insert(
             "mcp-session-id",
             session_id.parse().expect("UUID is a valid header value"),
         );
     }
     response
+}
+
+async fn mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(origin) = headers.get(ORIGIN).and_then(|value| value.to_str().ok()) {
+        if !origin_allowed(origin, &state.allowed_hosts) {
+            return json_response(
+                StatusCode::FORBIDDEN,
+                json!({ "error": "Origin is not allowed." }),
+            );
+        }
+    }
+    let Some(session_id) = headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return transport_error_response(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            "session_required",
+            "Mcp-Session-Id is required",
+        );
+    };
+    let Some(expected_version) = state.sessions.protocol_version(session_id) else {
+        return transport_error_response(
+            StatusCode::NOT_FOUND,
+            Value::Null,
+            "session_not_found",
+            "MCP session does not exist",
+        );
+    };
+    if headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        != Some(expected_version.as_str())
+    {
+        return transport_error_response(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            "unsupported_protocol_version",
+            &format!("MCP-Protocol-Version must match negotiated version {expected_version}"),
+        );
+    }
+    state.sessions.terminate(session_id);
+    no_content_response(StatusCode::NO_CONTENT)
 }
 
 async fn handle_rpc_payload(

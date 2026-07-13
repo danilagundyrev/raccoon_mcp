@@ -428,15 +428,35 @@ pub(super) fn store_rpc_error(error: StoreError) -> RpcError {
             expected,
             actual,
             current,
-        } => RpcError::new(-32602, "Revision conflict").with_data(json!({
-            "code": "revision_conflict",
-            "message": format!(
-                "work item {work_item_id} revision conflict: expected {expected}, actual {actual}"
-            ),
-            "work_item_id": work_item_id,
-            "expected_revision": expected,
-            "actual_revision": actual,
-            "current": current,
+        } => {
+            let retry_at = current.claim_expires_at.clone();
+            let retry_after_seconds = retry_after_seconds(retry_at.as_deref());
+            RpcError::new(-32602, "Revision conflict").with_data(json!({
+                "code": "revision_conflict",
+                "message": format!(
+                    "work item {work_item_id} revision conflict: expected {expected}, actual {actual}"
+                ),
+                "work_item_id": work_item_id,
+                "expected_revision": expected,
+                "actual_revision": actual,
+                "current": current,
+                "retry_at": retry_at,
+                "retry_after_seconds": retry_after_seconds,
+            }))
+        }
+        StoreError::ClaimConflict {
+            resource_type,
+            resource_id,
+            message,
+            retry_at,
+            retry_after_seconds,
+        } => RpcError::new(-32602, "Claim conflict").with_data(json!({
+            "code": "claim_conflict",
+            "message": message,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "retry_at": retry_at,
+            "retry_after_seconds": retry_after_seconds,
         })),
         other => RpcError::new(-32603, "Internal error")
             .with_data(machine_error_data("internal_error", other.to_string())),
@@ -455,6 +475,7 @@ pub(super) fn store_error_payload(error: &StoreError) -> Value {
         ..
     } = error
     {
+        let retry_at = current.claim_expires_at.clone();
         return json!({
             "error": {
                 "code": "revision_conflict",
@@ -462,6 +483,8 @@ pub(super) fn store_error_payload(error: &StoreError) -> Value {
                 "expected_revision": expected,
                 "actual_revision": actual,
                 "current": current,
+                "retry_after_seconds": retry_after_seconds(retry_at.as_deref()),
+                "retry_at": retry_at,
             }
         });
     }
@@ -469,12 +492,40 @@ pub(super) fn store_error_payload(error: &StoreError) -> Value {
         StoreError::NotFound(_) => "not_found",
         StoreError::Conflict(_) => "conflict",
         StoreError::RevisionConflict { .. } => unreachable!("handled above"),
+        StoreError::ClaimConflict { .. } => "claim_conflict",
         StoreError::Database(_)
         | StoreError::Io(_)
         | StoreError::Json(_)
         | StoreError::InvalidUuid(_) => "internal_error",
     };
+    if let StoreError::ClaimConflict {
+        resource_type,
+        resource_id,
+        message,
+        retry_at,
+        retry_after_seconds,
+    } = error
+    {
+        return json!({
+            "error": {
+                "code": code,
+                "message": message,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "retry_at": retry_at,
+                "retry_after_seconds": retry_after_seconds,
+            }
+        });
+    }
     json!({ "error": { "code": code, "message": error.to_string() } })
+}
+
+fn retry_after_seconds(retry_at: Option<&str>) -> Option<u64> {
+    let retry_at = chrono::DateTime::parse_from_rfc3339(retry_at?).ok()?;
+    let milliseconds = retry_at
+        .signed_duration_since(chrono::Utc::now())
+        .num_milliseconds();
+    (milliseconds > 0).then(|| ((milliseconds + 999) / 1_000) as u64)
 }
 
 pub(super) fn tool_result(payload: Value, is_error: bool) -> Value {

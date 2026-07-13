@@ -8,7 +8,11 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 type RequestCancellations = HashMap<String, Arc<Notify>>;
-type Sessions = HashMap<String, RequestCancellations>;
+struct Session {
+    protocol_version: String,
+    requests: RequestCancellations,
+}
+type Sessions = HashMap<String, Session>;
 
 #[derive(Clone, Default)]
 pub(super) struct SessionRegistry {
@@ -16,12 +20,18 @@ pub(super) struct SessionRegistry {
 }
 
 impl SessionRegistry {
-    pub(super) fn create(&self) -> String {
+    pub(super) fn create(&self, protocol_version: &str) -> String {
         let session_id = Uuid::new_v4().to_string();
         self.sessions
             .lock()
             .expect("session registry mutex poisoned")
-            .insert(session_id.clone(), HashMap::new());
+            .insert(
+                session_id.clone(),
+                Session {
+                    protocol_version: protocol_version.to_owned(),
+                    requests: HashMap::new(),
+                },
+            );
         session_id
     }
 
@@ -32,6 +42,30 @@ impl SessionRegistry {
             .contains_key(session_id)
     }
 
+    pub(super) fn protocol_version(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .get(session_id)
+            .map(|session| session.protocol_version.clone())
+    }
+
+    pub(super) fn terminate(&self, session_id: &str) -> bool {
+        let session = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .remove(session_id);
+        if let Some(session) = session {
+            for cancellation in session.requests.into_values() {
+                cancellation.notify_one();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     pub(super) fn register(&self, session_id: &str, request_id: &Value) -> Option<InFlightRequest> {
         let request_key = request_key(request_id)?;
         let cancellation = Arc::new(Notify::new());
@@ -39,6 +73,7 @@ impl SessionRegistry {
             .lock()
             .expect("session registry mutex poisoned")
             .get_mut(session_id)?
+            .requests
             .insert(request_key.clone(), cancellation.clone());
         Some(InFlightRequest {
             registry: self.clone(),
@@ -57,7 +92,7 @@ impl SessionRegistry {
             .lock()
             .expect("session registry mutex poisoned")
             .get(session_id)
-            .and_then(|requests| requests.get(&request_key))
+            .and_then(|session| session.requests.get(&request_key))
             .cloned();
         if let Some(cancellation) = cancellation {
             cancellation.notify_one();
@@ -71,7 +106,7 @@ impl SessionRegistry {
                 .lock()
                 .expect("session registry mutex poisoned")
                 .get(session_id)
-                .is_some_and(|requests| requests.contains_key(&request_key))
+                .is_some_and(|session| session.requests.contains_key(&request_key))
         })
     }
 }
@@ -96,14 +131,15 @@ impl Drop for InFlightRequest {
             .sessions
             .lock()
             .expect("session registry mutex poisoned");
-        let Some(requests) = sessions.get_mut(&self.session_id) else {
+        let Some(session) = sessions.get_mut(&self.session_id) else {
             return;
         };
-        if requests
+        if session
+            .requests
             .get(&self.request_key)
             .is_some_and(|current| Arc::ptr_eq(current, &self.cancellation))
         {
-            requests.remove(&self.request_key);
+            session.requests.remove(&self.request_key);
         }
     }
 }

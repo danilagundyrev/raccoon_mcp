@@ -53,6 +53,14 @@ pub enum StoreError {
         actual: u64,
         current: Box<WorkItem>,
     },
+    #[error("claim conflict for {resource_type} {resource_id}: {message}")]
+    ClaimConflict {
+        resource_type: &'static str,
+        resource_id: String,
+        message: String,
+        retry_at: Option<String>,
+        retry_after_seconds: Option<u64>,
+    },
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("filesystem error: {0}")]
@@ -620,6 +628,28 @@ fn request_transition_conflict(request_id: RequestId, action: &str) -> StoreErro
     StoreError::Conflict(format!(
         "request {request_id} cannot perform '{action}': status, target, owner or claim lease does not match"
     ))
+}
+
+fn claim_conflict(
+    resource_type: &'static str,
+    resource_id: String,
+    message: impl Into<String>,
+    retry_at: Option<String>,
+    now: &str,
+) -> StoreError {
+    let retry_after_seconds = retry_at.as_deref().and_then(|retry_at| {
+        let retry_at = chrono::DateTime::parse_from_rfc3339(retry_at).ok()?;
+        let now = chrono::DateTime::parse_from_rfc3339(now).ok()?;
+        let milliseconds = retry_at.signed_duration_since(now).num_milliseconds();
+        (milliseconds > 0).then(|| ((milliseconds + 999) / 1_000) as u64)
+    });
+    StoreError::ClaimConflict {
+        resource_type,
+        resource_id,
+        message: message.into(),
+        retry_at,
+        retry_after_seconds,
+    }
 }
 
 fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreError> {
