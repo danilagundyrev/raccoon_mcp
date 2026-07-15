@@ -34,7 +34,7 @@ pub(super) async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use expected_revision for updates, and claim an owner-repository item before creating its executor worker run. The current linked executor must publish an implementation_report and complete before its orchestrator completes the item. Roles are executor, butler and auditor. Auditor scope contains completed work_item_ids and publishes exactly one audit_report; a later iteration waits for the previous audit and any created remediation executor to complete. Workers never register as repositories. Use ask_repository for durable questions and actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. Omit timeout_seconds for no server-side timeout. JSON-RPC batches are not supported.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use bounded list_work_items pages, expected_revision for updates, and claim an owner-repository item before creating its executor worker run. The current linked executor must publish an implementation_report and complete before its orchestrator completes the item. Roles are executor, butler and auditor. Auditor scope contains completed work_item_ids and publishes exactly one audit_report; a later iteration waits for the previous audit and any created remediation executor to complete. Workers never register as repositories. Use ask_repository for durable questions and actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. Omit timeout_seconds for no server-side timeout. JSON-RPC batches are not supported.",
             }))
         }
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
@@ -263,10 +263,12 @@ pub(super) async fn call_tool(
         }
         "list_work_items" => {
             let feature_id = parse_feature_id(&arguments)?;
+            let after_work_item_id = optional_work_item_id(&arguments, "after_work_item_id")?;
+            let limit = optional_limit(&arguments)?.unwrap_or(20);
             store
-                .list_work_items(feature_id)
+                .list_work_items(feature_id, after_work_item_id, limit)
                 .await
-                .map(|items| json!({ "feature_id": feature_id, "work_items": items }))
+                .map(|page| json!({ "feature_id": feature_id, "work_items": page }))
         }
         "update_work_item" => {
             let parent_instance_id = parse_instance_id(&arguments)?;
@@ -390,6 +392,9 @@ pub(super) async fn call_tool(
                         artifact_title: optional_string(&arguments, "artifact_title")?,
                         content_type: optional_string(&arguments, "content_type")?
                             .unwrap_or_else(|| "text/markdown".to_owned()),
+                        feature_id: optional_feature_id(&arguments, "feature_id")?,
+                        work_item_id: optional_work_item_id(&arguments, "work_item_id")?,
+                        request_id: optional_request_id(&arguments, "request_id")?,
                         thread_id,
                         correlation_id,
                         in_reply_to,
@@ -505,9 +510,10 @@ pub(super) async fn call_tool(
         "list_inbox" => {
             let actor = parse_actor(&arguments)?;
             let after_delivery_id = optional_nonnegative_i64(&arguments, "after_delivery_id")?;
+            let kinds = optional_message_kinds(&arguments)?;
             let limit = optional_limit(&arguments)?.unwrap_or(20);
             store
-                .list_inbox(actor, after_delivery_id, limit)
+                .list_inbox(actor, after_delivery_id, &kinds, limit)
                 .await
                 .map(|value| json!(value))
         }
@@ -538,7 +544,8 @@ pub(super) async fn call_tool(
         }
         "list_repositories" => {
             let project_id = parse_project_id(&arguments)?;
-            store.list_repositories(project_id).await.map(
+            let presence_filter = optional_presence_filter(&arguments)?;
+            store.list_repositories(project_id, presence_filter).await.map(
                 |repositories| json!({ "project_id": project_id, "repositories": repositories }),
             )
         }
@@ -583,12 +590,18 @@ pub(super) async fn read_resource(
                 "lease_note": "Call heartbeat before lease_expires_at. Repository identity and future mailbox state remain stable across orchestrator instances.",
                 "max_summary_bytes": max_summary_bytes,
                 "max_artifact_bytes": max_artifact_bytes,
+                "collection_limits": {
+                    "context_refs": MAX_CONTEXT_REFS,
+                    "audit_work_items": MAX_AUDIT_WORK_ITEMS,
+                    "work_item_dependencies": MAX_WORK_ITEM_DEPENDENCIES,
+                    "message_recipients": MAX_MESSAGE_RECIPIENTS
+                },
                 "summary_note": "Summary fields are compact UTF-8 indexes. Put full context in an artifact instead of enlarging every inbox/event payload.",
                 "protocol_behavior": {
                     "json_rpc_batching": "unsupported",
                     "notifications": "accepted without a response body",
                     "errors": "JSON-RPC error.data and tool structuredContent contain stable machine-readable codes; active claim conflicts include retry_at and retry_after_seconds",
-                    "sessions": "initialize returns Mcp-Session-Id; every subsequent HTTP request must include that header. Idle sessions are reaped and the in-memory registry has a configured hard limit.",
+                    "sessions": "initialize returns Mcp-Session-Id; every subsequent HTTP request must include that header. Idle sessions are reaped; initialize is rejected when the configured hard limit is occupied by live sessions.",
                     "protocol_header": "every request after initialize must include MCP-Protocol-Version matching the negotiated session version",
                     "cancellation": "notifications/cancelled stops an in-flight request only inside the same MCP session and the cancelled request receives no response",
                     "session_termination": "DELETE /mcp with session and protocol headers cancels in-flight requests and terminates the session"
@@ -623,17 +636,19 @@ pub(super) async fn read_resource(
                     "Supply an actor-scoped idempotency_key to creation calls that may be retried; the same key requires an identical payload.",
                     "Call wait_for_events with the last event cursor; omit timeout_seconds for an unbounded server wait. The server renews the waiting actor lease.",
                     "Use list_inbox to read pending headers without artifact bodies.",
+                    "Use the kinds filter to select report, announcement or command headers.",
                     "Use read_message/read_artifact only for selected items.",
                     "Call ack_message after processing; broadcast recipients acknowledge independently."
                 ],
                 "operations": {
                     "health": "GET /healthz checks the HTTP process without depending on SQLite.",
-                    "readiness": "GET /readyz verifies that a SQLite transaction can begin and roll back.",
+                    "readiness": "GET /readyz performs a harmless SQLite write and rolls the transaction back.",
                     "metrics": "GET /metrics is exposed only with --enable-metrics and computes compact counters on demand without message or artifact bodies.",
                     "maintenance": "A frequent indexed lease/session sweep disconnects expired actors and requeues expired request claims. Retention is disabled by default; when configured, each pass deletes at most 1000 old events and 1000 idempotency records.",
                     "shutdown": "Graceful shutdown stops accepting calls, cancels session waiters and expires local actor and claim leases."
                 },
                 "current_scope": "Project/repository presence, feature/work graph with optimistic revisions and claims, linked worker/audit runs, immutable messaging/artifacts, reliable delivery, event waiting and claimed repository requests.",
+                "resource_scope": "Feature and work-item cards are addressable resources. Actor-sensitive inbox, message and artifact reads remain tools so repository access checks receive explicit actor identity.",
             }),
         ));
     }
@@ -656,13 +671,31 @@ pub(super) async fn read_resource(
     {
         let project_id = ProjectId::parse(project_id).map_err(invalid_uuid)?;
         let repositories = store
-            .list_repositories(project_id)
+            .list_repositories(project_id, RepositoryPresenceFilter::All)
             .await
             .map_err(store_rpc_error)?;
         return Ok(resource_contents(
             uri,
             json!({ "project_id": project_id, "repositories": repositories }),
         ));
+    }
+
+    if let Some(feature_id) = uri.strip_prefix("hub://feature/") {
+        let feature_id = FeatureId::parse(feature_id).map_err(invalid_uuid)?;
+        let feature = store
+            .get_feature(feature_id)
+            .await
+            .map_err(store_rpc_error)?;
+        return Ok(resource_contents(uri, json!(feature)));
+    }
+
+    if let Some(work_item_id) = uri.strip_prefix("hub://work-item/") {
+        let work_item_id = WorkItemId::parse(work_item_id).map_err(invalid_uuid)?;
+        let work_item = store
+            .get_work_item(work_item_id)
+            .await
+            .map_err(store_rpc_error)?;
+        return Ok(resource_contents(uri, json!(work_item)));
     }
 
     Err(

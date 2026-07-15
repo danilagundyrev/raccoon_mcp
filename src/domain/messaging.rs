@@ -2,7 +2,10 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ArtifactId, InstanceId, MessageId, ProjectId, RepositoryId, ThreadId, WorkerRunId};
+use super::{
+    ArtifactId, FeatureId, InstanceId, MessageId, ProjectId, RepositoryId, RequestId, ThreadId,
+    WorkItemId, WorkerRunId,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActorRef {
@@ -98,6 +101,9 @@ pub struct PublishMessage {
     pub artifact_kind: ArtifactKind,
     pub artifact_title: Option<String>,
     pub content_type: String,
+    pub feature_id: Option<FeatureId>,
+    pub work_item_id: Option<WorkItemId>,
+    pub request_id: Option<RequestId>,
     pub thread_id: Option<ThreadId>,
     pub correlation_id: Option<String>,
     pub in_reply_to: Option<MessageId>,
@@ -125,6 +131,9 @@ pub struct Message {
     pub sender_instance_id: Option<InstanceId>,
     pub sender_worker_run_id: Option<WorkerRunId>,
     pub kind: MessageKind,
+    pub feature_id: Option<FeatureId>,
+    pub work_item_id: Option<WorkItemId>,
+    pub request_id: Option<RequestId>,
     pub thread_id: ThreadId,
     pub correlation_id: Option<String>,
     pub in_reply_to: Option<MessageId>,

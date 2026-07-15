@@ -118,6 +118,13 @@ pub struct WorkItem {
     pub finished_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkItemPage {
+    pub items: Vec<WorkItem>,
+    pub next_cursor: Option<WorkItemId>,
+    pub has_more: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -25,11 +25,13 @@ use crate::domain::{
     ArtifactKind, AskRepository, AuditScopeItem, ConnectOrchestrator, ConnectResult,
     CoordinationRequest, CreateFeature, CreateWorkItem, CreateWorkerRun, DeliveryAck, EventBatch,
     EventEntityType, EventKind, FailRequest, Feature, FeatureId, HubEvent, InboxItem, InboxPage,
-    InstanceId, LeaseMaintenanceReport, Message, MessageId, MessageKind, MessageTarget,
-    OperationalMetrics, PresenceStatus, Project, ProjectId, ProjectOverview, PublishMessage,
-    PublishResult, Repository, RepositoryId, RepositoryPresence, RequestId, RequestStatus,
-    RetentionReport, ThreadId, UpdateWorkItem, WaitOutcome, WorkItem, WorkItemId, WorkItemStatus,
-    WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
+    InstanceId, LeaseMaintenanceReport, MAX_AUDIT_WORK_ITEMS, MAX_CONTEXT_REFS,
+    MAX_MESSAGE_RECIPIENTS, MAX_WORK_ITEM_DEPENDENCIES, Message, MessageId, MessageKind,
+    MessageTarget, OperationalMetrics, PresenceStatus, Project, ProjectId, ProjectOverview,
+    PublishMessage, PublishResult, Repository, RepositoryId, RepositoryPresence,
+    RepositoryPresenceFilter, RequestId, RequestStatus, RetentionReport, ThreadId, UpdateWorkItem,
+    WaitOutcome, WorkItem, WorkItemId, WorkItemPage, WorkItemStatus, WorkerRole, WorkerRun,
+    WorkerRunId, WorkerRunStatus,
 };
 
 use super::schema::{CREATE_SCHEMA, SCHEMA_VERSION};
@@ -161,8 +163,14 @@ impl SqliteStore {
     }
 
     pub async fn health_check(&self) -> Result<(), StoreError> {
+        let _write_guard = self.write_lock.lock().await;
         let mut transaction = self.pool.begin().await?;
-        sqlx::query("SELECT 1").execute(&mut *transaction).await?;
+        sqlx::query(
+            "INSERT INTO schema_meta(key, value) VALUES ('readiness_probe', 'ok')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(&mut *transaction)
+        .await?;
         transaction.rollback().await?;
         Ok(())
     }
@@ -508,6 +516,9 @@ fn publish_message_fingerprint(command: &PublishMessage) -> Result<String, Store
         "artifact_kind": command.artifact_kind.as_str(),
         "artifact_title": command.artifact_title,
         "content_type": command.content_type,
+        "feature_id": command.feature_id,
+        "work_item_id": command.work_item_id,
+        "request_id": command.request_id,
         "thread_id": command.thread_id,
         "correlation_id": command.correlation_id,
         "in_reply_to": command.in_reply_to,
@@ -673,6 +684,12 @@ fn claim_conflict(
 }
 
 fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreError> {
+    validate_context_refs_value(&command.context_refs)?;
+    if command.audit_work_items.len() > MAX_AUDIT_WORK_ITEMS {
+        return Err(StoreError::Conflict(format!(
+            "audit scope must contain at most {MAX_AUDIT_WORK_ITEMS} work items"
+        )));
+    }
     let has_audit_scope = !command.audit_work_items.is_empty();
     match command.role {
         WorkerRole::Auditor => {
@@ -841,6 +858,24 @@ async fn validate_remediation_audit(
             "audit worker run {audit_run_id} already has a remediation executor run"
         )));
     }
+    let later_iteration_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM worker_run_audit_items current_scope
+             JOIN worker_run_audit_items later
+               ON later.work_item_id = current_scope.work_item_id
+              AND later.audit_iteration > current_scope.audit_iteration
+             WHERE current_scope.worker_run_id = ?
+         )",
+    )
+    .bind(audit_run_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if later_iteration_exists != 0 {
+        return Err(StoreError::Conflict(format!(
+            "audit worker run {audit_run_id} cannot start remediation after a later audit iteration"
+        )));
+    }
     Ok(())
 }
 
@@ -858,6 +893,11 @@ async fn resolve_recipients(
             .bind(project_id.to_string())
             .fetch_all(&mut **transaction)
             .await?;
+            if rows.len() > MAX_MESSAGE_RECIPIENTS {
+                return Err(StoreError::Conflict(format!(
+                    "a message may target at most {MAX_MESSAGE_RECIPIENTS} repositories"
+                )));
+            }
             rows.iter()
                 .map(|row| Ok(RepositoryId::parse(row.try_get("repository_id")?)?))
                 .collect()
@@ -872,16 +912,28 @@ async fn resolve_recipients(
                     "at least one target repository is required".to_owned(),
                 ));
             }
-            let mut recipients = Vec::with_capacity(unique.len());
-            for repository_id in unique {
-                let row =
-                    sqlx::query("SELECT project_id FROM repositories WHERE repository_id = ?")
-                        .bind(&repository_id)
-                        .fetch_optional(&mut **transaction)
-                        .await?
-                        .ok_or_else(|| {
-                            StoreError::NotFound(format!("repository {repository_id}"))
-                        })?;
+            if unique.len() > MAX_MESSAGE_RECIPIENTS {
+                return Err(StoreError::Conflict(format!(
+                    "a message may target at most {MAX_MESSAGE_RECIPIENTS} repositories"
+                )));
+            }
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT repository_id, project_id FROM repositories WHERE repository_id IN (",
+            );
+            let mut separated = query.separated(", ");
+            for repository_id in &unique {
+                separated.push_bind(repository_id);
+            }
+            separated.push_unseparated(") ORDER BY repository_id");
+            let rows = query.build().fetch_all(&mut **transaction).await?;
+            if rows.len() != unique.len() {
+                return Err(StoreError::NotFound(
+                    "one or more target repositories do not exist".to_owned(),
+                ));
+            }
+            let mut recipients = Vec::with_capacity(rows.len());
+            for row in rows {
+                let repository_id: String = row.try_get("repository_id")?;
                 let recipient_project_id = ProjectId::parse(row.try_get("project_id")?)?;
                 if recipient_project_id != project_id {
                     return Err(StoreError::Conflict(format!(
@@ -893,6 +945,23 @@ async fn resolve_recipients(
             Ok(recipients)
         }
     }
+}
+
+fn validate_context_refs_value(context_refs: &serde_json::Value) -> Result<(), StoreError> {
+    let values = context_refs.as_array().ok_or_else(|| {
+        StoreError::Conflict("context_refs must be an array of objects".to_owned())
+    })?;
+    if values.len() > MAX_CONTEXT_REFS {
+        return Err(StoreError::Conflict(format!(
+            "context_refs must contain at most {MAX_CONTEXT_REFS} items"
+        )));
+    }
+    if values.iter().any(|value| !value.is_object()) {
+        return Err(StoreError::Conflict(
+            "context_refs must contain only objects".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn insert_artifact(
@@ -927,9 +996,10 @@ async fn insert_message(
     sqlx::query(
         "INSERT INTO messages(
              message_id, project_id, sender_repository_id, sender_instance_id,
-             sender_worker_run_id, kind, thread_id, correlation_id, in_reply_to,
+             sender_worker_run_id, kind, feature_id, work_item_id, request_id,
+             thread_id, correlation_id, in_reply_to,
              summary, artifact_id, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(message.message_id.to_string())
     .bind(message.project_id.to_string())
@@ -937,6 +1007,9 @@ async fn insert_message(
     .bind(message.sender_instance_id.map(|id| id.to_string()))
     .bind(message.sender_worker_run_id.map(|id| id.to_string()))
     .bind(message.kind.as_str())
+    .bind(message.feature_id.map(|id| id.to_string()))
+    .bind(message.work_item_id.map(|id| id.to_string()))
+    .bind(message.request_id.map(|id| id.to_string()))
     .bind(message.thread_id.to_string())
     .bind(&message.correlation_id)
     .bind(message.in_reply_to.map(|id| id.to_string()))
@@ -1240,6 +1313,9 @@ fn message_from_row(row: &SqliteRow) -> Result<Message, StoreError> {
             WorkerRunId::parse,
         )?,
         kind: kind.parse().map_err(StoreError::Conflict)?,
+        feature_id: parse_optional_id(row.try_get("feature_id")?, FeatureId::parse)?,
+        work_item_id: parse_optional_id(row.try_get("work_item_id")?, WorkItemId::parse)?,
+        request_id: parse_optional_id(row.try_get("request_id")?, RequestId::parse)?,
         thread_id: ThreadId::parse(row.try_get("thread_id")?)?,
         correlation_id: row.try_get("correlation_id")?,
         in_reply_to: parse_optional_id(row.try_get("in_reply_to")?, MessageId::parse)?,

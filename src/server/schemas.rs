@@ -4,7 +4,7 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
     json!([
         {
             "name": "connect_orchestrator",
-            "description": "Join or reconnect an orchestrator to a user-defined project and repository. This is the required first call.",
+            "description": "Join or reconnect an orchestrator and return peers plus compact active-feature, pending-inbox and open-request counters. This is the required first call.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -62,7 +62,11 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
                         "maxLength": max_summary_bytes,
                         "description": "Compact summary. The server enforces max_summary_bytes as UTF-8 bytes; put full context in artifacts."
                     },
-                    "context_refs": { "type": "array", "items": { "type": "object" } },
+                    "context_refs": {
+                        "type": "array",
+                        "maxItems": MAX_CONTEXT_REFS,
+                        "items": { "type": "object" }
+                    },
                     "idempotency_key": {
                         "type": "string",
                         "minLength": 1,
@@ -72,6 +76,7 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
                     "audit_work_items": {
                         "type": "array",
                         "minItems": 1,
+                        "maxItems": MAX_AUDIT_WORK_ITEMS,
                         "uniqueItems": true,
                         "items": {
                             "type": "object",
@@ -189,8 +194,8 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
         },
         {
             "name": "list_work_items",
-            "description": "List all work items for one feature in priority order.",
-            "inputSchema": id_schema("feature_id"),
+            "description": "List one bounded page of work items for a feature in priority order.",
+            "inputSchema": list_work_items_schema(),
             "annotations": mutation_annotations(true)
         },
         {
@@ -328,7 +333,7 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
         {
             "name": "list_repositories",
             "description": "List repositories in a project with their current online instance counts.",
-            "inputSchema": id_schema("project_id"),
+            "inputSchema": list_repositories_schema(),
             "annotations": {
                 "readOnlyHint": true,
                 "destructiveHint": false,
@@ -388,6 +393,7 @@ pub(super) fn create_work_item_schema(max_summary_bytes: u16) -> Value {
             "summary": { "type": "string", "maxLength": max_summary_bytes },
             "dependency_ids": {
                 "type": "array",
+                "maxItems": MAX_WORK_ITEM_DEPENDENCIES,
                 "uniqueItems": true,
                 "items": { "type": "string", "format": "uuid" }
             },
@@ -418,6 +424,7 @@ pub(super) fn update_work_item_schema(max_summary_bytes: u16) -> Value {
             "summary": { "type": "string", "maxLength": max_summary_bytes },
             "dependency_ids": {
                 "type": "array",
+                "maxItems": MAX_WORK_ITEM_DEPENDENCIES,
                 "uniqueItems": true,
                 "items": { "type": "string", "format": "uuid" }
             },
@@ -502,6 +509,15 @@ pub(super) fn inbox_schema() -> Value {
         "limit".to_owned(),
         json!({ "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }),
     );
+    properties.insert(
+        "kinds".to_owned(),
+        json!({
+            "type": "array",
+            "maxItems": 3,
+            "uniqueItems": true,
+            "items": { "type": "string", "enum": ["report", "announcement", "command"] }
+        }),
+    );
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -510,6 +526,35 @@ pub(super) fn inbox_schema() -> Value {
             { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
             { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
         ]
+    })
+}
+
+pub(super) fn list_work_items_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "feature_id": { "type": "string", "format": "uuid" },
+            "after_work_item_id": { "type": "string", "format": "uuid" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+        },
+        "required": ["feature_id"]
+    })
+}
+
+pub(super) fn list_repositories_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "project_id": { "type": "string", "format": "uuid" },
+            "presence_filter": {
+                "type": "string",
+                "enum": ["all", "online", "offline"],
+                "default": "all"
+            }
+        },
+        "required": ["project_id"]
     })
 }
 
@@ -523,6 +568,7 @@ pub(super) fn wait_for_events_schema() -> Value {
         "kinds".to_owned(),
         json!({
             "type": "array",
+            "maxItems": 12,
             "uniqueItems": true,
             "items": {
                 "type": "string",
@@ -583,7 +629,11 @@ pub(super) fn ask_repository_schema(max_summary_bytes: u16, max_artifact_bytes: 
     );
     properties.insert(
         "context_refs".to_owned(),
-        json!({ "type": "array", "items": { "type": "object" } }),
+        json!({
+            "type": "array",
+            "maxItems": MAX_CONTEXT_REFS,
+            "items": { "type": "object" }
+        }),
     );
     properties.insert("idempotency_key".to_owned(), idempotency_key_schema());
     json!({
@@ -673,6 +723,7 @@ pub(super) fn publish_message_schema(max_summary_bytes: u16, max_artifact_bytes:
             json!({
                 "type": "array",
                 "minItems": 1,
+                "maxItems": MAX_MESSAGE_RECIPIENTS,
                 "uniqueItems": true,
                 "items": { "type": "string", "format": "uuid" }
             }),
@@ -701,6 +752,18 @@ pub(super) fn publish_message_schema(max_summary_bytes: u16, max_artifact_bytes:
         (
             "content_type".to_owned(),
             json!({ "type": "string", "default": "text/markdown" }),
+        ),
+        (
+            "feature_id".to_owned(),
+            json!({ "type": "string", "format": "uuid" }),
+        ),
+        (
+            "work_item_id".to_owned(),
+            json!({ "type": "string", "format": "uuid" }),
+        ),
+        (
+            "request_id".to_owned(),
+            json!({ "type": "string", "format": "uuid" }),
         ),
         (
             "thread_id".to_owned(),
@@ -768,6 +831,18 @@ pub(super) fn list_resource_templates() -> Value {
             "uriTemplate": "hub://project/{project_id}/repositories",
             "name": "Project repositories",
             "description": "Repositories and online orchestrator counts.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": "hub://feature/{feature_id}",
+            "name": "Feature card",
+            "description": "One compact project feature card.",
+            "mimeType": "application/json"
+        },
+        {
+            "uriTemplate": "hub://work-item/{work_item_id}",
+            "name": "Work-item card",
+            "description": "One compact work-item card with revision, dependencies and artifact links.",
             "mimeType": "application/json"
         }
     ])

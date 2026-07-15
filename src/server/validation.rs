@@ -10,6 +10,16 @@ pub(super) fn parse_project_id(arguments: &JsonMap<String, Value>) -> Result<Pro
     ProjectId::parse(&require_string(arguments, "project_id")?).map_err(invalid_uuid)
 }
 
+pub(super) fn optional_presence_filter(
+    arguments: &JsonMap<String, Value>,
+) -> Result<RepositoryPresenceFilter, RpcError> {
+    optional_string(arguments, "presence_filter")?
+        .as_deref()
+        .unwrap_or("all")
+        .parse()
+        .map_err(invalid_argument)
+}
+
 pub(super) fn parse_worker_run_id(
     arguments: &JsonMap<String, Value>,
 ) -> Result<WorkerRunId, RpcError> {
@@ -85,6 +95,7 @@ pub(super) fn validated_context_refs(
     match arguments.get("context_refs") {
         None => Ok(json!([])),
         Some(Value::Array(values)) => {
+            ensure_array_limit("context_refs", values.len(), MAX_CONTEXT_REFS)?;
             if let Some((index, _)) = values
                 .iter()
                 .enumerate()
@@ -190,6 +201,24 @@ pub(super) fn optional_work_item_id(
         .transpose()
 }
 
+pub(super) fn optional_feature_id(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<FeatureId>, RpcError> {
+    optional_string(arguments, field_name)?
+        .map(|value| FeatureId::parse(&value).map_err(invalid_uuid))
+        .transpose()
+}
+
+pub(super) fn optional_request_id(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<RequestId>, RpcError> {
+    optional_string(arguments, field_name)?
+        .map(|value| RequestId::parse(&value).map_err(invalid_uuid))
+        .transpose()
+}
+
 pub(super) fn optional_nullable_work_item_id(
     arguments: &JsonMap<String, Value>,
     field_name: &str,
@@ -212,16 +241,20 @@ pub(super) fn optional_work_item_ids(
 ) -> Result<Option<Vec<WorkItemId>>, RpcError> {
     match arguments.get(field_name) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(|value| {
-                let value = value.as_str().ok_or_else(|| {
-                    invalid_argument(format!("every {field_name} entry must be a UUID string"))
-                })?;
-                WorkItemId::parse(value).map_err(invalid_uuid)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
+        Some(Value::Array(values)) => {
+            ensure_array_limit(field_name, values.len(), MAX_WORK_ITEM_DEPENDENCIES)?;
+            let ids = values
+                .iter()
+                .map(|value| {
+                    let value = value.as_str().ok_or_else(|| {
+                        invalid_argument(format!("every {field_name} entry must be a UUID string"))
+                    })?;
+                    WorkItemId::parse(value).map_err(invalid_uuid)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ensure_unique_strings(field_name, ids.iter().map(ToString::to_string))?;
+            Ok(Some(ids))
+        }
         Some(_) => Err(invalid_argument(format!("'{field_name}' must be an array"))),
     }
 }
@@ -280,18 +313,51 @@ pub(super) fn optional_event_kinds(
 ) -> Result<Vec<EventKind>, RpcError> {
     match arguments.get("kinds") {
         None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .ok_or_else(|| {
-                        invalid_argument("every event kind must be a string".to_owned())
-                    })?
-                    .parse::<EventKind>()
-                    .map_err(invalid_argument)
-            })
-            .collect(),
+        Some(Value::Array(values)) => {
+            ensure_array_limit("kinds", values.len(), 12)?;
+            let kinds = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| {
+                            invalid_argument("every event kind must be a string".to_owned())
+                        })?
+                        .parse::<EventKind>()
+                        .map_err(invalid_argument)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ensure_unique_strings("kinds", kinds.iter().map(|kind| kind.as_str().to_owned()))?;
+            Ok(kinds)
+        }
+        Some(_) => Err(invalid_argument(
+            "'kinds' must be an array when provided".to_owned(),
+        )),
+    }
+}
+
+pub(super) fn optional_message_kinds(
+    arguments: &JsonMap<String, Value>,
+) -> Result<Vec<MessageKind>, RpcError> {
+    match arguments.get("kinds") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(values)) => {
+            ensure_array_limit("kinds", values.len(), 3)?;
+            let kinds = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| {
+                            invalid_argument("every message kind must be a string".to_owned())
+                        })?
+                        .parse::<MessageKind>()
+                        .map_err(invalid_argument)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ensure_unique_strings("kinds", kinds.iter().map(|kind| kind.as_str().to_owned()))?;
+            Ok(kinds)
+        }
         Some(_) => Err(invalid_argument(
             "'kinds' must be an array when provided".to_owned(),
         )),
@@ -303,16 +369,26 @@ pub(super) fn optional_repository_ids(
 ) -> Result<Option<Vec<RepositoryId>>, RpcError> {
     match arguments.get("target_repository_ids") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(|value| {
-                let value = value.as_str().ok_or_else(|| {
-                    invalid_argument("every target_repository_id must be a UUID string".to_owned())
-                })?;
-                RepositoryId::parse(value).map_err(invalid_uuid)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
+        Some(Value::Array(values)) => {
+            ensure_array_limit(
+                "target_repository_ids",
+                values.len(),
+                MAX_MESSAGE_RECIPIENTS,
+            )?;
+            let ids = values
+                .iter()
+                .map(|value| {
+                    let value = value.as_str().ok_or_else(|| {
+                        invalid_argument(
+                            "every target_repository_id must be a UUID string".to_owned(),
+                        )
+                    })?;
+                    RepositoryId::parse(value).map_err(invalid_uuid)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ensure_unique_strings("target_repository_ids", ids.iter().map(ToString::to_string))?;
+            Ok(Some(ids))
+        }
         Some(_) => Err(invalid_argument(
             "'target_repository_ids' must be an array when provided".to_owned(),
         )),
@@ -324,9 +400,9 @@ pub(super) fn optional_audit_work_items(
 ) -> Result<Vec<AuditWorkItemInput>, RpcError> {
     match arguments.get("audit_work_items") {
         None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(|value| {
+        Some(Value::Array(values)) => {
+            ensure_array_limit("audit_work_items", values.len(), MAX_AUDIT_WORK_ITEMS)?;
+            let items = values.iter().map(|value| {
                 let object = value.as_object().ok_or_else(|| {
                     invalid_argument("every audit_work_item must be an object".to_owned())
                 })?;
@@ -340,11 +416,41 @@ pub(super) fn optional_audit_work_items(
                     .map_err(invalid_uuid)?;
                 Ok(AuditWorkItemInput { work_item_id })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?;
+            ensure_unique_strings(
+                "audit_work_items",
+                items.iter().map(|item| item.work_item_id.to_string()),
+            )?;
+            Ok(items)
+        }
         Some(_) => Err(invalid_argument(
             "'audit_work_items' must be an array when provided".to_owned(),
         )),
     }
+}
+
+fn ensure_array_limit(field_name: &str, actual: usize, maximum: usize) -> Result<(), RpcError> {
+    if actual > maximum {
+        return Err(invalid_argument(format!(
+            "'{field_name}' must contain at most {maximum} items"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_unique_strings(
+    field_name: &str,
+    values: impl IntoIterator<Item = String>,
+) -> Result<(), RpcError> {
+    let mut unique = HashSet::new();
+    for value in values {
+        if !unique.insert(value) {
+            return Err(invalid_argument(format!(
+                "'{field_name}' must not contain duplicate items"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn validated_summary(

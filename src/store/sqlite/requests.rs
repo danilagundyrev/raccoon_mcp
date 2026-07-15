@@ -14,6 +14,7 @@ impl SqliteStore {
         command: AskRepository,
         idempotency_key: Option<&str>,
     ) -> Result<CoordinationRequest, StoreError> {
+        validate_context_refs_value(&command.context_refs)?;
         let _write_guard = self.write_lock.lock().await;
         let request_fingerprint = ask_repository_fingerprint(&command)?;
         let now = utc_now();
@@ -332,6 +333,9 @@ impl SqliteStore {
             sender_instance_id: actor.instance_id,
             sender_worker_run_id: actor.worker_run_id,
             kind: MessageKind::Report,
+            feature_id: None,
+            work_item_id: None,
+            request_id: Some(command.request_id),
             thread_id: ThreadId::new(),
             correlation_id: Some(command.request_id.to_string()),
             in_reply_to: None,

@@ -24,9 +24,10 @@ use crate::{
     domain::{
         ActorRef, AnswerRequest, ArtifactId, ArtifactKind, AskRepository, AuditWorkItemInput,
         ConnectOrchestrator, CreateFeature, CreateWorkItem, CreateWorkerRun, EventKind,
-        FailRequest, FeatureId, InstanceId, MessageId, MessageKind, MessageTarget, ProjectId,
-        PublishMessage, RepositoryId, RequestId, ThreadId, UpdateWorkItem, WorkItemId,
-        WorkItemStatus, WorkerRole, WorkerRunId, validate_key,
+        FailRequest, FeatureId, InstanceId, MAX_AUDIT_WORK_ITEMS, MAX_CONTEXT_REFS,
+        MAX_MESSAGE_RECIPIENTS, MAX_WORK_ITEM_DEPENDENCIES, MessageId, MessageKind, MessageTarget,
+        ProjectId, PublishMessage, RepositoryId, RepositoryPresenceFilter, RequestId, ThreadId,
+        UpdateWorkItem, WorkItemId, WorkItemStatus, WorkerRole, WorkerRunId, validate_key,
     },
     store::{SqliteStore, StoreError},
 };
@@ -38,7 +39,7 @@ mod validation;
 
 use dispatch::dispatch;
 use schemas::*;
-use session::{SessionAccessError, SessionRegistry};
+use session::{SessionAccessError, SessionCreateError, SessionRegistry};
 use validation::*;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -378,6 +379,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     let is_initialize = payload
         .as_object()
         .is_some_and(|request| request.get("method").and_then(Value::as_str) == Some("initialize"));
+    let response_id = payload.get("id").cloned().unwrap_or(Value::Null);
     let session_header = headers.get("mcp-session-id");
     let (_session_id, in_flight) = if is_initialize {
         if session_header.is_some() {
@@ -480,7 +482,17 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         None => no_content_response(status),
     };
     if is_initialize && status == StatusCode::OK {
-        let session_id = state.sessions.create(PROTOCOL_VERSION);
+        let session_id = match state.sessions.create(PROTOCOL_VERSION) {
+            Ok(session_id) => session_id,
+            Err(SessionCreateError::CapacityExceeded) => {
+                return transport_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    response_id,
+                    "session_capacity_exceeded",
+                    "MCP session capacity is exhausted; retry after an idle session expires",
+                );
+            }
+        };
         response.headers_mut().insert(
             "mcp-session-id",
             session_id.parse().expect("UUID is a valid header value"),
@@ -724,6 +736,12 @@ fn session_access_error_response(error: SessionAccessError, request_id: Value) -
             Value::Null,
             "invalid_request_id",
             "request id must be a string or number",
+        ),
+        SessionAccessError::DuplicateRequestId => transport_error_response(
+            StatusCode::CONFLICT,
+            request_id,
+            "duplicate_request_id",
+            "request id is already in flight in this MCP session",
         ),
     }
 }

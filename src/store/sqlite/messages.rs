@@ -37,10 +37,15 @@ impl SqliteStore {
                 .await;
         }
 
-        let (inherited_thread, inherited_correlation_id) =
-            if let Some(in_reply_to) = command.in_reply_to {
-                let row = sqlx::query(
-                    "SELECT m.thread_id, m.correlation_id
+        let (
+            inherited_thread,
+            inherited_correlation_id,
+            inherited_feature_id,
+            inherited_work_item_id,
+            inherited_request_id,
+        ) = if let Some(in_reply_to) = command.in_reply_to {
+            let row = sqlx::query(
+                "SELECT m.thread_id, m.correlation_id, m.feature_id, m.work_item_id, m.request_id
                  FROM messages m
                  WHERE m.message_id = ? AND m.project_id = ?
                    AND (m.sender_repository_id = ? OR EXISTS (
@@ -48,21 +53,24 @@ impl SqliteStore {
                        WHERE d.message_id = m.message_id
                          AND d.recipient_repository_id = ?
                    ))",
-                )
-                .bind(in_reply_to.to_string())
-                .bind(actor.project_id.to_string())
-                .bind(actor.repository_id.to_string())
-                .bind(actor.repository_id.to_string())
-                .fetch_optional(&mut *transaction)
-                .await?
-                .ok_or_else(|| StoreError::NotFound(format!("accessible message {in_reply_to}")))?;
-                (
-                    Some(ThreadId::parse(row.try_get("thread_id")?)?),
-                    row.try_get::<Option<String>, _>("correlation_id")?,
-                )
-            } else {
-                (None, None)
-            };
+            )
+            .bind(in_reply_to.to_string())
+            .bind(actor.project_id.to_string())
+            .bind(actor.repository_id.to_string())
+            .bind(actor.repository_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("accessible message {in_reply_to}")))?;
+            (
+                Some(ThreadId::parse(row.try_get("thread_id")?)?),
+                row.try_get::<Option<String>, _>("correlation_id")?,
+                parse_optional_id(row.try_get("feature_id")?, FeatureId::parse)?,
+                parse_optional_id(row.try_get("work_item_id")?, WorkItemId::parse)?,
+                parse_optional_id(row.try_get("request_id")?, RequestId::parse)?,
+            )
+        } else {
+            (None, None, None, None, None)
+        };
         if let (Some(explicit), Some(inherited)) = (command.thread_id, inherited_thread) {
             if explicit != inherited {
                 return Err(StoreError::Conflict(
@@ -82,6 +90,20 @@ impl SqliteStore {
             }
         }
         let correlation_id = command.correlation_id.or(inherited_correlation_id);
+        let feature_id =
+            merge_message_link("feature_id", command.feature_id, inherited_feature_id)?;
+        let work_item_id =
+            merge_message_link("work_item_id", command.work_item_id, inherited_work_item_id)?;
+        let request_id =
+            merge_message_link("request_id", command.request_id, inherited_request_id)?;
+        validate_message_links(
+            &mut transaction,
+            &actor,
+            feature_id,
+            work_item_id,
+            request_id,
+        )
+        .await?;
 
         let recipient_ids =
             resolve_recipients(&mut transaction, actor.project_id, command.target).await?;
@@ -123,6 +145,9 @@ impl SqliteStore {
             sender_instance_id: actor.instance_id,
             sender_worker_run_id: actor.worker_run_id,
             kind: command.kind,
+            feature_id,
+            work_item_id,
+            request_id,
             thread_id,
             correlation_id,
             in_reply_to: command.in_reply_to,
@@ -131,34 +156,14 @@ impl SqliteStore {
             created_at: now.clone(),
         };
         insert_message(&mut transaction, &message).await?;
-        for recipient_id in &recipient_ids {
-            sqlx::query("INSERT INTO message_targets(message_id, repository_id) VALUES (?, ?)")
-                .bind(message.message_id.to_string())
-                .bind(recipient_id.to_string())
-                .execute(&mut *transaction)
-                .await?;
-            sqlx::query(
-                "INSERT INTO deliveries(
-                     message_id, recipient_repository_id, status, created_at,
-                     acked_at, acked_by_instance_id, acked_by_worker_run_id
-                 ) VALUES (?, ?, 'pending', ?, NULL, NULL, NULL)",
-            )
-            .bind(message.message_id.to_string())
-            .bind(recipient_id.to_string())
-            .bind(&now)
-            .execute(&mut *transaction)
-            .await?;
-            append_event(
-                &mut transaction,
-                actor.project_id,
-                *recipient_id,
-                EventKind::MessageAvailable,
-                EventEntityType::Message,
-                &message.message_id.to_string(),
-                &now,
-            )
-            .await?;
-        }
+        insert_message_fanout(
+            &mut transaction,
+            actor.project_id,
+            message.message_id,
+            &recipient_ids,
+            &now,
+        )
+        .await?;
         record_idempotent_result(
             &mut transaction,
             &actor_key,
@@ -216,26 +221,39 @@ impl SqliteStore {
         &self,
         actor_ref: ActorRef,
         after_delivery_id: Option<i64>,
+        kinds: &[MessageKind],
         limit: u8,
     ) -> Result<InboxPage, StoreError> {
+        if !(1..=100).contains(&limit) {
+            return Err(StoreError::Conflict(
+                "inbox page limit must be between 1 and 100".to_owned(),
+            ));
+        }
         let now = utc_now();
         let actor = self.resolve_actor_readonly(actor_ref, &now).await?;
 
-        let rows = sqlx::query(
+        let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT d.delivery_id, m.*
              FROM deliveries d
              JOIN messages m ON m.message_id = d.message_id
-             WHERE d.recipient_repository_id = ?
-               AND d.status = 'pending'
-               AND d.delivery_id > ?
-             ORDER BY d.delivery_id
-             LIMIT ?",
-        )
-        .bind(actor.repository_id.to_string())
-        .bind(after_delivery_id.unwrap_or(0))
-        .bind(i64::from(limit) + 1)
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE d.recipient_repository_id = ",
+        );
+        query
+            .push_bind(actor.repository_id.to_string())
+            .push(" AND d.status = 'pending' AND d.delivery_id > ")
+            .push_bind(after_delivery_id.unwrap_or(0));
+        if !kinds.is_empty() {
+            query.push(" AND m.kind IN (");
+            let mut separated = query.separated(", ");
+            for kind in kinds {
+                separated.push_bind(kind.as_str());
+            }
+            separated.push_unseparated(")");
+        }
+        query
+            .push(" ORDER BY d.delivery_id LIMIT ")
+            .push_bind(i64::from(limit) + 1);
+        let rows = query.build().fetch_all(&self.pool).await?;
 
         let has_more = rows.len() > usize::from(limit);
         let items = rows
@@ -358,4 +376,126 @@ impl SqliteStore {
         transaction.commit().await?;
         delivery_ack_from_row(&row)
     }
+}
+
+async fn insert_message_fanout(
+    transaction: &mut Transaction<'_, Sqlite>,
+    project_id: ProjectId,
+    message_id: MessageId,
+    recipient_ids: &[RepositoryId],
+    created_at: &str,
+) -> Result<(), StoreError> {
+    let mut targets =
+        QueryBuilder::<Sqlite>::new("INSERT INTO message_targets(message_id, repository_id) ");
+    targets.push_values(recipient_ids, |mut row, repository_id| {
+        row.push_bind(message_id.to_string())
+            .push_bind(repository_id.to_string());
+    });
+    targets.build().execute(&mut **transaction).await?;
+
+    let mut deliveries = QueryBuilder::<Sqlite>::new(
+        "INSERT INTO deliveries(message_id, recipient_repository_id, status, created_at, acked_at, acked_by_instance_id, acked_by_worker_run_id) ",
+    );
+    deliveries.push_values(recipient_ids, |mut row, repository_id| {
+        row.push_bind(message_id.to_string())
+            .push_bind(repository_id.to_string())
+            .push_bind("pending")
+            .push_bind(created_at)
+            .push_bind(Option::<String>::None)
+            .push_bind(Option::<String>::None)
+            .push_bind(Option::<String>::None);
+    });
+    deliveries.build().execute(&mut **transaction).await?;
+
+    let mut events = QueryBuilder::<Sqlite>::new(
+        "INSERT INTO events(project_id, recipient_repository_id, kind, entity_type, entity_id, created_at) ",
+    );
+    events.push_values(recipient_ids, |mut row, repository_id| {
+        row.push_bind(project_id.to_string())
+            .push_bind(repository_id.to_string())
+            .push_bind(EventKind::MessageAvailable.as_str())
+            .push_bind(EventEntityType::Message.as_str())
+            .push_bind(message_id.to_string())
+            .push_bind(created_at);
+    });
+    events.build().execute(&mut **transaction).await?;
+    Ok(())
+}
+
+fn merge_message_link<T: Copy + Eq>(
+    field_name: &str,
+    explicit: Option<T>,
+    inherited: Option<T>,
+) -> Result<Option<T>, StoreError> {
+    if explicit.is_some() && inherited.is_some() && explicit != inherited {
+        return Err(StoreError::Conflict(format!(
+            "explicit {field_name} does not match the replied-to message"
+        )));
+    }
+    Ok(explicit.or(inherited))
+}
+
+async fn validate_message_links(
+    transaction: &mut Transaction<'_, Sqlite>,
+    actor: &ResolvedActor,
+    feature_id: Option<FeatureId>,
+    work_item_id: Option<WorkItemId>,
+    request_id: Option<RequestId>,
+) -> Result<(), StoreError> {
+    if let Some(feature_id) = feature_id {
+        let project_id: Option<String> =
+            sqlx::query_scalar("SELECT project_id FROM features WHERE feature_id = ?")
+                .bind(feature_id.to_string())
+                .fetch_optional(&mut **transaction)
+                .await?;
+        let project_id = project_id
+            .map(|value| ProjectId::parse(&value))
+            .transpose()?;
+        if project_id != Some(actor.project_id) {
+            return Err(StoreError::NotFound(format!(
+                "feature {feature_id} in actor project"
+            )));
+        }
+    }
+    if let Some(work_item_id) = work_item_id {
+        let row = sqlx::query(
+            "SELECT work_items.feature_id, features.project_id
+             FROM work_items
+             JOIN features ON features.feature_id = work_items.feature_id
+             WHERE work_items.work_item_id = ?",
+        )
+        .bind(work_item_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("work item {work_item_id}")))?;
+        let linked_feature_id = FeatureId::parse(row.try_get("feature_id")?)?;
+        let project_id = ProjectId::parse(row.try_get("project_id")?)?;
+        if project_id != actor.project_id || feature_id.is_some_and(|id| id != linked_feature_id) {
+            return Err(StoreError::Conflict(
+                "message work_item_id must belong to its feature and actor project".to_owned(),
+            ));
+        }
+    }
+    if let Some(request_id) = request_id {
+        let row = sqlx::query(
+            "SELECT project_id, requester_repository_id, target_repository_id
+             FROM requests WHERE request_id = ?",
+        )
+        .bind(request_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("request {request_id}")))?;
+        let project_id = ProjectId::parse(row.try_get("project_id")?)?;
+        let requester_repository_id = RepositoryId::parse(row.try_get("requester_repository_id")?)?;
+        let target_repository_id = RepositoryId::parse(row.try_get("target_repository_id")?)?;
+        if project_id != actor.project_id
+            || (actor.repository_id != requester_repository_id
+                && actor.repository_id != target_repository_id)
+        {
+            return Err(StoreError::NotFound(format!(
+                "accessible request {request_id}"
+            )));
+        }
+    }
+    Ok(())
 }

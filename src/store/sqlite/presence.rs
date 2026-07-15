@@ -41,13 +41,36 @@ impl SqliteStore {
         .await?;
 
         transaction.commit().await?;
-        let repositories = self.list_repositories(project.project_id).await?;
+        let repositories = self
+            .list_repositories(project.project_id, RepositoryPresenceFilter::All)
+            .await?;
+        let bootstrap = sqlx::query(
+            "SELECT
+                (SELECT COUNT(*) FROM features f
+                 WHERE f.project_id = ? AND EXISTS (
+                     SELECT 1 FROM work_items w
+                     WHERE w.feature_id = f.feature_id
+                       AND w.status NOT IN ('completed', 'cancelled')
+                 )) AS active_feature_count,
+                (SELECT COUNT(*) FROM deliveries
+                 WHERE recipient_repository_id = ? AND status = 'pending') AS pending_inbox_count,
+                (SELECT COUNT(*) FROM requests
+                 WHERE target_repository_id = ? AND status IN ('pending', 'claimed')) AS open_request_count",
+        )
+        .bind(project.project_id.to_string())
+        .bind(repository.repository_id.to_string())
+        .bind(repository.repository_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
 
         Ok(ConnectResult {
             project,
             repository,
             instance,
             repositories,
+            active_feature_count: bootstrap.try_get::<i64, _>("active_feature_count")? as u64,
+            pending_inbox_count: bootstrap.try_get::<i64, _>("pending_inbox_count")? as u64,
+            open_request_count: bootstrap.try_get::<i64, _>("open_request_count")? as u64,
             warnings: warning.into_iter().collect(),
             next_actions: vec![
                 "Call heartbeat before the returned lease expires.".to_owned(),
@@ -142,6 +165,7 @@ impl SqliteStore {
     pub async fn list_repositories(
         &self,
         project_id: ProjectId,
+        presence_filter: RepositoryPresenceFilter,
     ) -> Result<Vec<RepositoryPresence>, StoreError> {
         let now = utc_now();
         let rows = sqlx::query(
@@ -161,14 +185,17 @@ impl SqliteStore {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.iter()
+        let mut repositories = rows
+            .iter()
             .map(|row| {
                 Ok(RepositoryPresence {
                     repository: repository_from_row(row)?,
                     online_instances: row.try_get::<i64, _>("online_instances")? as u64,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        repositories.retain(|presence| presence_filter.matches(presence.online_instances));
+        Ok(repositories)
     }
 
     pub async fn project_overview(
@@ -181,7 +208,9 @@ impl SqliteStore {
             .await?
             .ok_or_else(|| StoreError::NotFound(format!("project {project_id}")))?;
         let project = project_from_row(&row)?;
-        let repositories = self.list_repositories(project_id).await?;
+        let repositories = self
+            .list_repositories(project_id, RepositoryPresenceFilter::All)
+            .await?;
         Ok(ProjectOverview {
             project,
             repositories,

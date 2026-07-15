@@ -8,6 +8,11 @@ mod requests;
 mod work;
 mod worker;
 
+pub const MAX_CONTEXT_REFS: usize = 50;
+pub const MAX_AUDIT_WORK_ITEMS: usize = 50;
+pub const MAX_WORK_ITEM_DEPENDENCIES: usize = 100;
+pub const MAX_MESSAGE_RECIPIENTS: usize = 100;
+
 pub use events::{EventBatch, EventEntityType, EventKind, HubEvent, WaitOutcome};
 pub use ids::{
     ArtifactId, FeatureId, InstanceId, MessageId, ProjectId, RepositoryId, RequestId, ThreadId,
@@ -18,13 +23,17 @@ pub use messaging::{
     MessageTarget, PublishMessage, PublishResult,
 };
 pub use operations::{LeaseMaintenanceReport, OperationalMetrics, RetentionReport};
-pub use presence::{AgentInstance, ConnectOrchestrator, ConnectResult, PresenceStatus};
+pub use presence::{
+    AgentInstance, ConnectOrchestrator, ConnectResult, PresenceStatus, RepositoryPresenceFilter,
+};
 pub use project::{Project, ProjectOverview, Repository, RepositoryPresence};
 pub use requests::{
     AnswerRequest, AnswerRequestResult, AskRepository, CoordinationRequest, FailRequest,
     RequestStatus,
 };
-pub use work::{CreateFeature, CreateWorkItem, Feature, UpdateWorkItem, WorkItem, WorkItemStatus};
+pub use work::{
+    CreateFeature, CreateWorkItem, Feature, UpdateWorkItem, WorkItem, WorkItemPage, WorkItemStatus,
+};
 pub use worker::{
     AuditScopeItem, AuditWorkItemInput, CreateWorkerRun, WorkerRole, WorkerRun, WorkerRunStatus,
 };

@@ -97,6 +97,11 @@ CREATE INDEX IF NOT EXISTS work_items_active_claim_metrics_idx
     ON work_items(status, claim_expires_at)
     WHERE status IN ('claimed', 'in_progress', 'blocked');
 
+CREATE INDEX IF NOT EXISTS work_items_claim_owner_idx
+    ON work_items(assignee_instance_id, claim_expires_at)
+    WHERE status IN ('claimed', 'in_progress', 'blocked')
+      AND assignee_instance_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS work_item_dependencies (
     work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE CASCADE,
     dependency_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
@@ -189,6 +194,10 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS artifacts_project_created_idx
     ON artifacts(project_id, created_at);
 
+CREATE INDEX IF NOT EXISTS artifacts_producer_kind_idx
+    ON artifacts(producer_worker_run_id, kind)
+    WHERE producer_worker_run_id IS NOT NULL;
+
 CREATE UNIQUE INDEX IF NOT EXISTS artifacts_one_audit_report_per_worker_idx
     ON artifacts(producer_worker_run_id)
     WHERE kind = 'audit_report' AND producer_worker_run_id IS NOT NULL;
@@ -200,6 +209,9 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_instance_id TEXT REFERENCES agent_instances(instance_id) ON DELETE SET NULL,
     sender_worker_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE SET NULL,
     kind TEXT NOT NULL CHECK(kind IN ('report', 'announcement', 'command')),
+    feature_id TEXT REFERENCES features(feature_id) ON DELETE SET NULL,
+    work_item_id TEXT REFERENCES work_items(work_item_id) ON DELETE SET NULL,
+    request_id TEXT REFERENCES requests(request_id) ON DELETE SET NULL,
     thread_id TEXT NOT NULL,
     correlation_id TEXT,
     in_reply_to TEXT REFERENCES messages(message_id) ON DELETE SET NULL,
@@ -213,6 +225,22 @@ CREATE INDEX IF NOT EXISTS messages_project_thread_idx
 
 CREATE INDEX IF NOT EXISTS messages_correlation_idx
     ON messages(project_id, correlation_id);
+
+CREATE INDEX IF NOT EXISTS messages_feature_idx
+    ON messages(feature_id, created_at)
+    WHERE feature_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS messages_work_item_idx
+    ON messages(work_item_id, created_at)
+    WHERE work_item_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS messages_request_idx
+    ON messages(request_id, created_at)
+    WHERE request_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS messages_artifact_idx
+    ON messages(artifact_id)
+    WHERE artifact_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS message_targets (
     message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
@@ -273,6 +301,18 @@ CREATE INDEX IF NOT EXISTS requests_claim_expiry_idx
     ON requests(status, claim_expires_at)
     WHERE status = 'claimed';
 
+CREATE INDEX IF NOT EXISTS requests_claimed_instance_idx
+    ON requests(claimed_by_instance_id, claim_expires_at)
+    WHERE status = 'claimed' AND claimed_by_instance_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS requests_claimed_worker_idx
+    ON requests(claimed_by_worker_run_id, claim_expires_at)
+    WHERE status = 'claimed' AND claimed_by_worker_run_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS requests_question_artifact_idx
+    ON requests(question_artifact_id)
+    WHERE question_artifact_id IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS requests_open_metrics_idx
     ON requests(status, claim_expires_at)
     WHERE status IN ('pending', 'claimed');
@@ -314,6 +354,9 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS events_repository_cursor_idx
     ON events(recipient_repository_id, event_id);
+
+CREATE INDEX IF NOT EXISTS events_repository_kind_cursor_idx
+    ON events(recipient_repository_id, kind, event_id);
 
 CREATE INDEX IF NOT EXISTS events_retention_idx
     ON events(created_at, event_id);

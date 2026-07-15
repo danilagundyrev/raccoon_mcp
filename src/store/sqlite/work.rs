@@ -208,28 +208,106 @@ impl SqliteStore {
     }
 
     pub async fn get_work_item(&self, work_item_id: WorkItemId) -> Result<WorkItem, StoreError> {
-        get_work_item_pool(&self.pool, work_item_id).await
+        let mut transaction = self.pool.begin().await?;
+        let item = get_work_item_tx(&mut transaction, work_item_id).await?;
+        transaction.commit().await?;
+        Ok(item)
     }
 
     pub async fn list_work_items(
         &self,
         feature_id: FeatureId,
-    ) -> Result<Vec<WorkItem>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT work_item_id FROM work_items
-             WHERE feature_id = ? ORDER BY priority DESC, created_at",
-        )
-        .bind(feature_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        let mut items = Vec::with_capacity(rows.len());
-        for row in rows {
-            items.push(
-                get_work_item_pool(&self.pool, WorkItemId::parse(row.try_get("work_item_id")?)?)
-                    .await?,
-            );
+        after_work_item_id: Option<WorkItemId>,
+        limit: u8,
+    ) -> Result<WorkItemPage, StoreError> {
+        if !(1..=100).contains(&limit) {
+            return Err(StoreError::Conflict(
+                "work-item page limit must be between 1 and 100".to_owned(),
+            ));
         }
-        Ok(items)
+        let mut transaction = self.pool.begin().await?;
+        let cursor = if let Some(after_work_item_id) = after_work_item_id {
+            Some(
+                sqlx::query(
+                    "SELECT priority, created_at, work_item_id FROM work_items
+                     WHERE feature_id = ? AND work_item_id = ?",
+                )
+                .bind(feature_id.to_string())
+                .bind(after_work_item_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!(
+                        "work-item cursor {after_work_item_id} in feature {feature_id}"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT * FROM work_items WHERE feature_id = ");
+        query.push_bind(feature_id.to_string());
+        if let Some(cursor) = cursor {
+            let priority: i64 = cursor.try_get("priority")?;
+            let created_at: String = cursor.try_get("created_at")?;
+            let work_item_id: String = cursor.try_get("work_item_id")?;
+            query
+                .push(" AND (priority < ")
+                .push_bind(priority)
+                .push(" OR (priority = ")
+                .push_bind(priority)
+                .push(" AND created_at > ")
+                .push_bind(created_at.clone())
+                .push(") OR (priority = ")
+                .push_bind(priority)
+                .push(" AND created_at = ")
+                .push_bind(created_at)
+                .push(" AND work_item_id > ")
+                .push_bind(work_item_id)
+                .push("))");
+        }
+        query
+            .push(" ORDER BY priority DESC, created_at, work_item_id LIMIT ")
+            .push_bind(i64::from(limit) + 1);
+        let rows = query.build().fetch_all(&mut *transaction).await?;
+        let has_more = rows.len() > usize::from(limit);
+        let page_rows = rows.iter().take(usize::from(limit)).collect::<Vec<_>>();
+        let mut dependencies = HashMap::<String, Vec<WorkItemId>>::new();
+        if !page_rows.is_empty() {
+            let mut dependency_query = QueryBuilder::<Sqlite>::new(
+                "SELECT work_item_id, dependency_work_item_id FROM work_item_dependencies WHERE work_item_id IN (",
+            );
+            let mut separated = dependency_query.separated(", ");
+            for row in &page_rows {
+                separated.push_bind(row.try_get::<String, _>("work_item_id")?);
+            }
+            separated.push_unseparated(") ORDER BY work_item_id, dependency_work_item_id");
+            for dependency_row in dependency_query
+                .build()
+                .fetch_all(&mut *transaction)
+                .await?
+            {
+                dependencies
+                    .entry(dependency_row.try_get("work_item_id")?)
+                    .or_default()
+                    .push(WorkItemId::parse(
+                        dependency_row.try_get("dependency_work_item_id")?,
+                    )?);
+            }
+        }
+        let items = page_rows
+            .into_iter()
+            .map(|row| {
+                let work_item_id: String = row.try_get("work_item_id")?;
+                work_item_from_row(row, dependencies.remove(&work_item_id).unwrap_or_default())
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        transaction.commit().await?;
+        Ok(WorkItemPage {
+            next_cursor: items.last().map(|item| item.work_item_id),
+            items,
+            has_more,
+        })
     }
 
     pub async fn update_work_item(&self, command: UpdateWorkItem) -> Result<WorkItem, StoreError> {
@@ -547,25 +625,6 @@ impl SqliteStore {
     }
 }
 
-async fn get_work_item_pool(
-    pool: &SqlitePool,
-    work_item_id: WorkItemId,
-) -> Result<WorkItem, StoreError> {
-    let row = sqlx::query("SELECT * FROM work_items WHERE work_item_id = ?")
-        .bind(work_item_id.to_string())
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound(format!("work item {work_item_id}")))?;
-    let dependency_rows = sqlx::query(
-        "SELECT dependency_work_item_id FROM work_item_dependencies
-         WHERE work_item_id = ? ORDER BY dependency_work_item_id",
-    )
-    .bind(work_item_id.to_string())
-    .fetch_all(pool)
-    .await?;
-    work_item_from_row(&row, &dependency_rows)
-}
-
 async fn get_work_item_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     work_item_id: WorkItemId,
@@ -582,12 +641,16 @@ async fn get_work_item_tx(
     .bind(work_item_id.to_string())
     .fetch_all(&mut **transaction)
     .await?;
-    work_item_from_row(&row, &dependency_rows)
+    let dependency_ids = dependency_rows
+        .iter()
+        .map(|row| Ok(WorkItemId::parse(row.try_get("dependency_work_item_id")?)?))
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    work_item_from_row(&row, dependency_ids)
 }
 
 fn work_item_from_row(
     row: &SqliteRow,
-    dependency_rows: &[SqliteRow],
+    dependency_ids: Vec<WorkItemId>,
 ) -> Result<WorkItem, StoreError> {
     let status: String = row.try_get("status")?;
     Ok(WorkItem {
@@ -604,10 +667,7 @@ fn work_item_from_row(
         )?,
         title: row.try_get("title")?,
         summary: row.try_get("summary")?,
-        dependency_ids: dependency_rows
-            .iter()
-            .map(|row| Ok(WorkItemId::parse(row.try_get("dependency_work_item_id")?)?))
-            .collect::<Result<Vec<_>, StoreError>>()?,
+        dependency_ids,
         priority: row.try_get::<i64, _>("priority")? as i16,
         status: status.parse().map_err(StoreError::Conflict)?,
         revision: row.try_get::<i64, _>("revision")? as u64,
@@ -673,7 +733,10 @@ fn ensure_editable_shape(item: &WorkItem) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn validate_status_transition(from: WorkItemStatus, to: WorkItemStatus) -> Result<(), StoreError> {
+pub(super) fn validate_status_transition(
+    from: WorkItemStatus,
+    to: WorkItemStatus,
+) -> Result<(), StoreError> {
     if from == to {
         return Ok(());
     }
@@ -761,6 +824,11 @@ async fn validate_work_item_relations(
     parent_id: Option<WorkItemId>,
     dependency_ids: &[WorkItemId],
 ) -> Result<(), StoreError> {
+    if dependency_ids.len() > MAX_WORK_ITEM_DEPENDENCIES {
+        return Err(StoreError::Conflict(format!(
+            "a work item may have at most {MAX_WORK_ITEM_DEPENDENCIES} dependencies"
+        )));
+    }
     let mut unique = BTreeSet::new();
     for id in dependency_ids {
         if !unique.insert(id.to_string()) {
@@ -771,7 +839,29 @@ async fn validate_work_item_relations(
                 "work item cannot depend on itself".to_owned(),
             ));
         }
-        ensure_item_feature(transaction, *id, feature_id).await?;
+    }
+    if !unique.is_empty() {
+        let mut query =
+            QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM work_items WHERE feature_id = ");
+        query
+            .push_bind(feature_id.to_string())
+            .push(" AND work_item_id IN (");
+        let mut separated = query.separated(", ");
+        for id in &unique {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        let count: i64 = query
+            .build_query_scalar()
+            .fetch_one(&mut **transaction)
+            .await?;
+        if count != unique.len() as i64 {
+            return Err(StoreError::NotFound(format!(
+                "one or more dependencies do not belong to feature {feature_id}"
+            )));
+        }
+    }
+    for id in dependency_ids {
         if let Some(item_id) = work_item_id {
             if dependency_reaches(transaction, *id, item_id).await? {
                 return Err(StoreError::Conflict(
@@ -889,14 +979,15 @@ async fn replace_dependencies(
         .bind(work_item_id.to_string())
         .execute(&mut **transaction)
         .await?;
-    for dependency_id in dependency_ids {
-        sqlx::query(
-            "INSERT INTO work_item_dependencies(work_item_id, dependency_work_item_id) VALUES (?, ?)",
-        )
-        .bind(work_item_id.to_string())
-        .bind(dependency_id.to_string())
-        .execute(&mut **transaction)
-        .await?;
+    if !dependency_ids.is_empty() {
+        let mut insert = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO work_item_dependencies(work_item_id, dependency_work_item_id) ",
+        );
+        insert.push_values(dependency_ids, |mut row, dependency_id| {
+            row.push_bind(work_item_id.to_string())
+                .push_bind(dependency_id.to_string());
+        });
+        insert.build().execute(&mut **transaction).await?;
     }
     Ok(())
 }

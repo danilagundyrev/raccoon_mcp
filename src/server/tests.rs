@@ -12,6 +12,20 @@ fn resource_template_schema_contains_dynamic_id_key() {
     let schema = id_schema("project_id");
     assert_eq!(schema["required"][0], "project_id");
     assert_eq!(schema["properties"]["project_id"]["format"], "uuid");
+    let templates = list_resource_templates();
+    let uris = templates
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|template| template["uriTemplate"].as_str())
+        .collect::<HashSet<_>>();
+    assert!(uris.contains("hub://feature/{feature_id}"));
+    assert!(uris.contains("hub://work-item/{work_item_id}"));
+    assert!(
+        !uris
+            .iter()
+            .any(|uri| uri.contains("message") || uri.contains("artifact"))
+    );
 }
 
 #[test]
@@ -227,11 +241,15 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
 #[tokio::test]
 async fn sessions_isolate_cancellation_and_cancel_long_waits() {
     let isolated_registry = SessionRegistry::default();
-    let first_session = isolated_registry.create(PROTOCOL_VERSION);
-    let second_session = isolated_registry.create(PROTOCOL_VERSION);
+    let first_session = isolated_registry.create(PROTOCOL_VERSION).unwrap();
+    let second_session = isolated_registry.create(PROTOCOL_VERSION).unwrap();
     let first_request = isolated_registry
         .begin_request(&first_session, PROTOCOL_VERSION, &json!(7))
         .unwrap();
+    assert!(matches!(
+        isolated_registry.begin_request(&first_session, PROTOCOL_VERSION, &json!(7)),
+        Err(SessionAccessError::DuplicateRequestId)
+    ));
     let second_request = isolated_registry
         .begin_request(&second_session, PROTOCOL_VERSION, &json!(7))
         .unwrap();
@@ -267,13 +285,25 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
     ));
 
     let bounded_registry = SessionRegistry::new(2, Duration::from_secs(3600));
-    let oldest = bounded_registry.create(PROTOCOL_VERSION);
-    bounded_registry.create(PROTOCOL_VERSION);
-    bounded_registry.create(PROTOCOL_VERSION);
+    let oldest = bounded_registry.create(PROTOCOL_VERSION).unwrap();
+    bounded_registry.create(PROTOCOL_VERSION).unwrap();
+    assert!(matches!(
+        bounded_registry.create(PROTOCOL_VERSION),
+        Err(SessionCreateError::CapacityExceeded)
+    ));
     assert_eq!(bounded_registry.len(), 2);
-    assert!(!bounded_registry.contains(&oldest));
-    let idle_registry = SessionRegistry::new(2, Duration::ZERO);
-    let idle = idle_registry.create(PROTOCOL_VERSION);
+    assert!(bounded_registry.contains(&oldest));
+
+    let idle_registry = SessionRegistry::new(2, Duration::from_millis(20));
+    let idle = idle_registry.create(PROTOCOL_VERSION).unwrap();
+    let active = idle_registry
+        .begin_request(&idle, PROTOCOL_VERSION, &json!(9))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(idle_registry.reap_idle(), 0);
+    drop(active);
+    assert_eq!(idle_registry.reap_idle(), 0);
+    tokio::time::sleep(Duration::from_millis(25)).await;
     assert_eq!(idle_registry.reap_idle(), 1);
     assert!(!idle_registry.contains(&idle));
 
@@ -455,6 +485,19 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
     .await
     .unwrap();
 
+    let duplicate_id = mcp_post(
+        State(state.clone()),
+        session_headers.clone(),
+        Bytes::from(json!({ "jsonrpc": "2.0", "id": "wait-1", "method": "ping" }).to_string()),
+    )
+    .await;
+    assert_eq!(duplicate_id.status(), StatusCode::CONFLICT);
+    assert!(
+        state
+            .sessions
+            .has_in_flight_request(&session_id, &json!("wait-1"))
+    );
+
     let cancel = mcp_post(
         State(state.clone()),
         session_headers.clone(),
@@ -486,7 +529,7 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
     assert_eq!(healthz().await.status(), StatusCode::OK);
     assert_eq!(readyz(State(state.clone())).await.status(), StatusCode::OK);
     assert_eq!(metrics(State(state.clone())).await.status(), StatusCode::OK);
-    let shutdown_session = state.sessions.create(PROTOCOL_VERSION);
+    let shutdown_session = state.sessions.create(PROTOCOL_VERSION).unwrap();
     prepare_shutdown(&store, &state.sessions).await.unwrap();
     assert!(!state.sessions.contains(&shutdown_session));
     assert_eq!(
@@ -524,6 +567,17 @@ fn event_wait_arguments_enforce_public_limits() {
 }
 
 #[test]
+fn inbox_kind_filter_is_bounded_and_typed() {
+    let schema = inbox_schema();
+    assert_eq!(schema["properties"]["kinds"]["maxItems"], 3);
+    let mut arguments = JsonMap::new();
+    arguments.insert("kinds".to_owned(), json!(["report", "command"]));
+    assert_eq!(optional_message_kinds(&arguments).unwrap().len(), 2);
+    arguments.insert("kinds".to_owned(), json!(["unknown"]));
+    assert!(optional_message_kinds(&arguments).is_err());
+}
+
+#[test]
 fn request_tools_expose_actor_scoping_and_payload_limits() {
     let ask = ask_repository_schema(2048, 65_536);
     assert_eq!(ask["properties"]["question_summary"]["maxLength"], 2048);
@@ -546,6 +600,10 @@ fn request_tools_expose_actor_scoping_and_payload_limits() {
         "fail_request",
     ] {
         assert!(names.contains(expected));
+    }
+    let publish = publish_message_schema(2048, 65_536);
+    for link in ["feature_id", "work_item_id", "request_id"] {
+        assert_eq!(publish["properties"][link]["format"], "uuid");
     }
 }
 
@@ -574,6 +632,60 @@ fn context_refs_runtime_validation_matches_mcp_schema() {
         arguments.insert("context_refs".to_owned(), invalid);
         assert!(validated_context_refs(&arguments).is_err());
     }
+
+    arguments.insert(
+        "context_refs".to_owned(),
+        Value::Array(vec![json!({}); MAX_CONTEXT_REFS + 1]),
+    );
+    assert!(validated_context_refs(&arguments).is_err());
+    assert_eq!(
+        ask_repository_schema(1024, 4096)["properties"]["context_refs"]["maxItems"],
+        MAX_CONTEXT_REFS
+    );
+}
+
+#[test]
+fn collection_cardinality_limits_match_runtime_and_schemas() {
+    let work_item_ids = (0..=MAX_WORK_ITEM_DEPENDENCIES)
+        .map(|_| Value::String(WorkItemId::new().to_string()))
+        .collect::<Vec<_>>();
+    let repository_ids = (0..=MAX_MESSAGE_RECIPIENTS)
+        .map(|_| Value::String(RepositoryId::new().to_string()))
+        .collect::<Vec<_>>();
+    let audit_items = (0..=MAX_AUDIT_WORK_ITEMS)
+        .map(|_| json!({ "work_item_id": WorkItemId::new() }))
+        .collect::<Vec<_>>();
+
+    let mut arguments = JsonMap::new();
+    arguments.insert("dependency_ids".to_owned(), Value::Array(work_item_ids));
+    assert!(optional_work_item_ids(&arguments, "dependency_ids").is_err());
+    arguments.insert(
+        "target_repository_ids".to_owned(),
+        Value::Array(repository_ids),
+    );
+    assert!(optional_repository_ids(&arguments).is_err());
+    arguments.insert("audit_work_items".to_owned(), Value::Array(audit_items));
+    assert!(optional_audit_work_items(&arguments).is_err());
+
+    assert_eq!(
+        create_work_item_schema(1024)["properties"]["dependency_ids"]["maxItems"],
+        MAX_WORK_ITEM_DEPENDENCIES
+    );
+    assert_eq!(
+        publish_message_schema(1024, 4096)["properties"]["target_repository_ids"]["maxItems"],
+        MAX_MESSAGE_RECIPIENTS
+    );
+    let worker = tool_definitions(1024, 4096)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "create_worker_run")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        worker["inputSchema"]["properties"]["audit_work_items"]["maxItems"],
+        MAX_AUDIT_WORK_ITEMS
+    );
 }
 
 #[test]
@@ -633,6 +745,13 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
     let create = create_work_item_schema(2048);
     assert_eq!(create["properties"]["dependency_ids"]["uniqueItems"], true);
     assert_eq!(create["properties"]["max_audit_iterations"]["maximum"], 10);
+    let list = list_work_items_schema();
+    assert_eq!(list["properties"]["limit"]["maximum"], 100);
+    assert_eq!(list["properties"]["after_work_item_id"]["format"], "uuid");
+    assert_eq!(
+        list_repositories_schema()["properties"]["presence_filter"]["enum"],
+        json!(["all", "online", "offline"])
+    );
 
     let mut audit_arguments = JsonMap::new();
     audit_arguments.insert(

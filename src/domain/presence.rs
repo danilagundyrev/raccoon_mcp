@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -9,6 +11,36 @@ pub enum PresenceStatus {
     Online,
     Offline,
     Disconnected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositoryPresenceFilter {
+    All,
+    Online,
+    Offline,
+}
+
+impl RepositoryPresenceFilter {
+    pub fn matches(self, online_instances: u64) -> bool {
+        match self {
+            Self::All => true,
+            Self::Online => online_instances > 0,
+            Self::Offline => online_instances == 0,
+        }
+    }
+}
+
+impl FromStr for RepositoryPresenceFilter {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "all" => Ok(Self::All),
+            "online" => Ok(Self::Online),
+            "offline" => Ok(Self::Offline),
+            _ => Err(format!("unknown repository presence filter '{value}'")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -41,6 +73,9 @@ pub struct ConnectResult {
     pub repository: Repository,
     pub instance: AgentInstance,
     pub repositories: Vec<RepositoryPresence>,
+    pub active_feature_count: u64,
+    pub pending_inbox_count: u64,
+    pub open_request_count: u64,
     pub warnings: Vec<String>,
     pub next_actions: Vec<String>,
 }

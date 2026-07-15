@@ -32,6 +32,12 @@ pub(super) enum SessionAccessError {
     NotFound,
     VersionMismatch { expected: String },
     InvalidRequestId,
+    DuplicateRequestId,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum SessionCreateError {
+    CapacityExceeded,
 }
 
 impl Default for SessionRegistry {
@@ -51,7 +57,7 @@ impl SessionRegistry {
         }
     }
 
-    pub(super) fn create(&self, protocol_version: &str) -> String {
+    pub(super) fn create(&self, protocol_version: &str) -> Result<String, SessionCreateError> {
         let now = Instant::now();
         let mut sessions = self
             .state
@@ -59,15 +65,8 @@ impl SessionRegistry {
             .lock()
             .expect("session registry mutex poisoned");
         reap_idle_locked(&mut sessions, self.state.idle_timeout, now);
-        while sessions.len() >= self.state.max_sessions {
-            let Some(oldest_id) = sessions
-                .iter()
-                .min_by_key(|(_, session)| session.last_activity)
-                .map(|(session_id, _)| session_id.clone())
-            else {
-                break;
-            };
-            cancel_session(sessions.remove(&oldest_id));
+        if sessions.len() >= self.state.max_sessions {
+            return Err(SessionCreateError::CapacityExceeded);
         }
         let session_id = Uuid::new_v4().to_string();
         sessions.insert(
@@ -78,7 +77,7 @@ impl SessionRegistry {
                 requests: HashMap::new(),
             },
         );
-        session_id
+        Ok(session_id)
     }
 
     pub(super) fn begin_request(
@@ -96,6 +95,9 @@ impl SessionRegistry {
             .expect("session registry mutex poisoned");
         let session = validated_session(&mut sessions, session_id, protocol_version)?;
         session.last_activity = Instant::now();
+        if session.requests.contains_key(&request_key) {
+            return Err(SessionAccessError::DuplicateRequestId);
+        }
         session
             .requests
             .insert(request_key.clone(), cancellation.clone());
@@ -242,6 +244,7 @@ impl Drop for InFlightRequest {
             .is_some_and(|current| Arc::ptr_eq(current, &self.cancellation))
         {
             session.requests.remove(&self.request_key);
+            session.last_activity = Instant::now();
         }
     }
 }

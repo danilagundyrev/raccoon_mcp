@@ -50,6 +50,9 @@ fn publish_command(
         artifact_kind: crate::domain::ArtifactKind::ImplementationReport,
         artifact_title: None,
         content_type: "text/markdown".to_owned(),
+        feature_id: None,
+        work_item_id: None,
+        request_id: None,
         thread_id: None,
         correlation_id: None,
         in_reply_to: None,
@@ -62,6 +65,60 @@ fn remove_database(path: &Path) {
     let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
     if let Some(parent) = path.parent() {
         let _ = fs::remove_dir(parent);
+    }
+}
+
+#[test]
+fn work_item_transition_matrix_is_exhaustive() {
+    let statuses = [
+        WorkItemStatus::Planned,
+        WorkItemStatus::Ready,
+        WorkItemStatus::Claimed,
+        WorkItemStatus::InProgress,
+        WorkItemStatus::Blocked,
+        WorkItemStatus::Completed,
+        WorkItemStatus::Failed,
+        WorkItemStatus::Cancelled,
+    ];
+    for from in statuses {
+        for to in statuses {
+            let expected = from == to
+                || matches!(
+                    (from, to),
+                    (
+                        WorkItemStatus::Planned,
+                        WorkItemStatus::Ready | WorkItemStatus::Cancelled
+                    ) | (WorkItemStatus::Ready, WorkItemStatus::Cancelled)
+                        | (
+                            WorkItemStatus::Claimed,
+                            WorkItemStatus::InProgress | WorkItemStatus::Cancelled
+                        )
+                        | (
+                            WorkItemStatus::InProgress,
+                            WorkItemStatus::Blocked
+                                | WorkItemStatus::Completed
+                                | WorkItemStatus::Failed
+                                | WorkItemStatus::Cancelled
+                        )
+                        | (
+                            WorkItemStatus::Blocked,
+                            WorkItemStatus::InProgress
+                                | WorkItemStatus::Failed
+                                | WorkItemStatus::Cancelled
+                        )
+                        | (
+                            WorkItemStatus::Failed,
+                            WorkItemStatus::Ready | WorkItemStatus::Cancelled
+                        )
+                );
+            assert_eq!(
+                super::work::validate_status_transition(from, to).is_ok(),
+                expected,
+                "unexpected transition result for {} -> {}",
+                from.as_str(),
+                to.as_str()
+            );
+        }
     }
 }
 
@@ -82,6 +139,9 @@ async fn connects_multiple_repositories_to_one_project() {
         backend.repository.repository_id,
         web.repository.repository_id
     );
+    assert_eq!(web.active_feature_count, 0);
+    assert_eq!(web.pending_inbox_count, 0);
+    assert_eq!(web.open_request_count, 0);
     let overview = store
         .project_overview(backend.project.project_id)
         .await
@@ -112,10 +172,31 @@ async fn disconnect_is_visible_in_presence() {
 
     assert_eq!(disconnected.status, PresenceStatus::Disconnected);
     let repositories = store
-        .list_repositories(connected.project.project_id)
+        .list_repositories(connected.project.project_id, RepositoryPresenceFilter::All)
         .await
         .unwrap();
     assert_eq!(repositories[0].online_instances, 0);
+    assert!(
+        store
+            .list_repositories(
+                connected.project.project_id,
+                RepositoryPresenceFilter::Online,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .list_repositories(
+                connected.project.project_id,
+                RepositoryPresenceFilter::Offline,
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 
     store.pool.close().await;
     remove_database(&path);
@@ -285,6 +366,66 @@ async fn concurrent_finish_transitions_cannot_overwrite_each_other() {
 }
 
 #[tokio::test]
+async fn expired_worker_run_cannot_complete_or_fail() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "expired-finish",
+            "backend",
+            "C:/expired/backend",
+        ))
+        .await
+        .unwrap();
+    let worker = store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: connected.instance.instance_id,
+            role: WorkerRole::Butler,
+            task_summary: "Expire before finishing".to_owned(),
+            context_refs: json!([]),
+            audit_work_items: Vec::new(),
+            addresses_audit_run_id: None,
+            work_item_id: None,
+        })
+        .await
+        .unwrap();
+    store
+        .activate_worker_run(worker.worker_run_id)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE worker_runs SET lease_expires_at = ? WHERE worker_run_id = ?")
+        .bind("2000-01-01T00:00:00.000000Z")
+        .bind(worker.worker_run_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .complete_worker_run(worker.worker_run_id, "too late")
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store
+            .fail_worker_run(worker.worker_run_id, "too late")
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    store.run_lease_maintenance().await.unwrap();
+    assert_eq!(
+        store
+            .get_worker_run(worker.worker_run_id)
+            .await
+            .unwrap()
+            .status,
+        WorkerRunStatus::Abandoned
+    );
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn direct_message_exposes_header_then_artifact_and_ack_is_idempotent() {
     let (store, path) = test_store(90).await;
     let backend = store
@@ -310,8 +451,18 @@ async fn direct_message_exposes_header_then_artifact_and_ack_is_idempotent() {
         .await
         .unwrap();
     assert_eq!(published.recipient_count, 1);
+    let web_snapshot = store
+        .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+        .await
+        .unwrap();
+    assert_eq!(web_snapshot.pending_inbox_count, 1);
     let web_inbox = store
-        .list_inbox(ActorRef::Orchestrator(web.instance.instance_id), None, 20)
+        .list_inbox(
+            ActorRef::Orchestrator(web.instance.instance_id),
+            None,
+            &[],
+            20,
+        )
         .await
         .unwrap();
     assert_eq!(web_inbox.items.len(), 1);
@@ -322,8 +473,36 @@ async fn direct_message_exposes_header_then_artifact_and_ack_is_idempotent() {
     assert!(
         store
             .list_inbox(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                None,
+                &[MessageKind::Announcement],
+                20,
+            )
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .list_inbox(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                None,
+                &[MessageKind::Report],
+                20,
+            )
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .list_inbox(
                 ActorRef::Orchestrator(android.instance.instance_id),
                 None,
+                &[],
                 20
             )
             .await
@@ -366,7 +545,12 @@ async fn direct_message_exposes_header_then_artifact_and_ack_is_idempotent() {
     assert_eq!(first_ack.delivery_id, second_ack.delivery_id);
     assert!(
         store
-            .list_inbox(ActorRef::Orchestrator(web.instance.instance_id), None, 20)
+            .list_inbox(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                None,
+                &[],
+                20
+            )
             .await
             .unwrap()
             .items
@@ -408,7 +592,12 @@ async fn broadcast_deliveries_are_acknowledged_independently() {
         .unwrap();
     assert!(
         store
-            .list_inbox(ActorRef::Orchestrator(web.instance.instance_id), None, 20)
+            .list_inbox(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                None,
+                &[],
+                20
+            )
             .await
             .unwrap()
             .items
@@ -419,6 +608,7 @@ async fn broadcast_deliveries_are_acknowledged_independently() {
             .list_inbox(
                 ActorRef::Orchestrator(backend.instance.instance_id),
                 None,
+                &[],
                 20
             )
             .await
@@ -540,7 +730,12 @@ async fn pending_inbox_survives_store_restart() {
         .await
         .unwrap();
     let inbox = reopened
-        .list_inbox(ActorRef::Orchestrator(web.instance.instance_id), None, 20)
+        .list_inbox(
+            ActorRef::Orchestrator(web.instance.instance_id),
+            None,
+            &[],
+            20,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -581,7 +776,14 @@ async fn concurrent_connects_to_new_project_do_not_lock_database() {
             .iter()
             .all(|result| result.project.project_id == project_id)
     );
-    assert_eq!(store.list_repositories(project_id).await.unwrap().len(), 20);
+    assert_eq!(
+        store
+            .list_repositories(project_id, RepositoryPresenceFilter::All)
+            .await
+            .unwrap()
+            .len(),
+        20
+    );
 
     store.pool.close().await;
     remove_database(&path);
@@ -714,7 +916,12 @@ async fn inbox_and_content_reads_do_not_renew_actor_lease() {
     let before = store.get_instance(web.instance.instance_id).await.unwrap();
 
     store
-        .list_inbox(ActorRef::Orchestrator(web.instance.instance_id), None, 20)
+        .list_inbox(
+            ActorRef::Orchestrator(web.instance.instance_id),
+            None,
+            &[],
+            20,
+        )
         .await
         .unwrap();
     store
@@ -848,6 +1055,9 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
             artifact_kind: crate::domain::ArtifactKind::AuditReport,
             artifact_title: None,
             content_type: "text/markdown".to_owned(),
+            feature_id: Some(feature.feature_id),
+            work_item_id: None,
+            request_id: None,
             thread_id: None,
             correlation_id: None,
             in_reply_to: None,
@@ -867,6 +1077,9 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
                 artifact_kind: crate::domain::ArtifactKind::AuditReport,
                 artifact_title: None,
                 content_type: "text/markdown".to_owned(),
+                feature_id: Some(feature.feature_id),
+                work_item_id: None,
+                request_id: None,
                 thread_id: None,
                 correlation_id: None,
                 in_reply_to: None,
@@ -976,6 +1189,104 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
                 context_refs: json!([]),
                 audit_work_items: audit_items(),
                 addresses_audit_run_id: None,
+                work_item_id: None,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn remediation_cannot_start_after_the_next_audit_iteration() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "late-remediation",
+            "backend",
+            "C:/audit/backend",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: connected.instance.instance_id,
+            title: "Audit sequence".to_owned(),
+            summary: "Reject late remediation".to_owned(),
+        })
+        .await
+        .unwrap();
+    let item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: "Completed item".to_owned(),
+            summary: "Auditable".to_owned(),
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 2,
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE work_items SET status = 'completed' WHERE work_item_id = ?")
+        .bind(item.work_item_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let audit_command = || CreateWorkerRun {
+        parent_instance_id: connected.instance.instance_id,
+        role: WorkerRole::Auditor,
+        task_summary: "Audit completed item".to_owned(),
+        context_refs: json!([]),
+        audit_work_items: vec![AuditWorkItemInput {
+            work_item_id: item.work_item_id,
+        }],
+        addresses_audit_run_id: None,
+        work_item_id: None,
+    };
+    let first = store.create_worker_run(audit_command()).await.unwrap();
+    store
+        .activate_worker_run(first.worker_run_id)
+        .await
+        .unwrap();
+    store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Worker(first.worker_run_id),
+            kind: MessageKind::Report,
+            target: MessageTarget::Broadcast,
+            summary: "No findings".to_owned(),
+            body: Some("Audit report".to_owned()),
+            artifact_kind: ArtifactKind::AuditReport,
+            artifact_title: None,
+            content_type: "text/markdown".to_owned(),
+            feature_id: Some(feature.feature_id),
+            work_item_id: Some(item.work_item_id),
+            request_id: None,
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap();
+    store
+        .complete_worker_run(first.worker_run_id, "Audited")
+        .await
+        .unwrap();
+    store.create_worker_run(audit_command()).await.unwrap();
+
+    assert!(matches!(
+        store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: connected.instance.instance_id,
+                role: WorkerRole::Executor,
+                task_summary: "Late remediation".to_owned(),
+                context_refs: json!([]),
+                audit_work_items: Vec::new(),
+                addresses_audit_run_id: Some(first.worker_run_id),
                 work_item_id: None,
             })
             .await,
@@ -1202,6 +1513,59 @@ async fn waiter_is_notified_after_message_commit() {
 }
 
 #[tokio::test]
+async fn dozens_of_long_poll_waiters_receive_one_committed_event() {
+    let (store, path) = test_store(90).await;
+    let sender = store
+        .connect_orchestrator(connect_command("wait-load", "backend", "C:/wait/backend"))
+        .await
+        .unwrap();
+    let receiver = store
+        .connect_orchestrator(connect_command("wait-load", "web", "C:/wait/web"))
+        .await
+        .unwrap();
+    let mut waiters = Vec::new();
+    for _ in 0..32 {
+        let waiting_store = store.clone();
+        let instance_id = receiver.instance.instance_id;
+        waiters.push(tokio::spawn(async move {
+            waiting_store
+                .wait_for_events(
+                    ActorRef::Orchestrator(instance_id),
+                    0,
+                    &[EventKind::MessageAvailable],
+                    Some(Duration::from_secs(3)),
+                    1,
+                )
+                .await
+        }));
+    }
+    tokio::task::yield_now().await;
+    store
+        .publish_message(publish_command(
+            ActorRef::Orchestrator(sender.instance.instance_id),
+            MessageTarget::Repositories(vec![receiver.repository.repository_id]),
+            "Wake all waiters",
+            None,
+        ))
+        .await
+        .unwrap();
+
+    for waiter in waiters {
+        let batch = tokio::time::timeout(Duration::from_secs(4), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.outcome, WaitOutcome::Events);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].kind, EventKind::MessageAvailable);
+    }
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn wait_timeout_preserves_cursor_and_renews_lease() {
     let (store, path) = test_store(1).await;
     let connected = store
@@ -1378,6 +1742,34 @@ async fn maintenance_reaps_expired_runtime_state_and_reports_metrics() {
             "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM worker_runs WHERE status = 'active' AND lease_expires_at > '2020-01-01'",
             "worker_runs_active_metrics_idx",
         ),
+        (
+            "EXPLAIN QUERY PLAN SELECT request_id FROM requests WHERE status = 'claimed' AND claimed_by_instance_id = 'instance' AND claim_expires_at > '2020-01-01'",
+            "requests_claimed_instance_idx",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT request_id FROM requests WHERE status = 'claimed' AND claimed_by_worker_run_id = 'worker' AND claim_expires_at > '2020-01-01'",
+            "requests_claimed_worker_idx",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT work_item_id FROM work_items WHERE status IN ('claimed', 'in_progress', 'blocked') AND assignee_instance_id = 'instance' AND claim_expires_at > '2020-01-01'",
+            "work_items_claim_owner_idx",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT message_id FROM messages WHERE artifact_id = 'artifact'",
+            "messages_artifact_idx",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT request_id FROM requests WHERE question_artifact_id = 'artifact'",
+            "requests_question_artifact_idx",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT artifact_id FROM artifacts WHERE producer_worker_run_id = 'worker' AND kind = 'implementation_report'",
+            "artifacts_producer_kind_idx",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT event_id FROM events WHERE recipient_repository_id = 'repository' AND kind = 'message_available' AND event_id > 0 ORDER BY event_id",
+            "events_repository_kind_cursor_idx",
+        ),
     ] {
         let plan_rows = sqlx::query(query).fetch_all(&store.pool).await.unwrap();
         let plan = plan_rows
@@ -1430,6 +1822,11 @@ async fn only_one_actor_can_claim_the_same_request() {
         })
         .await
         .unwrap();
+    let target_snapshot = store
+        .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+        .await
+        .unwrap();
+    assert_eq!(target_snapshot.open_request_count, 1);
 
     let (first, second) = tokio::join!(
         store.claim_request(
@@ -1573,11 +1970,13 @@ async fn answer_atomically_closes_request_and_delivers_artifact() {
         answered.message.correlation_id,
         Some(request.request_id.to_string())
     );
+    assert_eq!(answered.message.request_id, Some(request.request_id));
     assert_eq!(answered.artifact.unwrap().content, "# API contract");
     let inbox = store
         .list_inbox(
             ActorRef::Orchestrator(requester.instance.instance_id),
             None,
+            &[],
             20,
         )
         .await
@@ -1990,6 +2389,7 @@ async fn three_worker_runs_claim_and_answer_independent_requests() {
         .list_inbox(
             ActorRef::Orchestrator(requester.instance.instance_id),
             None,
+            &[],
             20,
         )
         .await
@@ -2049,6 +2449,11 @@ async fn work_graph_unlocks_dependency_and_links_worker_report() {
         .unwrap();
     assert_eq!(api.status, WorkItemStatus::Ready);
     assert_eq!(ui.status, WorkItemStatus::Planned);
+    let bootstrap = store
+        .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
+        .await
+        .unwrap();
+    assert_eq!(bootstrap.active_feature_count, 1);
 
     let claimed = store
         .claim_work_item(backend.instance.instance_id, api.work_item_id, api.revision)
@@ -2083,6 +2488,9 @@ async fn work_graph_unlocks_dependency_and_links_worker_report() {
             artifact_kind: crate::domain::ArtifactKind::ImplementationReport,
             artifact_title: None,
             content_type: "text/markdown".to_owned(),
+            feature_id: Some(feature.feature_id),
+            work_item_id: Some(api.work_item_id),
+            request_id: None,
             thread_id: None,
             correlation_id: None,
             in_reply_to: None,
@@ -2101,12 +2509,17 @@ async fn work_graph_unlocks_dependency_and_links_worker_report() {
             artifact_kind: crate::domain::ArtifactKind::ImplementationReport,
             artifact_title: None,
             content_type: "text/markdown".to_owned(),
+            feature_id: Some(feature.feature_id),
+            work_item_id: Some(api.work_item_id),
+            request_id: None,
             thread_id: None,
             correlation_id: Some(api.work_item_id.to_string()),
             in_reply_to: None,
         })
         .await
         .unwrap();
+    assert_eq!(report.message.feature_id, Some(feature.feature_id));
+    assert_eq!(report.message.work_item_id, Some(api.work_item_id));
     store
         .complete_worker_run(worker.worker_run_id, "API complete")
         .await
@@ -2319,6 +2732,128 @@ async fn work_item_claim_and_dependency_cycle_are_conflict_safe() {
         .unwrap();
     assert_eq!(taken_over.assignee_instance_id, Some(takeover_instance_id));
     assert_eq!(taken_over.status, WorkItemStatus::Claimed);
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn work_item_pages_are_bounded_and_reads_keep_revision_with_dependencies() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "consistent-work",
+            "backend",
+            "C:/work/backend",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: connected.instance.instance_id,
+            title: "Consistent reads".to_owned(),
+            summary: "Exercise paging and snapshots".to_owned(),
+        })
+        .await
+        .unwrap();
+    let mut created = Vec::new();
+    for priority in [3, 2, 1] {
+        created.push(
+            store
+                .create_work_item(CreateWorkItem {
+                    parent_instance_id: connected.instance.instance_id,
+                    feature_id: feature.feature_id,
+                    parent_work_item_id: None,
+                    owner_repository_id: connected.repository.repository_id,
+                    title: format!("Priority {priority}"),
+                    summary: "Paged item".to_owned(),
+                    dependency_ids: Vec::new(),
+                    priority,
+                    max_audit_iterations: 1,
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let first_page = store
+        .list_work_items(feature.feature_id, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(first_page.items.len(), 2);
+    assert!(first_page.has_more);
+    assert_eq!(first_page.items[0].priority, 3);
+    let second_page = store
+        .list_work_items(feature.feature_id, first_page.next_cursor, 2)
+        .await
+        .unwrap();
+    assert_eq!(second_page.items.len(), 1);
+    assert!(!second_page.has_more);
+    assert_eq!(second_page.items[0].work_item_id, created[2].work_item_id);
+
+    let dependency_one = created[0].work_item_id;
+    let dependency_two = created[1].work_item_id;
+    let observed = created[2].work_item_id;
+    sqlx::query("UPDATE work_items SET status = 'completed' WHERE work_item_id IN (?, ?)")
+        .bind(dependency_one.to_string())
+        .bind(dependency_two.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO work_item_dependencies(work_item_id, dependency_work_item_id) VALUES (?, ?)",
+    )
+    .bind(observed.to_string())
+    .bind(dependency_one.to_string())
+    .execute(&store.pool)
+    .await
+    .unwrap();
+
+    let writer_pool = store.pool.clone();
+    let writer = async move {
+        for revision in 2..=200_i64 {
+            let dependency = if revision % 2 == 0 {
+                dependency_two
+            } else {
+                dependency_one
+            };
+            let mut transaction = writer_pool.begin().await.unwrap();
+            sqlx::query("UPDATE work_items SET revision = ? WHERE work_item_id = ?")
+                .bind(revision)
+                .bind(observed.to_string())
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM work_item_dependencies WHERE work_item_id = ?")
+                .bind(observed.to_string())
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO work_item_dependencies(work_item_id, dependency_work_item_id) VALUES (?, ?)",
+            )
+            .bind(observed.to_string())
+            .bind(dependency.to_string())
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+            transaction.commit().await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    };
+    let reader_store = store.clone();
+    let reader = async move {
+        for _ in 0..400 {
+            let item = reader_store.get_work_item(observed).await.unwrap();
+            let expected = if item.revision % 2 == 0 {
+                dependency_two
+            } else {
+                dependency_one
+            };
+            assert_eq!(item.dependency_ids, vec![expected]);
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::join!(writer, reader);
 
     store.pool.close().await;
     remove_database(&path);

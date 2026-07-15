@@ -326,6 +326,7 @@ impl SqliteStore {
         if worker.status == target_status {
             return Ok(worker);
         }
+        let now = utc_now();
         let can_finish = match target_status {
             WorkerRunStatus::Completed => worker.status == WorkerRunStatus::Active,
             WorkerRunStatus::Failed => {
@@ -342,6 +343,9 @@ impl SqliteStore {
                 worker.status,
                 target_status.as_str(),
             ));
+        }
+        if worker.lease_expires_at.as_str() <= now.as_str() {
+            return Err(expired_worker_lease(worker_run_id));
         }
 
         if target_status == WorkerRunStatus::Completed {
@@ -369,13 +373,13 @@ impl SqliteStore {
             }
         }
 
-        let now = utc_now();
         let mut transaction = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE worker_runs
              SET status = ?, result_summary = ?, error_summary = ?,
                  last_heartbeat_at = ?, lease_expires_at = ?, finished_at = ?
              WHERE worker_run_id = ?
+               AND lease_expires_at > ?
                AND ((? = 'completed' AND status = 'active')
                     OR (? = 'failed' AND status IN ('created', 'active')))",
         )
@@ -386,6 +390,7 @@ impl SqliteStore {
         .bind(&now)
         .bind(&now)
         .bind(worker_run_id.to_string())
+        .bind(&now)
         .bind(target_status.as_str())
         .bind(target_status.as_str())
         .execute(&mut *transaction)
