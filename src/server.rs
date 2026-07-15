@@ -43,7 +43,7 @@ use session::{SessionAccessError, SessionCreateError, SessionRegistry};
 use validation::*;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
-const SERVER_NAME: &str = "agent-sync-mcp";
+const SERVER_NAME: &str = "raccoon-mcp";
 const SERVER_TITLE: &str = "Agent Coordination Hub";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 

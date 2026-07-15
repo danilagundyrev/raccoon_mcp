@@ -11,7 +11,7 @@ use crate::domain::{
 
 fn temp_database_path() -> PathBuf {
     std::env::temp_dir()
-        .join("agent-sync-mcp-tests")
+        .join("raccoon-mcp-tests")
         .join(format!("{}.sqlite3", Uuid::new_v4()))
 }
 

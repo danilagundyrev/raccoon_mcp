@@ -13,7 +13,7 @@ pub struct Args {
 
     #[arg(
         long,
-        default_value = ".agent-sync/hub.sqlite3",
+        default_value = ".raccoon-mcp/hub.sqlite3",
         help = "Path to the local SQLite database."
     )]
     pub database: PathBuf,
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn local_defaults_keep_optional_operations_disabled() {
-        let args = Args::try_parse_from(["agent-sync-mcp"]).unwrap();
+        let args = Args::try_parse_from(["raccoon-mcp"]).unwrap();
         assert!(!args.enable_metrics);
         assert_eq!(args.retention_interval_seconds, 0);
         assert_eq!(args.maintenance_interval_seconds, 30);

@@ -130,7 +130,7 @@ fn rpc_errors_expose_machine_readable_data_codes() {
 #[tokio::test]
 async fn protocol_rejects_batches_and_never_responds_to_notifications() {
     let path = std::env::temp_dir()
-        .join("agent-sync-mcp-server-tests")
+        .join("raccoon-mcp-server-tests")
         .join(format!("{}.sqlite3", uuid::Uuid::new_v4()));
     let store = SqliteStore::open(&path, 1, 90, 3600, 600, 3600)
         .await
@@ -308,7 +308,7 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
     assert!(!idle_registry.contains(&idle));
 
     let path = std::env::temp_dir()
-        .join("agent-sync-mcp-server-tests")
+        .join("raccoon-mcp-server-tests")
         .join(format!("{}.sqlite3", uuid::Uuid::new_v4()));
     let store = SqliteStore::open(&path, 1, 90, 3600, 600, 3600)
         .await

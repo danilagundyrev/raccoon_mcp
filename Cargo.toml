@@ -1,5 +1,5 @@
 [package]
-name = "agent-sync-mcp"
+name = "raccoon-mcp"
 version = "0.1.0"
 edition = "2024"
 
