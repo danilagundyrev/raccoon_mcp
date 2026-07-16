@@ -477,6 +477,76 @@ pub(super) fn canonical_repository_path(raw_path: &str) -> Result<String, RpcErr
         })
 }
 
+pub(super) fn validate_tool_argument_members(
+    tool_name: &str,
+    arguments: &JsonMap<String, Value>,
+    input_schema: &Value,
+) -> Result<(), RpcError> {
+    validate_object_members(tool_name, arguments, input_schema, "arguments")
+}
+
+fn validate_object_members(
+    tool_name: &str,
+    object: &JsonMap<String, Value>,
+    schema: &Value,
+    path: &str,
+) -> Result<(), RpcError> {
+    let properties = schema.get("properties").and_then(Value::as_object);
+    if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+        let mut allowed_arguments = properties
+            .into_iter()
+            .flat_map(|properties| properties.keys().cloned())
+            .collect::<Vec<_>>();
+        allowed_arguments.sort_unstable();
+        for field_name in object.keys() {
+            if !properties.is_some_and(|properties| properties.contains_key(field_name)) {
+                let argument_path = format!("{path}.{field_name}");
+                return Err(RpcError::new(-32602, "Invalid params").with_data(json!({
+                    "code": "unknown_argument",
+                    "message": format!(
+                        "tool '{tool_name}' does not declare argument '{argument_path}'"
+                    ),
+                    "tool_name": tool_name,
+                    "argument_path": argument_path,
+                    "allowed_arguments": allowed_arguments,
+                })));
+            }
+        }
+    }
+
+    let Some(properties) = properties else {
+        return Ok(());
+    };
+    for (field_name, value) in object {
+        let Some(property_schema) = properties.get(field_name) else {
+            continue;
+        };
+        let field_path = format!("{path}.{field_name}");
+        match value {
+            Value::Object(nested) => {
+                validate_object_members(tool_name, nested, property_schema, &field_path)?;
+            }
+            Value::Array(items) => {
+                let Some(item_schema) = property_schema.get("items") else {
+                    continue;
+                };
+                for (index, item) in items.iter().enumerate() {
+                    if let Value::Object(nested) = item {
+                        validate_object_members(
+                            tool_name,
+                            nested,
+                            item_schema,
+                            &format!("{field_path}[{index}]"),
+                        )?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn optional_arguments(
     params: &JsonMap<String, Value>,
 ) -> Result<JsonMap<String, Value>, RpcError> {
@@ -635,10 +705,23 @@ fn retry_after_seconds(retry_at: Option<&str>) -> Option<u64> {
 }
 
 pub(super) fn tool_result(payload: Value, is_error: bool) -> Value {
+    let text = if is_error {
+        let code = payload
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .unwrap_or("tool_error");
+        let message = payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("Tool call failed");
+        format!("Tool error [{code}]: {message}")
+    } else {
+        "Tool call succeeded; inspect structuredContent for the result.".to_owned()
+    };
     json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned()),
+            "text": text,
         }],
         "structuredContent": payload,
         "isError": is_error,

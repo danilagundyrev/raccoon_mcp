@@ -44,6 +44,135 @@ fn worker_schema_uses_configured_summary_limit() {
 }
 
 #[test]
+fn actor_scoped_schemas_keep_named_properties_without_top_level_composition() {
+    for schema in [
+        actor_entity_schema("request_id"),
+        inbox_schema(),
+        wait_for_events_schema(),
+        ask_repository_schema(1024, 4096),
+        answer_request_schema(1024, 4096),
+        fail_request_schema(1024),
+        publish_message_schema(1024, 4096),
+    ] {
+        assert_eq!(schema["properties"]["instance_id"]["format"], "uuid");
+        assert_eq!(schema["properties"]["worker_run_id"]["format"], "uuid");
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema.get("allOf").is_none());
+    }
+}
+
+#[test]
+fn actor_runtime_still_requires_exactly_one_identity() {
+    let mut arguments = JsonMap::new();
+    assert!(parse_actor(&arguments).is_err());
+    arguments.insert("instance_id".to_owned(), json!(InstanceId::new()));
+    assert!(matches!(
+        parse_actor(&arguments),
+        Ok(ActorRef::Orchestrator(_))
+    ));
+    arguments.insert("worker_run_id".to_owned(), json!(WorkerRunId::new()));
+    assert!(parse_actor(&arguments).is_err());
+}
+
+#[test]
+fn closed_tool_schemas_reject_unknown_members_recursively() {
+    let tools = tool_definitions(1024, 4096);
+    let answer_schema = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "answer_request")
+        .unwrap()
+        .get("inputSchema")
+        .unwrap();
+    let error = validate_tool_argument_members(
+        "answer_request",
+        json!({
+            "instance_id": InstanceId::new(),
+            "request_id": RequestId::new(),
+            "answer_summary": "Contract attached",
+            "artifact": { "kind": "answer", "content": "unexpected" }
+        })
+        .as_object()
+        .unwrap(),
+        answer_schema,
+    )
+    .unwrap_err();
+    assert_eq!(error.data.as_ref().unwrap()["code"], "unknown_argument");
+    assert_eq!(
+        error.data.as_ref().unwrap()["argument_path"],
+        "arguments.artifact"
+    );
+    assert_eq!(error.data.as_ref().unwrap()["tool_name"], "answer_request");
+
+    let worker_schema = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "create_worker_run")
+        .unwrap()
+        .get("inputSchema")
+        .unwrap();
+    let nested = validate_tool_argument_members(
+        "create_worker_run",
+        json!({
+            "instance_id": InstanceId::new(),
+            "role": "auditor",
+            "task_summary": "Audit",
+            "audit_work_items": [{
+                "work_item_id": WorkItemId::new(),
+                "unexpected": true
+            }]
+        })
+        .as_object()
+        .unwrap(),
+        worker_schema,
+    )
+    .unwrap_err();
+    assert_eq!(
+        nested.data.as_ref().unwrap()["argument_path"],
+        "arguments.audit_work_items[0].unexpected"
+    );
+
+    let connect_schema = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "connect_orchestrator")
+        .unwrap()
+        .get("inputSchema")
+        .unwrap();
+    assert!(
+        validate_tool_argument_members(
+            "connect_orchestrator",
+            json!({
+                "project_key": "project",
+                "repository_key": "backend",
+                "repository_path": "C:/project/backend",
+                "capabilities": { "custom": { "nested": true } }
+            })
+            .as_object()
+            .unwrap(),
+            connect_schema,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn tool_results_do_not_duplicate_structured_payload_in_text() {
+    let payload = json!({
+        "artifact_id": ArtifactId::new(),
+        "body": "unique-large-payload-marker"
+    });
+    let result = tool_result(payload.clone(), false);
+    assert_eq!(result["structuredContent"], payload);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains("unique-large-payload-marker"));
+    assert!(text.len() < 160);
+}
+
+#[test]
 fn event_wait_schema_has_explicit_unbounded_timeout_contract() {
     let schema = wait_for_events_schema();
     assert_eq!(schema["properties"]["limit"]["maximum"], 50);
@@ -125,6 +254,102 @@ fn rpc_errors_expose_machine_readable_data_codes() {
     let rpc_claim = store_rpc_error(claim_conflict);
     assert_eq!(rpc_claim.data.as_ref().unwrap()["code"], "claim_conflict");
     assert_eq!(rpc_claim.data.as_ref().unwrap()["retry_after_seconds"], 30);
+}
+
+#[tokio::test]
+async fn unknown_answer_argument_is_rejected_before_request_mutation() {
+    let path = std::env::temp_dir()
+        .join("raccoon-mcp-server-tests")
+        .join(format!("{}.sqlite3", uuid::Uuid::new_v4()));
+    let store = SqliteStore::open(&path, 1, 90, 3600, 600, 3600)
+        .await
+        .unwrap();
+    let requester = store
+        .connect_orchestrator(ConnectOrchestrator {
+            project_key: "unknown-argument-test".to_owned(),
+            project_display_name: None,
+            repository_key: "web".to_owned(),
+            repository_display_name: None,
+            canonical_path: "C:/unknown-argument-test/web".to_owned(),
+            instance_id: None,
+            capabilities: json!({}),
+        })
+        .await
+        .unwrap();
+    let target = store
+        .connect_orchestrator(ConnectOrchestrator {
+            project_key: "unknown-argument-test".to_owned(),
+            project_display_name: None,
+            repository_key: "backend".to_owned(),
+            repository_display_name: None,
+            canonical_path: "C:/unknown-argument-test/backend".to_owned(),
+            instance_id: None,
+            capabilities: json!({}),
+        })
+        .await
+        .unwrap();
+    let request = store
+        .ask_repository(AskRepository {
+            actor: ActorRef::Orchestrator(requester.instance.instance_id),
+            target_repository_id: target.repository.repository_id,
+            question_summary: "Return the contract".to_owned(),
+            body: None,
+            context_refs: json!([]),
+        })
+        .await
+        .unwrap();
+    store
+        .claim_request(
+            ActorRef::Orchestrator(target.instance.instance_id),
+            request.request_id,
+        )
+        .await
+        .unwrap();
+
+    let params = json!({
+        "name": "answer_request",
+        "arguments": {
+            "instance_id": target.instance.instance_id,
+            "request_id": request.request_id,
+            "answer_summary": "Contract attached",
+            "artifact": { "kind": "answer", "content": "unexpected" }
+        }
+    });
+    let error = dispatch(
+        &store,
+        1024,
+        4096,
+        "tools/call",
+        params.as_object().unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.data.as_ref().unwrap()["code"], "unknown_argument");
+
+    let unchanged = store
+        .read_request(
+            ActorRef::Orchestrator(target.instance.instance_id),
+            request.request_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(unchanged.status, crate::domain::RequestStatus::Claimed);
+    assert!(unchanged.answer_message_id.is_none());
+    let inbox = store
+        .list_inbox(
+            ActorRef::Orchestrator(requester.instance.instance_id),
+            None,
+            &[],
+            20,
+        )
+        .await
+        .unwrap();
+    assert!(inbox.items.is_empty());
+
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
 }
 
 #[tokio::test]
@@ -230,6 +455,16 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
     assert_eq!(
         guide_payload["protocol_behavior"]["notifications"],
         "accepted without a response body"
+    );
+    assert_eq!(guide_payload["collection_limits"]["event_page"], 50);
+    assert_eq!(guide_payload["collection_limits"]["event_kind_filters"], 12);
+    assert!(
+        guide_payload["work_flow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|step| step.contains("Higher numeric priority"))
     );
 
     drop(store);
@@ -745,6 +980,12 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
     let create = create_work_item_schema(2048);
     assert_eq!(create["properties"]["dependency_ids"]["uniqueItems"], true);
     assert_eq!(create["properties"]["max_audit_iterations"]["maximum"], 10);
+    assert!(
+        create["properties"]["priority"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Higher numeric values")
+    );
     let list = list_work_items_schema();
     assert_eq!(list["properties"]["limit"]["maximum"], 100);
     assert_eq!(list["properties"]["after_work_item_id"]["format"], "uuid");

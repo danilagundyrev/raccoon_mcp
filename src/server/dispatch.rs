@@ -68,6 +68,22 @@ pub(super) async fn call_tool(
 ) -> Result<Value, RpcError> {
     let tool_name = require_string(params, "name")?;
     let arguments = optional_arguments(params)?;
+    let definitions = tool_definitions(max_summary_bytes, max_artifact_bytes);
+    let input_schema = definitions
+        .as_array()
+        .and_then(|definitions| {
+            definitions
+                .iter()
+                .find(|definition| definition["name"].as_str() == Some(tool_name.as_str()))
+        })
+        .and_then(|definition| definition.get("inputSchema"))
+        .ok_or_else(|| {
+            RpcError::new(-32602, "Invalid params").with_data(machine_error_data(
+                "unknown_tool",
+                format!("Unknown tool: {tool_name}"),
+            ))
+        })?;
+    validate_tool_argument_members(&tool_name, &arguments, input_schema)?;
     let result = match tool_name.as_str() {
         "connect_orchestrator" => {
             let project_key =
@@ -558,9 +574,9 @@ pub(super) async fn call_tool(
         }
         _ => {
             return Err(
-                RpcError::new(-32602, "Invalid params").with_data(machine_error_data(
-                    "unknown_tool",
-                    format!("Unknown tool: {tool_name}"),
+                RpcError::new(-32603, "Internal error").with_data(machine_error_data(
+                    "tool_contract_mismatch",
+                    format!("Tool '{tool_name}' is published without a dispatcher"),
                 )),
             );
         }
@@ -594,7 +610,12 @@ pub(super) async fn read_resource(
                     "context_refs": MAX_CONTEXT_REFS,
                     "audit_work_items": MAX_AUDIT_WORK_ITEMS,
                     "work_item_dependencies": MAX_WORK_ITEM_DEPENDENCIES,
-                    "message_recipients": MAX_MESSAGE_RECIPIENTS
+                    "message_recipients": MAX_MESSAGE_RECIPIENTS,
+                    "event_page": 50,
+                    "event_kind_filters": 12,
+                    "inbox_page": 100,
+                    "inbox_kind_filters": 3,
+                    "work_item_page": 100
                 },
                 "summary_note": "Summary fields are compact UTF-8 indexes. Put full context in an artifact instead of enlarging every inbox/event payload.",
                 "protocol_behavior": {
@@ -614,6 +635,7 @@ pub(super) async fn read_resource(
                 ],
                 "work_flow": [
                     "Create a project feature and repository-owned work items; dependencies remain planned until all prerequisites complete.",
+                    "Higher numeric priority values are listed and claimed before lower values when other eligibility rules are equal.",
                     "Claim a ready item with expected_revision, then create an executor worker run linked by work_item_id.",
                     "The latest executor linked to the item publishes an implementation_report and completes its worker run.",
                     "Its assigned orchestrator then completes the item through update_work_item while the claim is still active.",

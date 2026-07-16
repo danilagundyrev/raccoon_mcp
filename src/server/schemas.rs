@@ -194,7 +194,7 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
         },
         {
             "name": "list_work_items",
-            "description": "List one bounded page of work items for a feature in priority order.",
+            "description": "List one bounded page of work items for a feature. Higher numeric priority values appear first.",
             "inputSchema": list_work_items_schema(),
             "annotations": mutation_annotations(true)
         },
@@ -397,7 +397,13 @@ pub(super) fn create_work_item_schema(max_summary_bytes: u16) -> Value {
                 "uniqueItems": true,
                 "items": { "type": "string", "format": "uuid" }
             },
-            "priority": { "type": "integer", "minimum": -32768, "maximum": 32767, "default": 0 },
+            "priority": {
+                "type": "integer",
+                "minimum": -32768,
+                "maximum": 32767,
+                "default": 0,
+                "description": "Higher numeric values are processed before lower values when other eligibility rules are equal."
+            },
             "max_audit_iterations": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
             "idempotency_key": idempotency_key_schema()
         },
@@ -428,7 +434,12 @@ pub(super) fn update_work_item_schema(max_summary_bytes: u16) -> Value {
                 "uniqueItems": true,
                 "items": { "type": "string", "format": "uuid" }
             },
-            "priority": { "type": "integer", "minimum": -32768, "maximum": 32767 },
+            "priority": {
+                "type": "integer",
+                "minimum": -32768,
+                "maximum": 32767,
+                "description": "Higher numeric values are processed before lower values when other eligibility rules are equal."
+            },
             "status": {
                 "type": "string",
                 "enum": ["planned", "ready", "claimed", "in_progress", "blocked", "completed", "failed", "cancelled"]
@@ -472,11 +483,19 @@ pub(super) fn actor_properties() -> JsonMap<String, Value> {
     let mut properties = JsonMap::new();
     properties.insert(
         "instance_id".to_owned(),
-        json!({ "type": "string", "format": "uuid" }),
+        json!({
+            "type": "string",
+            "format": "uuid",
+            "description": "Orchestrator actor identity. Provide exactly one of instance_id or worker_run_id."
+        }),
     );
     properties.insert(
         "worker_run_id".to_owned(),
-        json!({ "type": "string", "format": "uuid" }),
+        json!({
+            "type": "string",
+            "format": "uuid",
+            "description": "Worker actor identity. Provide exactly one of instance_id or worker_run_id."
+        }),
     );
     properties
 }
@@ -491,11 +510,7 @@ pub(super) fn actor_entity_schema(entity_field: &str) -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": properties,
-        "required": [entity_field],
-        "oneOf": [
-            { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
-            { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
-        ]
+        "required": [entity_field]
     })
 }
 
@@ -521,11 +536,7 @@ pub(super) fn inbox_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "properties": properties,
-        "oneOf": [
-            { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
-            { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
-        ]
+        "properties": properties
     })
 }
 
@@ -605,11 +616,7 @@ pub(super) fn wait_for_events_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "properties": properties,
-        "oneOf": [
-            { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
-            { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
-        ]
+        "properties": properties
     })
 }
 
@@ -640,11 +647,7 @@ pub(super) fn ask_repository_schema(max_summary_bytes: u16, max_artifact_bytes: 
         "type": "object",
         "additionalProperties": false,
         "properties": properties,
-        "required": ["target_repository_id", "question_summary"],
-        "oneOf": [
-            { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
-            { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
-        ]
+        "required": ["target_repository_id", "question_summary"]
     })
 }
 
@@ -670,11 +673,7 @@ pub(super) fn answer_request_schema(max_summary_bytes: u16, max_artifact_bytes: 
         "type": "object",
         "additionalProperties": false,
         "properties": properties,
-        "required": ["request_id", "answer_summary"],
-        "oneOf": [
-            { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
-            { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
-        ]
+        "required": ["request_id", "answer_summary"]
     })
 }
 
@@ -693,11 +692,7 @@ pub(super) fn fail_request_schema(max_summary_bytes: u16) -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": properties,
-        "required": ["request_id", "retryable", "summary"],
-        "oneOf": [
-            { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
-            { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
-        ]
+        "required": ["request_id", "retryable", "summary"]
     })
 }
 
@@ -717,7 +712,13 @@ pub(super) fn publish_message_schema(max_summary_bytes: u16, max_artifact_bytes:
             "kind".to_owned(),
             json!({ "type": "string", "enum": ["report", "announcement", "command"] }),
         ),
-        ("broadcast".to_owned(), json!({ "type": "boolean" })),
+        (
+            "broadcast".to_owned(),
+            json!({
+                "type": "boolean",
+                "description": "Set true for project-wide delivery. Provide exactly one of broadcast=true or target_repository_ids."
+            }),
+        ),
         (
             "target_repository_ids".to_owned(),
             json!({
@@ -725,7 +726,8 @@ pub(super) fn publish_message_schema(max_summary_bytes: u16, max_artifact_bytes:
                 "minItems": 1,
                 "maxItems": MAX_MESSAGE_RECIPIENTS,
                 "uniqueItems": true,
-                "items": { "type": "string", "format": "uuid" }
+                "items": { "type": "string", "format": "uuid" },
+                "description": "Direct recipients. Provide exactly one of target_repository_ids or broadcast=true."
             }),
         ),
         (
@@ -783,21 +785,7 @@ pub(super) fn publish_message_schema(max_summary_bytes: u16, max_artifact_bytes:
         "type": "object",
         "additionalProperties": false,
         "properties": properties,
-        "required": ["kind", "summary"],
-        "allOf": [
-            {
-                "oneOf": [
-                    { "required": ["instance_id"], "not": { "required": ["worker_run_id"] } },
-                    { "required": ["worker_run_id"], "not": { "required": ["instance_id"] } }
-                ]
-            },
-            {
-                "oneOf": [
-                    { "required": ["broadcast"], "properties": { "broadcast": { "const": true } }, "not": { "required": ["target_repository_ids"] } },
-                    { "required": ["target_repository_ids"], "not": { "required": ["broadcast"] } }
-                ]
-            }
-        ]
+        "required": ["kind", "summary"]
     })
 }
 
