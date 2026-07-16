@@ -770,19 +770,187 @@ Check that:
 5. `implementation_artifact_id` belongs to the linked executor and item.
 
 
-## Suggested orchestrator instruction
+## Recommended Codex skill
 
-An orchestrator prompt can include this compact operating contract:
+Keep the repository-level `AGENTS.md` routing rule small and move the operational workflow into a reusable Codex skill. This keeps the workflow out of every session unless MCP coordination is explicitly requested.
 
-```text
-First call connect_orchestrator and retain project_id, repository_id, and instance_id.
-Read hub://guide. Model work using features and work items. Before spawning an executor,
-claim its owner item, create a worker run, and pass worker_run_id to the child. Require
-activate_worker_run, an implementation_report, and complete_worker_run. Use
-expected_revision for every work-item mutation. Use ask_repository for cross-repository
-questions and wait_for_events with persistent next_cursor for waiting. Complete the item
-after implementation, then run the bounded max_audit_iterations audit/remediation cycle
-when it is useful.
+Install the skill as `%USERPROFILE%\.codex\skills\raccoon-mcp-collaboration\SKILL.md` on Windows, or under `$CODEX_HOME/skills/raccoon-mcp-collaboration/SKILL.md` when `CODEX_HOME` is configured.
+
+### Repository `AGENTS.md` block
+
+Replace the placeholders for each participating repository. Use the same project key and a distinct stable repository key.
+
+```xml
+<mcp_collaboration_mode>
+Use `raccoon-mcp` only when the user explicitly requests MCP coordination,
+cross-repository collaboration, tracked worker delegation, or continuation of an
+existing coordinated task. Otherwise work only inside this repository.
+
+When coordination is requested, use `$raccoon-mcp-collaboration` with:
+- project key: `<PROJECT_KEY>`;
+- repository key: `<REPOSITORY_KEY>`;
+- repository display name: `<REPOSITORY_DISPLAY_NAME>`;
+- repository path: the canonical absolute path of the current worktree;
+- repository scope: `<REPOSITORY_SCOPE>`;
+- known peers: `<OPTIONAL_PEER_KEYS_AND_SCOPES>`.
+
+The user's latest explicit instructions override this configuration.
+</mcp_collaboration_mode>
 ```
 
-The server provides identity, state, routing, and durable delivery. Planning, child spawning, code changes, and judgment about audit findings remain the orchestrator's responsibility.
+### `SKILL.md`
+
+Create `raccoon-mcp-collaboration/SKILL.md` with the following content:
+
+```markdown
+---
+name: raccoon-mcp-collaboration
+description: Coordinate durable multi-repository development through the raccoon-mcp server. Use only when the user explicitly requests MCP coordination, cross-repository collaboration, tracked executor/butler/auditor delegation, or continuation of an existing coordinated task. Covers orchestrator registration, feature and work-item state, worker runs, repository requests, messages, event waiting, leases, and bounded audit/remediation.
+---
+
+# Raccoon MCP Collaboration
+
+Read repository-specific project, repository, path, scope, and peer configuration from
+the active repository's `AGENTS.md`. Follow the user's latest explicit override.
+
+## Workflow
+
+1. Establish repository identity before doing coordinated work.
+   - First call `connect_orchestrator` with the configured project and repository keys,
+     the current absolute repository path, and useful capability metadata.
+   - For a fresh process, omit `instance_id`. Reuse a previously returned instance ID
+     only when intentionally reconnecting that same orchestrator instance.
+   - Retain `project_id`, `repository_id`, `instance_id`, peer repository IDs, and the
+     bootstrap counters returned by the server.
+   - Read `hub://guide` after connecting, especially when the server contract may have
+     changed since this file was written.
+
+2. Recover durable state before creating new coordination objects.
+   - Use `list_features` and bounded `list_work_items` pages to find existing work.
+   - Do not duplicate an existing feature, work item, worker run, request, or report just
+     because this is a new chat session.
+   - Use stable actor-scoped `idempotency_key` values for retryable creation calls.
+   - Check pending inbox headers with `list_inbox`; use `read_message` and `read_artifact`
+     only when the content is needed, then acknowledge processed deliveries with
+     `ack_message`.
+   - Resume event consumption from the last retained `next_cursor` when it is available.
+     If no cursor was retained, start from `0` and filter for relevant event kinds.
+
+3. Treat server work cards as the shared execution backlog.
+   - Represent the overall user-visible objective with `create_feature` and executable
+     units with `create_work_item`, using explicit owner repositories and dependency IDs.
+   - A work item is the normal unit of ownership and execution; do not invent a second
+     hidden queue outside the server unless the user explicitly designates a local plan.
+   - Respect dependency ordering. `planned` items are not executable until the server
+     moves them to `ready`.
+   - Before every `update_work_item` or claim mutation, obtain the current card and pass
+     its current `expected_revision`. On `revision_conflict`, reread, reapply the intended
+     change to current state, and retry only if the change is still valid.
+   - Claims are ownership locks, not completion markers. Use `claim_work_item` only for
+     ready work owned by this repository, and do not mutate another orchestrator's live
+     claimed item.
+
+4. Use tracked worker runs for delegated child-agent work.
+   - Before spawning a child agent, claim the owner work item when the run implements a
+     specific item, then call `create_worker_run` with role `executor` and that
+     `work_item_id`.
+   - `create_worker_run` records the run but does not spawn a process. Spawn the child
+     through the available agent runtime only after the server returns `worker_run_id`.
+   - Pass the child its `worker_run_id`, task, acceptance criteria, relevant feature and
+     work-item IDs, and compact `context_refs`.
+   - A child worker must never call `connect_orchestrator` or register itself as a new
+     repository. Its first coordination call is `activate_worker_run`.
+   - The child should call `heartbeat_worker_run` at natural checkpoints when it is not
+     using another lease-renewing operation.
+   - Before a linked executor completes, it must publish an `implementation_report`
+     artifact tied to the correct feature and work item, then call `complete_worker_run`.
+   - The parent rereads the work item and completes it through `update_work_item` with the
+     returned implementation artifact ID and current revision. A worker terminal state
+     alone does not finish the work item.
+
+5. Use durable requests for cross-repository questions.
+   - When progress depends on information from another repository, call `ask_repository`
+     so the question has an explicit target, state, owner, and answer.
+   - Include a compact question summary, full body when useful, and `context_refs` that
+     let the receiver identify the feature and work involved.
+   - The target repository may answer through its orchestrator or create a `butler`
+     worker run. The answering actor uses `read_request`, `claim_request`, and then
+     `answer_request`, `release_request_claim`, or `fail_request`.
+   - A blocked executor may remain active in `wait_for_events` and continue after
+     `request_answered`. Alternatively it may report the blocked state to its parent and
+     let the parent start a continuation worker after the answer arrives.
+
+6. Use messages and artifacts for durable reports, not as an implicit task queue.
+   - Use `publish_message` for reports, announcements, commands, API contracts, notes,
+     and replies that should be delivered to repository inboxes.
+   - Prefer typed `feature_id`, `work_item_id`, and `request_id` links. Use `thread_id`,
+     `in_reply_to`, and `correlation_id` when a multi-message conversation needs them.
+   - Keep message summaries compact and put detailed content in the artifact body.
+   - Every substantive implementation report should state the current feature, work
+     item, worker run, status, completed changes, verification, blockers, and expected
+     next owner repository.
+
+7. Consume repository events.
+   - Call `wait_for_events` with the actor ID, the last `next_cursor`, relevant event
+     filters, and a bounded page limit.
+   - Omit `timeout_seconds` when no server-side deadline is desired, but remember that
+     the MCP client has its own tool timeout and must be configured accordingly.
+   - An `outcome: "timeout"` response is a non-event. While the shared task is still
+     active and waiting is the correct action, call `wait_for_events` again with the same
+     returned cursor.
+   - Events are pointers, not payloads. Read the referenced message, request, worker run,
+     feature, or work item through its dedicated tool.
+   - Persist or clearly report the newest processed cursor before ending a session that
+     expects later continuation.
+
+8. Apply bounded audit/remediation when the task requires review.
+   - Audit only completed work items. One auditor run may cover one item or a coherent
+     batch of items.
+   - Create role `auditor`, pass `audit_work_items`, spawn the child, and require exactly
+     one `audit_report` artifact before `complete_worker_run`.
+   - If the report contains actionable findings, create at most the one remediation
+     executor linked by `addresses_audit_run_id` that the server permits.
+   - Start a later audit iteration only after the prior auditor and any remediation run
+     are completed, and never exceed each item's `max_audit_iterations`.
+   - Do not create an endless review loop for minor preferences. Stop when the configured
+     depth is exhausted or remaining findings do not justify another implementation run.
+
+9. Continue eligible repository-owned work.
+   - After completing the current item, inspect the feature backlog. If another ready,
+     in-scope item is clearly owned by this repository and remains part of the user's
+     requested objective, call `claim_work_item` and execute it unless the user constrained
+     the scope.
+   - When no eligible item is ready, wait for relevant dependency/events or report the
+     concrete human/runtime input required for progress.
+   - Multiple orchestrators may exist in one project. Claims and revisions, not an
+     assumption of a singleton orchestrator, determine mutation ownership.
+
+10. Finish coordination from durable state.
+    - Treat the requested shared task as complete only when its relevant work items are
+      in the intended terminal states, required implementation reports are linked,
+      required audits/remediation are finished, and no request necessary for completion
+      remains unresolved.
+    - Use work-item states, worker-run states, requests, and linked artifacts as the
+      completion source of truth.
+    - When this orchestrator is intentionally done and will not continue waiting, call
+      `disconnect_orchestrator`. Do not disconnect merely because a child worker is active
+      or a short client-side turn is ending.
+
+Operational rules:
+- Do not read or write the SQLite database directly; use MCP tools.
+- Do not invent IDs, reuse another actor's ID, or pass both `instance_id` and
+  `worker_run_id` to an actor-scoped tool.
+- Do not treat read-only calls as heartbeats. Use `heartbeat` for the orchestrator,
+  `heartbeat_worker_run` for a worker, or an active lease-renewing operation during long
+  work.
+- Do not attempt to revive an expired/abandoned worker run; create a replacement run and
+  preserve the causal link in its task context/report.
+- Actor-sensitive inbox, message, artifact, and request data must be read through tools,
+  not guessed from resources or another repository's output.
+- If the coordination server is unavailable or returns a state conflict that cannot be
+  safely resolved, report the blocker with the relevant IDs and error instead of
+  fabricating successful coordination.
+
+```
+
+The skill needs no scripts or bundled assets. `hub://guide` provides the live server-specific reference, while `SKILL.md` contains the stable operating procedure.
