@@ -17,6 +17,9 @@ pub enum EventKind {
     RequestAnswered,
     RequestFailed,
     FeatureCreated,
+    FeatureUpdated,
+    FeatureCompleted,
+    FeatureCancelled,
     WorkItemCreated,
     WorkItemUpdated,
 }
@@ -34,6 +37,9 @@ impl EventKind {
             Self::RequestAnswered => "request_answered",
             Self::RequestFailed => "request_failed",
             Self::FeatureCreated => "feature_created",
+            Self::FeatureUpdated => "feature_updated",
+            Self::FeatureCompleted => "feature_completed",
+            Self::FeatureCancelled => "feature_cancelled",
             Self::WorkItemCreated => "work_item_created",
             Self::WorkItemUpdated => "work_item_updated",
         }
@@ -55,6 +61,9 @@ impl FromStr for EventKind {
             "request_answered" => Ok(Self::RequestAnswered),
             "request_failed" => Ok(Self::RequestFailed),
             "feature_created" => Ok(Self::FeatureCreated),
+            "feature_updated" => Ok(Self::FeatureUpdated),
+            "feature_completed" => Ok(Self::FeatureCompleted),
+            "feature_cancelled" => Ok(Self::FeatureCancelled),
             "work_item_created" => Ok(Self::WorkItemCreated),
             "work_item_updated" => Ok(Self::WorkItemUpdated),
             _ => Err(format!("unknown event kind '{value}'")),
@@ -114,7 +123,7 @@ pub struct HubEvent {
 #[serde(rename_all = "snake_case")]
 pub enum WaitOutcome {
     Events,
-    Timeout,
+    Deadline,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -132,6 +141,7 @@ mod tests {
     #[test]
     fn parses_supported_event_kinds() {
         assert_eq!("message_available".parse(), Ok(EventKind::MessageAvailable));
+        assert_eq!("feature_completed".parse(), Ok(EventKind::FeatureCompleted));
         assert!("handoff".parse::<EventKind>().is_err());
     }
 }

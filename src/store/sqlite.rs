@@ -22,16 +22,16 @@ use tokio::{
 
 use crate::domain::{
     ActorRef, AgentInstance, AnswerRequest, AnswerRequestResult, Artifact, ArtifactId,
-    ArtifactKind, AskRepository, AuditScopeItem, ConnectOrchestrator, ConnectResult,
-    CoordinationRequest, CreateFeature, CreateWorkItem, CreateWorkerRun, DeliveryAck, EventBatch,
-    EventEntityType, EventKind, FailRequest, Feature, FeatureId, HubEvent, InboxItem, InboxPage,
-    InstanceId, LeaseMaintenanceReport, MAX_AUDIT_WORK_ITEMS, MAX_CONTEXT_REFS,
-    MAX_MESSAGE_RECIPIENTS, MAX_WORK_ITEM_DEPENDENCIES, Message, MessageId, MessageKind,
-    MessageTarget, OperationalMetrics, PresenceStatus, Project, ProjectId, ProjectOverview,
-    PublishMessage, PublishResult, Repository, RepositoryId, RepositoryPresence,
-    RepositoryPresenceFilter, RequestId, RequestStatus, RetentionReport, ThreadId, UpdateWorkItem,
-    WaitOutcome, WorkItem, WorkItemId, WorkItemPage, WorkItemStatus, WorkerRole, WorkerRun,
-    WorkerRunId, WorkerRunStatus,
+    ArtifactKind, AskRepository, AuditScopeItem, CancelFeature, CompleteFeature,
+    ConnectOrchestrator, ConnectResult, CoordinationRequest, CreateFeature, CreateWorkItem,
+    CreateWorkerRun, DeliveryAck, EventBatch, EventEntityType, EventKind, FailRequest, Feature,
+    FeatureId, FeatureStatus, HubEvent, InboxItem, InboxPage, InstanceId, LeaseMaintenanceReport,
+    MAX_AUDIT_WORK_ITEMS, MAX_CONTEXT_REFS, MAX_MESSAGE_RECIPIENTS, MAX_WORK_ITEM_DEPENDENCIES,
+    Message, MessageId, MessageKind, MessageTarget, OperationalMetrics, PresenceStatus, Project,
+    ProjectId, ProjectOverview, PublishMessage, PublishResult, Repository, RepositoryId,
+    RepositoryPresence, RepositoryPresenceFilter, RequestId, RequestStatus, RetentionReport,
+    ThreadId, UpdateWorkItem, WaitOutcome, WorkItem, WorkItemId, WorkItemPage, WorkItemStatus,
+    WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
 };
 
 use super::schema::{CREATE_SCHEMA, SCHEMA_VERSION};
@@ -56,6 +56,13 @@ pub enum StoreError {
         expected: u64,
         actual: u64,
         current: Box<WorkItem>,
+    },
+    #[error("feature {feature_id} revision conflict: expected {expected}, actual {actual}")]
+    FeatureRevisionConflict {
+        feature_id: FeatureId,
+        expected: u64,
+        actual: u64,
+        current: Box<Feature>,
     },
     #[error("claim conflict for {resource_type} {resource_id}: {message}")]
     ClaimConflict {
@@ -358,11 +365,8 @@ fn trace_resolved_actor(actor: &ResolvedActor) {
     );
 }
 
-async fn wait_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => sleep_until(deadline).await,
-        None => std::future::pending::<()>().await,
-    }
+async fn wait_until(deadline: Instant) {
+    sleep_until(deadline).await;
 }
 
 async fn repository_project_id(
@@ -528,6 +532,8 @@ fn publish_message_fingerprint(command: &PublishMessage) -> Result<String, Store
 fn ask_repository_fingerprint(command: &AskRepository) -> Result<String, StoreError> {
     payload_digest(&serde_json::json!({
         "target_repository_id": command.target_repository_id,
+        "feature_id": command.feature_id,
+        "work_item_id": command.work_item_id,
         "question_summary": command.question_summary,
         "body": command.body,
         "context_refs": command.context_refs,
@@ -1387,6 +1393,8 @@ fn request_from_row(row: &SqliteRow) -> Result<CoordinationRequest, StoreError> 
         project_id: ProjectId::parse(row.try_get("project_id")?)?,
         requester_repository_id: RepositoryId::parse(row.try_get("requester_repository_id")?)?,
         target_repository_id: RepositoryId::parse(row.try_get("target_repository_id")?)?,
+        feature_id: parse_optional_id(row.try_get("feature_id")?, FeatureId::parse)?,
+        work_item_id: parse_optional_id(row.try_get("work_item_id")?, WorkItemId::parse)?,
         created_by_instance_id: parse_optional_id(
             row.try_get("created_by_instance_id")?,
             InstanceId::parse,

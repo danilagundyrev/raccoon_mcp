@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    ActorRef, Artifact, ArtifactId, InstanceId, Message, MessageId, ProjectId, RepositoryId,
-    RequestId, WorkerRunId,
+    ActorRef, Artifact, ArtifactId, FeatureId, InstanceId, Message, MessageId, ProjectId,
+    RepositoryId, RequestId, WorkItemId, WorkerRunId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -35,6 +35,8 @@ impl FromStr for RequestStatus {
 pub struct AskRepository {
     pub actor: ActorRef,
     pub target_repository_id: RepositoryId,
+    pub feature_id: Option<FeatureId>,
+    pub work_item_id: Option<WorkItemId>,
     pub question_summary: String,
     pub body: Option<String>,
     pub context_refs: Value,
@@ -63,6 +65,8 @@ pub struct CoordinationRequest {
     pub project_id: ProjectId,
     pub requester_repository_id: RepositoryId,
     pub target_repository_id: RepositoryId,
+    pub feature_id: Option<FeatureId>,
+    pub work_item_id: Option<WorkItemId>,
     pub created_by_instance_id: Option<InstanceId>,
     pub created_by_worker_run_id: Option<WorkerRunId>,
     pub status: RequestStatus,

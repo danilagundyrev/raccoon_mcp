@@ -55,14 +55,43 @@ CREATE TABLE IF NOT EXISTS features (
     feature_id TEXT PRIMARY KEY NOT NULL,
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
     created_by_instance_id TEXT NOT NULL REFERENCES agent_instances(instance_id) ON DELETE RESTRICT,
+    coordinator_repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE RESTRICT,
     title TEXT NOT NULL,
     summary TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('active', 'completed', 'cancelled')),
+    revision INTEGER NOT NULL CHECK(revision >= 1),
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    cancelled_at TEXT,
+    CHECK(
+        (status = 'active' AND completed_at IS NULL AND cancelled_at IS NULL) OR
+        (status = 'completed' AND completed_at IS NOT NULL AND cancelled_at IS NULL) OR
+        (status = 'cancelled' AND completed_at IS NULL AND cancelled_at IS NOT NULL)
+    )
 );
 
 CREATE INDEX IF NOT EXISTS features_project_created_idx
     ON features(project_id, created_at);
+
+CREATE INDEX IF NOT EXISTS features_project_status_idx
+    ON features(project_id, status, created_at);
+
+CREATE TRIGGER IF NOT EXISTS features_actor_scope
+BEFORE INSERT ON features
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM repositories coordinator
+    JOIN agent_instances creator ON creator.instance_id = NEW.created_by_instance_id
+    JOIN repositories creator_repository
+      ON creator_repository.repository_id = creator.repository_id
+    WHERE coordinator.repository_id = NEW.coordinator_repository_id
+      AND coordinator.project_id = NEW.project_id
+      AND creator_repository.repository_id = coordinator.repository_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'feature creator and coordinator must be the same repository in the feature project');
+END;
 
 CREATE TABLE IF NOT EXISTS work_items (
     work_item_id TEXT PRIMARY KEY NOT NULL,
@@ -274,6 +303,8 @@ CREATE TABLE IF NOT EXISTS requests (
     target_repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
     created_by_instance_id TEXT REFERENCES agent_instances(instance_id) ON DELETE SET NULL,
     created_by_worker_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE SET NULL,
+    feature_id TEXT REFERENCES features(feature_id) ON DELETE RESTRICT,
+    work_item_id TEXT REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
     status TEXT NOT NULL CHECK(status IN ('pending', 'claimed', 'answered', 'failed')),
     question_summary TEXT NOT NULL,
     question_artifact_id TEXT REFERENCES artifacts(artifact_id) ON DELETE SET NULL,
@@ -313,9 +344,40 @@ CREATE INDEX IF NOT EXISTS requests_question_artifact_idx
     ON requests(question_artifact_id)
     WHERE question_artifact_id IS NOT NULL;
 
+CREATE INDEX IF NOT EXISTS requests_feature_status_idx
+    ON requests(feature_id, status, created_at)
+    WHERE feature_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS requests_work_item_idx
+    ON requests(work_item_id, created_at)
+    WHERE work_item_id IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS requests_open_metrics_idx
     ON requests(status, claim_expires_at)
     WHERE status IN ('pending', 'claimed');
+
+CREATE TRIGGER IF NOT EXISTS requests_feature_scope
+BEFORE INSERT ON requests
+WHEN NEW.feature_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM features
+    WHERE features.feature_id = NEW.feature_id
+      AND features.project_id = NEW.project_id
+      AND features.status = 'active'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'request feature must be active and belong to the request project');
+END;
+
+CREATE TRIGGER IF NOT EXISTS requests_work_item_scope
+BEFORE INSERT ON requests
+WHEN NEW.work_item_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM work_items
+    WHERE work_items.work_item_id = NEW.work_item_id
+      AND work_items.feature_id = NEW.feature_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'request work item must belong to the request feature');
+END;
 
 CREATE TABLE IF NOT EXISTS idempotency_records (
     actor_key TEXT NOT NULL,
@@ -342,6 +404,9 @@ CREATE TABLE IF NOT EXISTS events (
         'request_answered',
         'request_failed',
         'feature_created',
+        'feature_updated',
+        'feature_completed',
+        'feature_cancelled',
         'work_item_created',
         'work_item_updated'
     )),

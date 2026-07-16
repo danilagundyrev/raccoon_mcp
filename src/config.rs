@@ -76,6 +76,14 @@ pub struct Args {
 
     #[arg(
         long,
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u16).range(1..=65535),
+        help = "Maximum duration of one wait_for_events call in seconds."
+    )]
+    pub max_wait_seconds: u16,
+
+    #[arg(
+        long,
         default_value_t = 30,
         value_parser = clap::value_parser!(u16).range(1..=3600),
         help = "Interval between maintenance passes in seconds."
@@ -147,5 +155,6 @@ mod tests {
         assert_eq!(args.retention_interval_seconds, 0);
         assert_eq!(args.maintenance_interval_seconds, 30);
         assert_eq!(args.max_sessions, 128);
+        assert_eq!(args.max_wait_seconds, 60);
     }
 }

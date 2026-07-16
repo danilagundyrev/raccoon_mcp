@@ -107,12 +107,12 @@ Add the server to `%USERPROFILE%\.codex\config.toml` on Windows, or `~/.codex/co
 [mcp_servers.raccoon_mcp]
 url = "http://127.0.0.1:8765/mcp"
 enabled = true
-tool_timeout_sec = 65535
+tool_timeout_sec = 90
 ```
 
 Restart the MCP client after changing its configuration.
 
-The high `tool_timeout_sec` is important for `wait_for_events`. Omitting `timeout_seconds` removes the **server-side** deadline, but the MCP client can still cancel a long tool call using its own timeout.
+Keep `tool_timeout_sec` above the server's `--max-wait-seconds` value. Event waits are finite on both sides: the server defaults to a 60-second ceiling and the MCP client may still cancel sooner.
 
 The MCP client handles `initialize`, `Mcp-Session-Id`, protocol-version headers, and session deletion. Normal use does not require hand-written JSON-RPC or HTTP requests.
 
@@ -360,6 +360,8 @@ An executor asks another repository:
 {
   "worker_run_id": "<requester-worker-run-id>",
   "target_repository_id": "<target-repository-id>",
+  "feature_id": "<feature-id>",
+  "work_item_id": "<work-item-id>",
   "question_summary": "What response shape does the checkout UI need?",
   "body": "Please confirm fields, optional values, and error states.",
   "context_refs": [
@@ -533,6 +535,22 @@ The next audit iteration is allowed only after the prior auditor completed with 
 
 The server does not automatically start audit iterations. The orchestrator decides whether another iteration is useful.
 
+## Complete or cancel a feature
+
+The repository that created a feature is its coordinator. After durable work state is verified, that repository closes the feature using its current revision:
+
+```json
+{
+  "instance_id": "<coordinator-instance-id>",
+  "feature_id": "<feature-id>",
+  "expected_revision": 1
+}
+```
+
+`complete_feature` rejects unfinished work items, open linked repository requests, active linked executors, auditors, and remediation runs. `cancel_feature` rejects active claims, workers, and requests and atomically cancels remaining unclaimed `planned`, `ready`, or `failed` items. Both operations increment the feature revision and emit a terminal project-wide event.
+
+Peer repositories stop their wait loop when they receive `feature_completed` or `feature_cancelled` for the current feature. A repository that joins later reads the durable terminal status through `get_feature` or `list_features`; events are wake-up hints, not the source of truth. Every orchestrator calls `disconnect_orchestrator` before it exits. MCP session DELETE is transport cleanup, not the shared completion signal.
+
 ## Events and cursors
 
 `wait_for_events` is the primary waiting mechanism. It returns only events addressed to the actor's repository.
@@ -543,7 +561,7 @@ The server does not automatically start audit iterations. The orchestrator decid
   "cursor": 0,
   "kinds": ["message_available", "request_available", "work_item_updated"],
   "limit": 20,
-  "timeout_seconds": 300
+  "timeout_seconds": 30
 }
 ```
 
@@ -552,9 +570,10 @@ Rules:
 - `cursor` is the last processed event ID; use `0` initially;
 - persist `next_cursor` after every response;
 - `timeout_seconds: 0` performs a non-blocking check;
-- an explicit timeout ranges from 0 to 65535 seconds;
-- omitting `timeout_seconds` means no server-side deadline;
-- `outcome: "timeout"` is a normal result, not an error;
+- omitting `timeout_seconds` uses the configured `--max-wait-seconds` ceiling;
+- a value above that ceiling is clamped and reported in `effective_timeout_seconds`;
+- `outcome: "deadline"` is a normal empty result, not completion or an error;
+- each response reports `requested_timeout_seconds`, `effective_timeout_seconds`, and `elapsed_ms`;
 - when `has_more` is true, fetch the next page immediately using the new cursor.
 
 An event is a pointer, not the full object. Use `entity_type` and `entity_id` to call `read_message`, `read_request`, `get_worker_run`, `get_feature`, or `get_work_item`.
@@ -624,6 +643,8 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 | `create_feature` | Create a feature. |
 | `get_feature` | Read one feature. |
 | `list_features` | List project features. |
+| `complete_feature` | Complete a coordinator-owned feature after linked state is terminal. |
+| `cancel_feature` | Cancel a coordinator-owned feature and remaining unclaimed work. |
 | `create_work_item` | Create an item with dependencies and audit policy. |
 | `get_work_item` | Read a consistent item snapshot with dependencies. |
 | `list_work_items` | Read a bounded page of feature items. |
@@ -664,7 +685,7 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 | `read_message` | Read an accessible message envelope. |
 | `read_artifact` | Read accessible full artifact content. |
 | `ack_message` | Idempotently acknowledge a delivery. |
-| `wait_for_events` | Wait for repository events with cursor and optional timeout. |
+| `wait_for_events` | Wait for repository events within the configured finite ceiling. |
 
 ## Server configuration
 
@@ -686,6 +707,7 @@ cargo run -- --help
 | `--work-item-claim-lease-seconds` | `3600` | Work-item claim lease, 60–65535 seconds. |
 | `--max-summary-bytes` | `1024` | UTF-8 limit for compact title and summary fields, 128–65535. |
 | `--max-artifact-bytes` | `524288` | UTF-8 limit for one artifact body, 1024–1048576. |
+| `--max-wait-seconds` | `60` | Hard ceiling for one event wait, 1–65535 seconds. |
 | `--maintenance-interval-seconds` | `30` | Lease and session cleanup interval, 1–3600 seconds. |
 | `--retention-interval-seconds` | `0` | Retention interval; `0` disables retention. |
 | `--retention-seconds` | `604800` | Event/idempotency retention age when retention is enabled. |
@@ -716,7 +738,7 @@ cargo run --release -- `
 | `list_inbox` page | 100 |
 | `wait_for_events` page | 50 |
 | Audit depth per item | 1–10 |
-| Explicit `wait_for_events.timeout_seconds` | 0–65535 seconds |
+| Explicit `wait_for_events.timeout_seconds` | 0–configured `--max-wait-seconds` in the published schema |
 | `idempotency_key` | 1–128 bytes |
 | `correlation_id` | up to 128 bytes |
 
@@ -743,9 +765,9 @@ This server is intended for a trusted local environment:
 
 ### `wait_for_events` ended unexpectedly
 
-An `outcome: "timeout"` response is normal: repeat the call with `next_cursor`.
+An `outcome: "deadline"` response is normal: it means no matching event arrived during this finite call. Repeat with the unchanged `next_cursor` only while the feature is still active.
 
-If the MCP client cancelled the call, increase `tool_timeout_sec`. Omitting `timeout_seconds` removes only the server deadline; `65535` is the maximum explicit server timeout.
+If the MCP client cancels earlier than intended, keep its `tool_timeout_sec` above `--max-wait-seconds`. Omission uses the server ceiling; it never creates an unbounded wait.
 
 ### `revision_conflict`
 
@@ -893,9 +915,9 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
 7. Consume repository events.
    - Call `wait_for_events` with the actor ID, the last `next_cursor`, relevant event
      filters, and a bounded page limit.
-   - Omit `timeout_seconds` when no server-side deadline is desired, but remember that
-     the MCP client has its own tool timeout and must be configured accordingly.
-   - An `outcome: "timeout"` response is a non-event. While the shared task is still
+   - Omit `timeout_seconds` to use the server's configured finite ceiling. Values above
+     that ceiling are clamped; zero performs a non-blocking check.
+   - An `outcome: "deadline"` response is a non-event. While the shared task is still
      active and waiting is the correct action, call `wait_for_events` again with the same
      returned cursor.
    - Events are pointers, not payloads. Read the referenced message, request, worker run,
@@ -932,9 +954,17 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
       remains unresolved.
     - Use work-item states, worker-run states, requests, and linked artifacts as the
       completion source of truth.
+    - If this repository coordinates the feature, reread it and call `complete_feature`
+      with its current revision only after those checks pass. If the feature is being
+      abandoned, use `cancel_feature` only after active work and requests are resolved.
+    - If this repository is not the coordinator, stop waiting when `feature_completed`
+      or `feature_cancelled` names the current feature. A deadline alone is not a
+      completion signal.
     - When this orchestrator is intentionally done and will not continue waiting, call
       `disconnect_orchestrator`. Do not disconnect merely because a child worker is active
       or a short client-side turn is ending.
+    - MCP session DELETE is transport cleanup and does not replace the durable feature
+      terminal state or `disconnect_orchestrator`.
 
 Operational rules:
 - Do not read or write the SQLite database directly; use MCP tools.

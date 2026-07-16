@@ -1,6 +1,10 @@
 use super::*;
 
-pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) -> Value {
+pub(super) fn tool_definitions(
+    max_summary_bytes: u16,
+    max_artifact_bytes: u32,
+    max_wait_seconds: u16,
+) -> Value {
     json!([
         {
             "name": "connect_orchestrator",
@@ -181,6 +185,18 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
             "annotations": mutation_annotations(true)
         },
         {
+            "name": "complete_feature",
+            "description": "Complete an active feature after all linked work, repository requests and worker runs are terminal. Only its coordinator repository may close it.",
+            "inputSchema": feature_transition_schema(),
+            "annotations": mutation_annotations(false)
+        },
+        {
+            "name": "cancel_feature",
+            "description": "Cancel an active feature and its unclaimed work. Open requests, active workers or claimed work must be resolved first.",
+            "inputSchema": feature_transition_schema(),
+            "annotations": mutation_annotations(false)
+        },
+        {
             "name": "create_work_item",
             "description": "Create a repository-owned work item with dependencies and audit policy.",
             "inputSchema": create_work_item_schema(max_summary_bytes),
@@ -235,8 +251,8 @@ pub(super) fn tool_definitions(max_summary_bytes: u16, max_artifact_bytes: u32) 
         },
         {
             "name": "wait_for_events",
-            "description": "Wait for append-only events addressed to the actor's repository. The cursor is independent of inbox acknowledgement. An omitted timeout waits without a server-side deadline, and the active wait renews the actor lease.",
-            "inputSchema": wait_for_events_schema(),
+            "description": "Wait for append-only events addressed to the actor's repository. Every call is bounded by the server maximum; omission uses that maximum and zero performs a non-blocking check. The active wait renews the actor lease.",
+            "inputSchema": wait_for_events_schema(max_wait_seconds),
             "annotations": {
                 "readOnlyHint": false,
                 "destructiveHint": false,
@@ -377,6 +393,19 @@ pub(super) fn create_feature_schema(max_summary_bytes: u16) -> Value {
             "idempotency_key": idempotency_key_schema()
         },
         "required": ["instance_id", "title", "summary"]
+    })
+}
+
+pub(super) fn feature_transition_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "instance_id": { "type": "string", "format": "uuid" },
+            "feature_id": { "type": "string", "format": "uuid" },
+            "expected_revision": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["instance_id", "feature_id", "expected_revision"]
     })
 }
 
@@ -569,7 +598,7 @@ pub(super) fn list_repositories_schema() -> Value {
     })
 }
 
-pub(super) fn wait_for_events_schema() -> Value {
+pub(super) fn wait_for_events_schema(max_wait_seconds: u16) -> Value {
     let mut properties = actor_properties();
     properties.insert(
         "cursor".to_owned(),
@@ -579,7 +608,7 @@ pub(super) fn wait_for_events_schema() -> Value {
         "kinds".to_owned(),
         json!({
             "type": "array",
-            "maxItems": 12,
+            "maxItems": 15,
             "uniqueItems": true,
             "items": {
                 "type": "string",
@@ -594,6 +623,9 @@ pub(super) fn wait_for_events_schema() -> Value {
                     "request_answered",
                     "request_failed",
                     "feature_created",
+                    "feature_updated",
+                    "feature_completed",
+                    "feature_cancelled",
                     "work_item_created",
                     "work_item_updated"
                 ]
@@ -605,8 +637,8 @@ pub(super) fn wait_for_events_schema() -> Value {
         json!({
             "type": "integer",
             "minimum": 0,
-            "maximum": 65_535,
-            "description": "Omit for no server-side timeout; zero performs a non-blocking event check."
+            "maximum": max_wait_seconds,
+            "description": "Omission uses the server maximum; values above it are clamped by runtime validation, and zero performs a non-blocking event check."
         }),
     );
     properties.insert(
@@ -625,6 +657,18 @@ pub(super) fn ask_repository_schema(max_summary_bytes: u16, max_artifact_bytes: 
     properties.insert(
         "target_repository_id".to_owned(),
         json!({ "type": "string", "format": "uuid" }),
+    );
+    properties.insert(
+        "feature_id".to_owned(),
+        json!({ "type": "string", "format": "uuid" }),
+    );
+    properties.insert(
+        "work_item_id".to_owned(),
+        json!({
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional work-item scope. The server infers feature_id and rejects a conflicting explicit feature_id."
+        }),
     );
     properties.insert(
         "question_summary".to_owned(),

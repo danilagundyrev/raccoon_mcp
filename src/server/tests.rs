@@ -48,7 +48,7 @@ fn actor_scoped_schemas_keep_named_properties_without_top_level_composition() {
     for schema in [
         actor_entity_schema("request_id"),
         inbox_schema(),
-        wait_for_events_schema(),
+        wait_for_events_schema(60),
         ask_repository_schema(1024, 4096),
         answer_request_schema(1024, 4096),
         fail_request_schema(1024),
@@ -76,7 +76,7 @@ fn actor_runtime_still_requires_exactly_one_identity() {
 
 #[test]
 fn closed_tool_schemas_reject_unknown_members_recursively() {
-    let tools = tool_definitions(1024, 4096);
+    let tools = tool_definitions(1024, 4096, 60);
     let answer_schema = tools
         .as_array()
         .unwrap()
@@ -173,17 +173,20 @@ fn tool_results_do_not_duplicate_structured_payload_in_text() {
 }
 
 #[test]
-fn event_wait_schema_has_explicit_unbounded_timeout_contract() {
-    let schema = wait_for_events_schema();
+fn event_wait_schema_has_explicit_finite_timeout_contract() {
+    let schema = wait_for_events_schema(60);
     assert_eq!(schema["properties"]["limit"]["maximum"], 50);
-    assert_eq!(schema["properties"]["timeout_seconds"]["maximum"], 65_535);
+    assert_eq!(schema["properties"]["timeout_seconds"]["maximum"], 60);
     assert!(
         schema["properties"]["timeout_seconds"]
             .get("default")
             .is_none()
     );
+    assert_eq!(dispatch::effective_wait_seconds(None, 60), 60);
+    assert_eq!(dispatch::effective_wait_seconds(Some(600), 60), 60);
+    assert_eq!(dispatch::effective_wait_seconds(Some(0), 60), 0);
 
-    let tools = tool_definitions(1024, 524_288);
+    let tools = tool_definitions(1024, 524_288, 60);
     assert!(tools.as_array().unwrap().iter().any(|tool| {
         tool["name"] == "wait_for_events"
             && tool["annotations"]["readOnlyHint"] == Value::Bool(false)
@@ -191,9 +194,62 @@ fn event_wait_schema_has_explicit_unbounded_timeout_contract() {
     }));
 }
 
+#[tokio::test]
+async fn event_wait_reaches_the_configured_deadline_and_reports_clamping() {
+    let path = std::env::temp_dir()
+        .join("raccoon-mcp-server-tests")
+        .join(format!("{}.sqlite3", uuid::Uuid::new_v4()));
+    let store = SqliteStore::open(&path, 1, 90, 3600, 600, 3600)
+        .await
+        .unwrap();
+    let connected = store
+        .connect_orchestrator(ConnectOrchestrator {
+            project_key: "bounded-wait".to_owned(),
+            project_display_name: None,
+            repository_key: "backend".to_owned(),
+            repository_display_name: None,
+            canonical_path: "C:/bounded-wait/backend".to_owned(),
+            instance_id: None,
+            capabilities: json!({}),
+        })
+        .await
+        .unwrap();
+    let started_at = tokio::time::Instant::now();
+    let result = dispatch(
+        &store,
+        1024,
+        4096,
+        1,
+        "tools/call",
+        json!({
+            "name": "wait_for_events",
+            "arguments": {
+                "instance_id": connected.instance.instance_id,
+                "cursor": 0,
+                "timeout_seconds": 65_535
+            }
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let payload = &result["structuredContent"];
+    assert_eq!(payload["outcome"], "deadline");
+    assert_eq!(payload["requested_timeout_seconds"], 65_535);
+    assert_eq!(payload["effective_timeout_seconds"], 1);
+    assert!(payload["elapsed_ms"].as_u64().unwrap() >= 900);
+    assert!(started_at.elapsed() < Duration::from_secs(2));
+
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+}
+
 #[test]
 fn tool_annotations_match_lease_mutation_semantics() {
-    let tools = tool_definitions(1024, 524_288);
+    let tools = tool_definitions(1024, 524_288, 60);
     for name in [
         "heartbeat",
         "activate_worker_run",
@@ -254,6 +310,31 @@ fn rpc_errors_expose_machine_readable_data_codes() {
     let rpc_claim = store_rpc_error(claim_conflict);
     assert_eq!(rpc_claim.data.as_ref().unwrap()["code"], "claim_conflict");
     assert_eq!(rpc_claim.data.as_ref().unwrap()["retry_after_seconds"], 30);
+
+    let feature = crate::domain::Feature {
+        feature_id: FeatureId::new(),
+        project_id: ProjectId::new(),
+        created_by_instance_id: InstanceId::new(),
+        coordinator_repository_id: RepositoryId::new(),
+        title: "Feature".to_owned(),
+        summary: "Current state".to_owned(),
+        status: crate::domain::FeatureStatus::Completed,
+        revision: 2,
+        created_at: "2026-07-16T00:00:00Z".to_owned(),
+        updated_at: "2026-07-16T00:01:00Z".to_owned(),
+        completed_at: Some("2026-07-16T00:01:00Z".to_owned()),
+        cancelled_at: None,
+    };
+    let feature_conflict = StoreError::FeatureRevisionConflict {
+        feature_id: feature.feature_id,
+        expected: 1,
+        actual: 2,
+        current: Box::new(feature),
+    };
+    let feature_payload = store_error_payload(&feature_conflict);
+    assert_eq!(feature_payload["error"]["code"], "revision_conflict");
+    assert_eq!(feature_payload["error"]["resource_type"], "feature");
+    assert_eq!(feature_payload["error"]["current"]["revision"], 2);
 }
 
 #[tokio::test]
@@ -292,6 +373,8 @@ async fn unknown_answer_argument_is_rejected_before_request_mutation() {
         .ask_repository(AskRepository {
             actor: ActorRef::Orchestrator(requester.instance.instance_id),
             target_repository_id: target.repository.repository_id,
+            feature_id: None,
+            work_item_id: None,
             question_summary: "Return the contract".to_owned(),
             body: None,
             context_refs: json!([]),
@@ -319,6 +402,7 @@ async fn unknown_answer_argument_is_rejected_before_request_mutation() {
         &store,
         1024,
         4096,
+        60,
         "tools/call",
         params.as_object().unwrap(),
     )
@@ -365,6 +449,7 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
         &store,
         1024,
         524_288,
+        60,
         json!([{ "jsonrpc": "2.0", "id": 1, "method": "ping" }]),
         None,
     )
@@ -379,6 +464,7 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
         &store,
         1024,
         524_288,
+        60,
         json!({ "jsonrpc": "2.0", "method": "ping" }),
         None,
     )
@@ -390,6 +476,7 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
         &store,
         1024,
         524_288,
+        60,
         json!({ "jsonrpc": "2.0", "id": 2, "method": "ping", "params": [] }),
         None,
     )
@@ -404,6 +491,7 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
         &store,
         1024,
         524_288,
+        60,
         "initialize",
         &JsonMap::from_iter([
             ("protocolVersion".to_owned(), json!(PROTOCOL_VERSION)),
@@ -421,6 +509,7 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
             &store,
             1024,
             524_288,
+            60,
             "initialize",
             &JsonMap::from_iter([
                 ("protocolVersion".to_owned(), json!(PROTOCOL_VERSION)),
@@ -441,6 +530,7 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
         &store,
         1024,
         524_288,
+        60,
         "resources/read",
         &JsonMap::from_iter([("uri".to_owned(), json!("hub://guide"))]),
     )
@@ -457,7 +547,7 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
         "accepted without a response body"
     );
     assert_eq!(guide_payload["collection_limits"]["event_page"], 50);
-    assert_eq!(guide_payload["collection_limits"]["event_kind_filters"], 12);
+    assert_eq!(guide_payload["collection_limits"]["event_kind_filters"], 15);
     assert!(
         guide_payload["work_flow"]
             .as_array()
@@ -566,6 +656,7 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
         database_path: Arc::new(path.clone()),
         max_summary_bytes: 1024,
         max_artifact_bytes: 524_288,
+        max_wait_seconds: 60,
         sessions: SessionRegistry::default(),
         metrics_enabled: true,
     };
@@ -751,8 +842,40 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
     assert_eq!(cancelled_wait.status(), StatusCode::ACCEPTED);
     assert_eq!(cancelled_wait.headers()[CONTENT_LENGTH], "0");
 
+    let delete_wait_state = state.clone();
+    let delete_wait_headers = session_headers.clone();
+    let delete_wait = tokio::spawn(async move {
+        mcp_post(
+            State(delete_wait_state),
+            delete_wait_headers,
+            Bytes::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "wait-delete",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "wait_for_events",
+                        "arguments": { "instance_id": instance_id, "cursor": 0 }
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !state
+            .sessions
+            .has_in_flight_request(&session_id, &json!("wait-delete"))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let deleted = mcp_delete(State(state.clone()), session_headers.clone()).await;
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(delete_wait.await.unwrap().status(), StatusCode::ACCEPTED);
     let after_delete = mcp_post(
         State(state.clone()),
         session_headers,
@@ -765,7 +888,47 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
     assert_eq!(readyz(State(state.clone())).await.status(), StatusCode::OK);
     assert_eq!(metrics(State(state.clone())).await.status(), StatusCode::OK);
     let shutdown_session = state.sessions.create(PROTOCOL_VERSION).unwrap();
+    let mut shutdown_headers = HeaderMap::new();
+    shutdown_headers.insert(
+        "mcp-session-id",
+        axum::http::HeaderValue::from_str(&shutdown_session).unwrap(),
+    );
+    shutdown_headers.insert(
+        "mcp-protocol-version",
+        axum::http::HeaderValue::from_static(PROTOCOL_VERSION),
+    );
+    let shutdown_wait_state = state.clone();
+    let shutdown_wait = tokio::spawn(async move {
+        mcp_post(
+            State(shutdown_wait_state),
+            shutdown_headers,
+            Bytes::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "wait-shutdown",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "wait_for_events",
+                        "arguments": { "instance_id": instance_id, "cursor": 0 }
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !state
+            .sessions
+            .has_in_flight_request(&shutdown_session, &json!("wait-shutdown"))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     prepare_shutdown(&store, &state.sessions).await.unwrap();
+    assert_eq!(shutdown_wait.await.unwrap().status(), StatusCode::ACCEPTED);
     assert!(!state.sessions.contains(&shutdown_session));
     assert_eq!(
         store
@@ -818,7 +981,7 @@ fn request_tools_expose_actor_scoping_and_payload_limits() {
     assert_eq!(ask["properties"]["question_summary"]["maxLength"], 2048);
     assert_eq!(ask["properties"]["body"]["maxLength"], 65_536);
 
-    let tools = tool_definitions(2048, 65_536);
+    let tools = tool_definitions(2048, 65_536, 60);
     let names = tools
         .as_array()
         .unwrap()
@@ -835,6 +998,9 @@ fn request_tools_expose_actor_scoping_and_payload_limits() {
         "fail_request",
     ] {
         assert!(names.contains(expected));
+    }
+    for link in ["feature_id", "work_item_id"] {
+        assert_eq!(ask["properties"][link]["format"], "uuid");
     }
     let publish = publish_message_schema(2048, 65_536);
     for link in ["feature_id", "work_item_id", "request_id"] {
@@ -910,7 +1076,7 @@ fn collection_cardinality_limits_match_runtime_and_schemas() {
         publish_message_schema(1024, 4096)["properties"]["target_repository_ids"]["maxItems"],
         MAX_MESSAGE_RECIPIENTS
     );
-    let worker = tool_definitions(1024, 4096)
+    let worker = tool_definitions(1024, 4096, 60)
         .as_array()
         .unwrap()
         .iter()
@@ -949,7 +1115,7 @@ fn idempotency_key_runtime_validation_matches_creation_schemas() {
 
 #[test]
 fn work_graph_tools_publish_revision_and_dependency_contracts() {
-    let tools = tool_definitions(2048, 65_536);
+    let tools = tool_definitions(2048, 65_536, 60);
     let names = tools
         .as_array()
         .unwrap()
@@ -960,6 +1126,8 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
         "create_feature",
         "get_feature",
         "list_features",
+        "complete_feature",
+        "cancel_feature",
         "create_work_item",
         "get_work_item",
         "list_work_items",

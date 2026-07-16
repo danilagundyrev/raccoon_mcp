@@ -6,7 +6,7 @@ impl SqliteStore {
         actor_ref: ActorRef,
         cursor: i64,
         kinds: &[EventKind],
-        timeout: Option<Duration>,
+        timeout: Duration,
         limit: u8,
     ) -> Result<EventBatch, StoreError> {
         if cursor < 0 {
@@ -37,7 +37,7 @@ impl SqliteStore {
         let heartbeat_every =
             Duration::from_secs((lease_seconds.min(renewal_seconds) / 3).max(1) as u64);
         let mut heartbeat = interval_at(Instant::now() + heartbeat_every, heartbeat_every);
-        let deadline = timeout.map(|duration| Instant::now() + duration);
+        let deadline = Instant::now() + timeout;
 
         loop {
             // Register before querying so a commit between the query and await cannot be missed.
@@ -64,7 +64,7 @@ impl SqliteStore {
                 }
                 _ = wait_until(deadline) => {
                     return Ok(EventBatch {
-                        outcome: WaitOutcome::Timeout,
+                        outcome: WaitOutcome::Deadline,
                         events: Vec::new(),
                         next_cursor: cursor,
                         has_more: false,

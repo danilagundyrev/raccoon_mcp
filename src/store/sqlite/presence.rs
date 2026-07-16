@@ -47,11 +47,7 @@ impl SqliteStore {
         let bootstrap = sqlx::query(
             "SELECT
                 (SELECT COUNT(*) FROM features f
-                 WHERE f.project_id = ? AND EXISTS (
-                     SELECT 1 FROM work_items w
-                     WHERE w.feature_id = f.feature_id
-                       AND w.status NOT IN ('completed', 'cancelled')
-                 )) AS active_feature_count,
+                 WHERE f.project_id = ? AND f.status = 'active') AS active_feature_count,
                 (SELECT COUNT(*) FROM deliveries
                  WHERE recipient_repository_id = ? AND status = 'pending') AS pending_inbox_count,
                 (SELECT COUNT(*) FROM requests

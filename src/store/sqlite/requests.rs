@@ -47,6 +47,13 @@ impl SqliteStore {
                 "request target must differ from the requester repository".to_owned(),
             ));
         }
+        let (feature_id, work_item_id) = resolve_request_scope(
+            &mut transaction,
+            actor.project_id,
+            command.feature_id,
+            command.work_item_id,
+        )
+        .await?;
         let context_refs_json = serde_json::to_string(&command.context_refs)?;
         let request_id = RequestId::new();
         let question_artifact = command.body.map(|content| Artifact {
@@ -68,11 +75,11 @@ impl SqliteStore {
         sqlx::query(
             "INSERT INTO requests(
                  request_id, project_id, requester_repository_id, target_repository_id,
-                 created_by_instance_id, created_by_worker_run_id, status, question_summary,
-                 question_artifact_id, context_refs_json, claimed_by_instance_id,
+                 created_by_instance_id, created_by_worker_run_id, feature_id, work_item_id,
+                 status, question_summary, question_artifact_id, context_refs_json, claimed_by_instance_id,
                  claimed_by_worker_run_id, claim_expires_at, failure_summary, failure_retryable,
                  answer_message_id, created_at, updated_at, finished_at
-             ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL)",
         )
         .bind(request_id.to_string())
         .bind(actor.project_id.to_string())
@@ -80,6 +87,8 @@ impl SqliteStore {
         .bind(command.target_repository_id.to_string())
         .bind(actor.instance_id.map(|id| id.to_string()))
         .bind(actor.worker_run_id.map(|id| id.to_string()))
+        .bind(feature_id.map(|id| id.to_string()))
+        .bind(work_item_id.map(|id| id.to_string()))
         .bind(command.question_summary)
         .bind(question_artifact.as_ref().map(|artifact| artifact.artifact_id.to_string()))
         .bind(context_refs_json)
@@ -333,8 +342,8 @@ impl SqliteStore {
             sender_instance_id: actor.instance_id,
             sender_worker_run_id: actor.worker_run_id,
             kind: MessageKind::Report,
-            feature_id: None,
-            work_item_id: None,
+            feature_id: request.feature_id,
+            work_item_id: request.work_item_id,
             request_id: Some(command.request_id),
             thread_id: ThreadId::new(),
             correlation_id: Some(command.request_id.to_string()),
@@ -467,4 +476,65 @@ impl SqliteStore {
         self.notifications.notify(recipient);
         self.get_request(command.request_id).await
     }
+}
+
+async fn resolve_request_scope(
+    transaction: &mut Transaction<'_, Sqlite>,
+    project_id: ProjectId,
+    requested_feature_id: Option<FeatureId>,
+    work_item_id: Option<WorkItemId>,
+) -> Result<(Option<FeatureId>, Option<WorkItemId>), StoreError> {
+    let feature_id = if let Some(work_item_id) = work_item_id {
+        let row = sqlx::query(
+            "SELECT wi.feature_id, f.project_id, f.status
+             FROM work_items wi
+             JOIN features f ON f.feature_id = wi.feature_id
+             WHERE wi.work_item_id = ?",
+        )
+        .bind(work_item_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("work item {work_item_id}")))?;
+        let actual_project_id = ProjectId::parse(row.try_get("project_id")?)?;
+        if actual_project_id != project_id {
+            return Err(StoreError::NotFound(format!(
+                "work item {work_item_id} in actor project"
+            )));
+        }
+        let work_feature_id = FeatureId::parse(row.try_get("feature_id")?)?;
+        if requested_feature_id.is_some_and(|feature_id| feature_id != work_feature_id) {
+            return Err(StoreError::Conflict(format!(
+                "work item {work_item_id} does not belong to the requested feature"
+            )));
+        }
+        let status: String = row.try_get("status")?;
+        if status != FeatureStatus::Active.as_str() {
+            return Err(StoreError::Conflict(format!(
+                "feature {work_feature_id} is '{status}', expected 'active'"
+            )));
+        }
+        Some(work_feature_id)
+    } else if let Some(feature_id) = requested_feature_id {
+        let row = sqlx::query("SELECT project_id, status FROM features WHERE feature_id = ?")
+            .bind(feature_id.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("feature {feature_id}")))?;
+        let actual_project_id = ProjectId::parse(row.try_get("project_id")?)?;
+        if actual_project_id != project_id {
+            return Err(StoreError::NotFound(format!(
+                "feature {feature_id} in actor project"
+            )));
+        }
+        let status: String = row.try_get("status")?;
+        if status != FeatureStatus::Active.as_str() {
+            return Err(StoreError::Conflict(format!(
+                "feature {feature_id} is '{status}', expected 'active'"
+            )));
+        }
+        Some(feature_id)
+    } else {
+        None
+    };
+    Ok((feature_id, work_item_id))
 }

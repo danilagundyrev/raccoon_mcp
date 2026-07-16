@@ -11,15 +11,65 @@ pub struct CreateFeature {
     pub summary: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeatureStatus {
+    Active,
+    Completed,
+    Cancelled,
+}
+
+impl FeatureStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl FromStr for FeatureStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "active" => Ok(Self::Active),
+            "completed" => Ok(Self::Completed),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(format!("unknown feature status '{value}'")),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CompleteFeature {
+    pub parent_instance_id: InstanceId,
+    pub feature_id: FeatureId,
+    pub expected_revision: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CancelFeature {
+    pub parent_instance_id: InstanceId,
+    pub feature_id: FeatureId,
+    pub expected_revision: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Feature {
     pub feature_id: FeatureId,
     pub project_id: ProjectId,
     pub created_by_instance_id: InstanceId,
+    pub coordinator_repository_id: RepositoryId,
     pub title: String,
     pub summary: String,
+    pub status: FeatureStatus,
+    pub revision: u64,
     pub created_at: String,
     pub updated_at: String,
+    pub completed_at: Option<String>,
+    pub cancelled_at: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -133,5 +183,12 @@ mod tests {
     fn parses_work_item_statuses() {
         assert_eq!("in_progress".parse(), Ok(WorkItemStatus::InProgress));
         assert!("open".parse::<WorkItemStatus>().is_err());
+    }
+
+    #[test]
+    fn parses_feature_statuses() {
+        assert_eq!("active".parse(), Ok(FeatureStatus::Active));
+        assert_eq!("completed".parse(), Ok(FeatureStatus::Completed));
+        assert!("open".parse::<FeatureStatus>().is_err());
     }
 }

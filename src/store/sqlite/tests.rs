@@ -1,12 +1,12 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Duration};
 
 use serde_json::json;
 use uuid::Uuid;
 
 use super::*;
 use crate::domain::{
-    AnswerRequest, AskRepository, AuditWorkItemInput, FailRequest, RequestStatus, WorkItemId,
-    WorkerRole,
+    AnswerRequest, AskRepository, AuditWorkItemInput, CancelFeature, CompleteFeature, FailRequest,
+    FeatureStatus, RequestStatus, WorkItemId, WorkerRole,
 };
 
 fn temp_database_path() -> PathBuf {
@@ -159,6 +159,352 @@ async fn connects_multiple_repositories_to_one_project() {
 }
 
 #[tokio::test]
+async fn feature_completion_is_revisioned_coordinator_owned_and_waits_for_linked_requests() {
+    let (store, path) = test_store(90).await;
+    let backend = store
+        .connect_orchestrator(connect_command(
+            "feature-lifecycle",
+            "backend",
+            "C:/feature/backend",
+        ))
+        .await
+        .unwrap();
+    let android = store
+        .connect_orchestrator(connect_command(
+            "feature-lifecycle",
+            "android",
+            "C:/feature/android",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: backend.instance.instance_id,
+            title: "Lifecycle".to_owned(),
+            summary: "Verify completion".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(feature.status, FeatureStatus::Active);
+    assert_eq!(feature.revision, 1);
+    assert_eq!(
+        feature.coordinator_repository_id,
+        backend.repository.repository_id
+    );
+
+    let request = store
+        .ask_repository(AskRepository {
+            actor: ActorRef::Orchestrator(backend.instance.instance_id),
+            target_repository_id: android.repository.repository_id,
+            feature_id: Some(feature.feature_id),
+            work_item_id: None,
+            question_summary: "Confirm Android scope".to_owned(),
+            body: None,
+            context_refs: json!([]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(request.feature_id, Some(feature.feature_id));
+    assert!(
+        store
+            .complete_feature(CompleteFeature {
+                parent_instance_id: android.instance.instance_id,
+                feature_id: feature.feature_id,
+                expected_revision: feature.revision,
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .complete_feature(CompleteFeature {
+                parent_instance_id: backend.instance.instance_id,
+                feature_id: feature.feature_id,
+                expected_revision: feature.revision,
+            })
+            .await
+            .is_err()
+    );
+
+    store
+        .claim_request(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            request.request_id,
+        )
+        .await
+        .unwrap();
+    let answer = store
+        .answer_request(AnswerRequest {
+            actor: ActorRef::Orchestrator(android.instance.instance_id),
+            request_id: request.request_id,
+            answer_summary: "Scope confirmed".to_owned(),
+            body: None,
+            content_type: "text/plain".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(answer.message.feature_id, Some(feature.feature_id));
+
+    let completed = store
+        .complete_feature(CompleteFeature {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: feature.feature_id,
+            expected_revision: feature.revision,
+        })
+        .await
+        .unwrap();
+    assert_eq!(completed.status, FeatureStatus::Completed);
+    assert_eq!(completed.revision, feature.revision + 1);
+    assert!(completed.completed_at.is_some());
+    assert!(matches!(
+        store
+            .complete_feature(CompleteFeature {
+                parent_instance_id: backend.instance.instance_id,
+                feature_id: feature.feature_id,
+                expected_revision: feature.revision,
+            })
+            .await
+            .unwrap_err(),
+        StoreError::FeatureRevisionConflict { .. }
+    ));
+
+    let events = store
+        .wait_for_events(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            0,
+            &[EventKind::FeatureCompleted],
+            Duration::ZERO,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.outcome, WaitOutcome::Events);
+    assert_eq!(events.events.len(), 1);
+    let updated_events = store
+        .wait_for_events(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            0,
+            &[EventKind::FeatureUpdated],
+            Duration::ZERO,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_events.events.len(), 1);
+    let coordinator_events = store
+        .wait_for_events(
+            ActorRef::Orchestrator(backend.instance.instance_id),
+            0,
+            &[EventKind::FeatureCompleted],
+            Duration::ZERO,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(coordinator_events.events.len(), 1);
+    let reconnect = store
+        .connect_orchestrator(connect_command(
+            "feature-lifecycle",
+            "backend",
+            "C:/feature/backend",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reconnect.active_feature_count, 0);
+    let late_joiner = store
+        .connect_orchestrator(connect_command(
+            "feature-lifecycle",
+            "web",
+            "C:/feature/web",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(late_joiner.active_feature_count, 0);
+    assert_eq!(
+        store.get_feature(feature.feature_id).await.unwrap().status,
+        FeatureStatus::Completed
+    );
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn repository_request_infers_and_validates_work_item_feature_scope() {
+    let (store, path) = test_store(90).await;
+    let backend = store
+        .connect_orchestrator(connect_command(
+            "request-scope",
+            "backend",
+            "C:/scope/backend",
+        ))
+        .await
+        .unwrap();
+    let android = store
+        .connect_orchestrator(connect_command(
+            "request-scope",
+            "android",
+            "C:/scope/android",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: backend.instance.instance_id,
+            title: "Scoped request".to_owned(),
+            summary: "Infer the feature from work".to_owned(),
+        })
+        .await
+        .unwrap();
+    let other_feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: backend.instance.instance_id,
+            title: "Other feature".to_owned(),
+            summary: "Must not accept the work link".to_owned(),
+        })
+        .await
+        .unwrap();
+    let item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: backend.repository.repository_id,
+            title: "Backend contract".to_owned(),
+            summary: "Explain the contract".to_owned(),
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    let request = store
+        .ask_repository(AskRepository {
+            actor: ActorRef::Orchestrator(backend.instance.instance_id),
+            target_repository_id: android.repository.repository_id,
+            feature_id: None,
+            work_item_id: Some(item.work_item_id),
+            question_summary: "Confirm the client contract".to_owned(),
+            body: None,
+            context_refs: json!([]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(request.feature_id, Some(feature.feature_id));
+    assert_eq!(request.work_item_id, Some(item.work_item_id));
+    assert!(
+        store
+            .ask_repository(AskRepository {
+                actor: ActorRef::Orchestrator(backend.instance.instance_id),
+                target_repository_id: android.repository.repository_id,
+                feature_id: Some(other_feature.feature_id),
+                work_item_id: Some(item.work_item_id),
+                question_summary: "Invalid scope".to_owned(),
+                body: None,
+                context_refs: json!([]),
+            })
+            .await
+            .is_err()
+    );
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn feature_cancellation_cancels_unclaimed_items_but_rejects_active_work() {
+    let (store, path) = test_store(90).await;
+    let backend = store
+        .connect_orchestrator(connect_command(
+            "feature-cancel",
+            "backend",
+            "C:/cancel/backend",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: backend.instance.instance_id,
+            title: "Cancellation".to_owned(),
+            summary: "Cancel idle work".to_owned(),
+        })
+        .await
+        .unwrap();
+    let item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: backend.repository.repository_id,
+            title: "Idle item".to_owned(),
+            summary: "Not started".to_owned(),
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    let cancelled = store
+        .cancel_feature(CancelFeature {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: feature.feature_id,
+            expected_revision: feature.revision,
+        })
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, FeatureStatus::Cancelled);
+    assert!(cancelled.cancelled_at.is_some());
+    assert_eq!(
+        store.get_work_item(item.work_item_id).await.unwrap().status,
+        WorkItemStatus::Cancelled
+    );
+
+    let active_feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: backend.instance.instance_id,
+            title: "Active cancellation".to_owned(),
+            summary: "Reject active work".to_owned(),
+        })
+        .await
+        .unwrap();
+    let active_item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: active_feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: backend.repository.repository_id,
+            title: "Claimed item".to_owned(),
+            summary: "Already claimed".to_owned(),
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .claim_work_item(
+            backend.instance.instance_id,
+            active_item.work_item_id,
+            active_item.revision,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .cancel_feature(CancelFeature {
+                parent_instance_id: backend.instance.instance_id,
+                feature_id: active_feature.feature_id,
+                expected_revision: active_feature.revision,
+            })
+            .await
+            .is_err()
+    );
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn disconnect_is_visible_in_presence() {
     let (store, path) = test_store(90).await;
     let connected = store
@@ -266,7 +612,7 @@ async fn worker_run_completes_full_lifecycle_in_parent_repository() {
                 EventKind::WorkerRunActive,
                 EventKind::WorkerRunCompleted,
             ],
-            Some(Duration::ZERO),
+            Duration::ZERO,
             20,
         )
         .await
@@ -1435,12 +1781,12 @@ async fn queued_message_is_returned_as_repository_event() {
             ActorRef::Orchestrator(web.instance.instance_id),
             0,
             &[EventKind::WorkerRunCompleted],
-            Some(Duration::ZERO),
+            Duration::ZERO,
             20,
         )
         .await
         .unwrap();
-    assert_eq!(filtered.outcome, WaitOutcome::Timeout);
+    assert_eq!(filtered.outcome, WaitOutcome::Deadline);
     assert_eq!(filtered.next_cursor, 0);
 
     let batch = store
@@ -1448,7 +1794,7 @@ async fn queued_message_is_returned_as_repository_event() {
             ActorRef::Orchestrator(web.instance.instance_id),
             0,
             &[EventKind::MessageAvailable],
-            Some(Duration::ZERO),
+            Duration::ZERO,
             20,
         )
         .await
@@ -1487,7 +1833,7 @@ async fn waiter_is_notified_after_message_commit() {
                 ActorRef::Orchestrator(web_instance_id),
                 0,
                 &[],
-                Some(Duration::from_secs(2)),
+                Duration::from_secs(2),
                 20,
             )
             .await
@@ -1533,7 +1879,7 @@ async fn dozens_of_long_poll_waiters_receive_one_committed_event() {
                     ActorRef::Orchestrator(instance_id),
                     0,
                     &[EventKind::MessageAvailable],
-                    Some(Duration::from_secs(3)),
+                    Duration::from_secs(3),
                     1,
                 )
                 .await
@@ -1579,7 +1925,7 @@ async fn wait_timeout_preserves_cursor_and_renews_lease() {
             ActorRef::Orchestrator(connected.instance.instance_id),
             42,
             &[],
-            Some(Duration::from_millis(1_500)),
+            Duration::from_millis(1_500),
             20,
         )
         .await
@@ -1589,7 +1935,7 @@ async fn wait_timeout_preserves_cursor_and_renews_lease() {
         .await
         .unwrap();
 
-    assert_eq!(batch.outcome, WaitOutcome::Timeout);
+    assert_eq!(batch.outcome, WaitOutcome::Deadline);
     assert_eq!(batch.next_cursor, 42);
     assert!(batch.events.is_empty());
     assert!(renewed.last_heartbeat_at > initial_heartbeat);
@@ -1619,6 +1965,8 @@ async fn maintenance_reaps_expired_runtime_state_and_reports_metrics() {
         .ask_repository(AskRepository {
             actor: ActorRef::Orchestrator(requester.instance.instance_id),
             target_repository_id: target.repository.repository_id,
+            feature_id: None,
+            work_item_id: None,
             question_summary: "Operational request".to_owned(),
             body: None,
             context_refs: json!([]),
@@ -1816,6 +2164,8 @@ async fn only_one_actor_can_claim_the_same_request() {
         .ask_repository(AskRepository {
             actor: ActorRef::Orchestrator(requester.instance.instance_id),
             target_repository_id: target_one.repository.repository_id,
+            feature_id: None,
+            work_item_id: None,
             question_summary: "Which response fields are guaranteed?".to_owned(),
             body: Some("Need the complete API contract.".to_owned()),
             context_refs: json!([]),
@@ -1879,6 +2229,8 @@ async fn expired_claim_can_be_taken_over_and_retryable_failure_requeues() {
         .ask_repository(AskRepository {
             actor: ActorRef::Orchestrator(requester.instance.instance_id),
             target_repository_id: target_one.repository.repository_id,
+            feature_id: None,
+            work_item_id: None,
             question_summary: "Can this request be retried?".to_owned(),
             body: None,
             context_refs: json!([]),
@@ -1940,6 +2292,8 @@ async fn answer_atomically_closes_request_and_delivers_artifact() {
         .ask_repository(AskRepository {
             actor: ActorRef::Orchestrator(requester.instance.instance_id),
             target_repository_id: target.repository.repository_id,
+            feature_id: None,
+            work_item_id: None,
             question_summary: "Return the contract".to_owned(),
             body: None,
             context_refs: json!([]),
@@ -2018,6 +2372,8 @@ async fn claim_owner_can_renew_release_and_terminally_fail_request() {
         .ask_repository(AskRepository {
             actor: ActorRef::Orchestrator(requester.instance.instance_id),
             target_repository_id: owner.repository.repository_id,
+            feature_id: None,
+            work_item_id: None,
             question_summary: "Resolve ownership rules".to_owned(),
             body: None,
             context_refs: json!([]),
@@ -2079,7 +2435,7 @@ async fn claim_owner_can_renew_release_and_terminally_fail_request() {
             ActorRef::Orchestrator(requester.instance.instance_id),
             0,
             &[EventKind::RequestFailed],
-            Some(Duration::ZERO),
+            Duration::ZERO,
             20,
         )
         .await
@@ -2182,6 +2538,8 @@ async fn creation_idempotency_replays_result_and_rejects_changed_payload() {
     let request_command = AskRepository {
         actor: ActorRef::Orchestrator(web.instance.instance_id),
         target_repository_id: backend.repository.repository_id,
+        feature_id: None,
+        work_item_id: None,
         question_summary: "Idempotent question".to_owned(),
         body: None,
         context_refs: json!([]),
@@ -2244,6 +2602,8 @@ async fn actor_activity_renews_only_unexpired_request_claims() {
         .ask_repository(AskRepository {
             actor: ActorRef::Orchestrator(requester.instance.instance_id),
             target_repository_id: target.repository.repository_id,
+            feature_id: None,
+            work_item_id: None,
             question_summary: "Renew me".to_owned(),
             body: None,
             context_refs: json!([]),
@@ -2307,6 +2667,8 @@ async fn three_worker_runs_claim_and_answer_independent_requests() {
                 .ask_repository(AskRepository {
                     actor: ActorRef::Orchestrator(requester.instance.instance_id),
                     target_repository_id: target.repository.repository_id,
+                    feature_id: None,
+                    work_item_id: None,
                     question_summary: format!("Question {index}"),
                     body: None,
                     context_refs: json!([]),

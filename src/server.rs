@@ -23,11 +23,12 @@ use tokio::{net::TcpListener, sync::watch, time::MissedTickBehavior};
 use crate::{
     domain::{
         ActorRef, AnswerRequest, ArtifactId, ArtifactKind, AskRepository, AuditWorkItemInput,
-        ConnectOrchestrator, CreateFeature, CreateWorkItem, CreateWorkerRun, EventKind,
-        FailRequest, FeatureId, InstanceId, MAX_AUDIT_WORK_ITEMS, MAX_CONTEXT_REFS,
-        MAX_MESSAGE_RECIPIENTS, MAX_WORK_ITEM_DEPENDENCIES, MessageId, MessageKind, MessageTarget,
-        ProjectId, PublishMessage, RepositoryId, RepositoryPresenceFilter, RequestId, ThreadId,
-        UpdateWorkItem, WorkItemId, WorkItemStatus, WorkerRole, WorkerRunId, validate_key,
+        CancelFeature, CompleteFeature, ConnectOrchestrator, CreateFeature, CreateWorkItem,
+        CreateWorkerRun, EventKind, FailRequest, FeatureId, InstanceId, MAX_AUDIT_WORK_ITEMS,
+        MAX_CONTEXT_REFS, MAX_MESSAGE_RECIPIENTS, MAX_WORK_ITEM_DEPENDENCIES, MessageId,
+        MessageKind, MessageTarget, ProjectId, PublishMessage, RepositoryId,
+        RepositoryPresenceFilter, RequestId, ThreadId, UpdateWorkItem, WorkItemId, WorkItemStatus,
+        WorkerRole, WorkerRunId, validate_key,
     },
     store::{SqliteStore, StoreError},
 };
@@ -50,6 +51,7 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct RuntimeConfig {
     pub max_summary_bytes: u16,
     pub max_artifact_bytes: u32,
+    pub max_wait_seconds: u16,
     pub maintenance_interval: Duration,
     pub retention_interval: Option<Duration>,
     pub retention: Duration,
@@ -65,6 +67,7 @@ struct AppState {
     database_path: Arc<PathBuf>,
     max_summary_bytes: u16,
     max_artifact_bytes: u32,
+    max_wait_seconds: u16,
     sessions: SessionRegistry,
     metrics_enabled: bool,
 }
@@ -113,11 +116,9 @@ pub async fn run_server(
     let app = router(
         store.clone(),
         database_path.clone(),
-        config.max_summary_bytes,
-        config.max_artifact_bytes,
+        &config,
         allowed_hosts,
         sessions.clone(),
-        config.enable_metrics,
     );
     let listener = TcpListener::bind((host.as_str(), port))
         .await
@@ -152,11 +153,9 @@ pub async fn run_server(
 fn router(
     store: SqliteStore,
     database_path: PathBuf,
-    max_summary_bytes: u16,
-    max_artifact_bytes: u32,
+    config: &RuntimeConfig,
     allowed_hosts: HashSet<String>,
     sessions: SessionRegistry,
-    metrics_enabled: bool,
 ) -> Router {
     let mut router = Router::new()
         .route("/", get(root))
@@ -165,17 +164,18 @@ fn router(
         .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024));
-    if metrics_enabled {
+    if config.enable_metrics {
         router = router.route("/metrics", get(metrics));
     }
     router.with_state(AppState {
         store,
         allowed_hosts: Arc::new(allowed_hosts),
         database_path: Arc::new(database_path),
-        max_summary_bytes,
-        max_artifact_bytes,
+        max_summary_bytes: config.max_summary_bytes,
+        max_artifact_bytes: config.max_artifact_bytes,
+        max_wait_seconds: config.max_wait_seconds,
         sessions,
-        metrics_enabled,
+        metrics_enabled: config.enable_metrics,
     })
 }
 
@@ -473,6 +473,7 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         &state.store,
         state.max_summary_bytes,
         state.max_artifact_bytes,
+        state.max_wait_seconds,
         payload,
         in_flight.as_ref().map(|request| request.cancellation()),
     )
@@ -542,6 +543,7 @@ async fn handle_rpc_payload(
     store: &SqliteStore,
     max_summary_bytes: u16,
     max_artifact_bytes: u32,
+    max_wait_seconds: u16,
     payload: Value,
     cancellation: Option<Arc<tokio::sync::Notify>>,
 ) -> (StatusCode, Option<Value>) {
@@ -563,6 +565,7 @@ async fn handle_rpc_payload(
         store,
         max_summary_bytes,
         max_artifact_bytes,
+        max_wait_seconds,
         payload,
         cancellation,
     )
@@ -573,6 +576,7 @@ async fn handle_single_request(
     store: &SqliteStore,
     max_summary_bytes: u16,
     max_artifact_bytes: u32,
+    max_wait_seconds: u16,
     request: Value,
     cancellation: Option<Arc<tokio::sync::Notify>>,
 ) -> (StatusCode, Option<Value>) {
@@ -676,6 +680,7 @@ async fn handle_single_request(
         store,
         max_summary_bytes,
         max_artifact_bytes,
+        max_wait_seconds,
         method,
         &params,
     );

@@ -32,7 +32,8 @@ pub use requests::{
     RequestStatus,
 };
 pub use work::{
-    CreateFeature, CreateWorkItem, Feature, UpdateWorkItem, WorkItem, WorkItemPage, WorkItemStatus,
+    CancelFeature, CompleteFeature, CreateFeature, CreateWorkItem, Feature, FeatureStatus,
+    UpdateWorkItem, WorkItem, WorkItemPage, WorkItemStatus,
 };
 pub use worker::{
     AuditScopeItem, AuditWorkItemInput, CreateWorkerRun, WorkerRole, WorkerRun, WorkerRunStatus,

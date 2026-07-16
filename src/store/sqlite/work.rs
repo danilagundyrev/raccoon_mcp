@@ -43,12 +43,15 @@ impl SqliteStore {
         }
         sqlx::query(
             "INSERT INTO features(
-                 feature_id, project_id, created_by_instance_id, title, summary, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 feature_id, project_id, created_by_instance_id, coordinator_repository_id,
+                 title, summary, status, revision, created_at, updated_at,
+                 completed_at, cancelled_at
+             ) VALUES (?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, NULL, NULL)",
         )
         .bind(feature_id.to_string())
         .bind(actor.project_id.to_string())
         .bind(command.parent_instance_id.to_string())
+        .bind(actor.repository_id.to_string())
         .bind(command.title)
         .bind(command.summary)
         .bind(&now)
@@ -96,6 +99,178 @@ impl SqliteStore {
         rows.iter().map(feature_from_row).collect()
     }
 
+    pub async fn complete_feature(&self, command: CompleteFeature) -> Result<Feature, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(
+                &mut transaction,
+                ActorRef::Orchestrator(command.parent_instance_id),
+                &now,
+            )
+            .await?;
+        let feature = get_feature_tx(&mut transaction, command.feature_id).await?;
+        ensure_feature_actor(&feature, &actor)?;
+        ensure_feature_revision(&feature, command.expected_revision)?;
+        if feature.status != FeatureStatus::Active {
+            return Err(StoreError::Conflict(format!(
+                "feature {} is already {}",
+                feature.feature_id,
+                feature.status.as_str()
+            )));
+        }
+        ensure_feature_has_no_open_work(&mut transaction, feature.feature_id).await?;
+        ensure_feature_has_no_open_requests(&mut transaction, feature.feature_id).await?;
+        ensure_feature_has_no_active_workers(&mut transaction, feature.feature_id).await?;
+
+        let updated = sqlx::query(
+            "UPDATE features
+             SET status = 'completed', revision = revision + 1,
+                 updated_at = ?, completed_at = ?, cancelled_at = NULL
+             WHERE feature_id = ? AND status = 'active' AND revision = ?",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(feature.feature_id.to_string())
+        .bind(feature.revision as i64)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::Conflict(format!(
+                "feature {} changed while completing",
+                feature.feature_id
+            )));
+        }
+        append_project_event(
+            &mut transaction,
+            feature.project_id,
+            EventKind::FeatureUpdated,
+            EventEntityType::Feature,
+            &feature.feature_id.to_string(),
+            &now,
+        )
+        .await?;
+        let recipients = append_project_event(
+            &mut transaction,
+            feature.project_id,
+            EventKind::FeatureCompleted,
+            EventEntityType::Feature,
+            &feature.feature_id.to_string(),
+            &now,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.notify_repositories(&recipients);
+        self.get_feature(feature.feature_id).await
+    }
+
+    pub async fn cancel_feature(&self, command: CancelFeature) -> Result<Feature, StoreError> {
+        let _write_guard = self.write_lock.lock().await;
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(
+                &mut transaction,
+                ActorRef::Orchestrator(command.parent_instance_id),
+                &now,
+            )
+            .await?;
+        let feature = get_feature_tx(&mut transaction, command.feature_id).await?;
+        ensure_feature_actor(&feature, &actor)?;
+        ensure_feature_revision(&feature, command.expected_revision)?;
+        if feature.status != FeatureStatus::Active {
+            return Err(StoreError::Conflict(format!(
+                "feature {} is already {}",
+                feature.feature_id,
+                feature.status.as_str()
+            )));
+        }
+        ensure_feature_has_no_open_requests(&mut transaction, feature.feature_id).await?;
+        ensure_feature_has_no_active_workers(&mut transaction, feature.feature_id).await?;
+        let active_items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_items
+             WHERE feature_id = ? AND status IN ('claimed', 'in_progress', 'blocked')",
+        )
+        .bind(feature.feature_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if active_items != 0 {
+            return Err(StoreError::Conflict(format!(
+                "feature {} has {active_items} actively claimed work item(s)",
+                feature.feature_id
+            )));
+        }
+
+        let rows = sqlx::query(
+            "SELECT work_item_id FROM work_items
+             WHERE feature_id = ? AND status IN ('planned', 'ready', 'failed')",
+        )
+        .bind(feature.feature_id.to_string())
+        .fetch_all(&mut *transaction)
+        .await?;
+        let cancelled_items = rows
+            .iter()
+            .map(|row| {
+                let work_item_id: String = row.try_get("work_item_id")?;
+                Ok::<WorkItemId, StoreError>(WorkItemId::parse(&work_item_id)?)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        sqlx::query(
+            "UPDATE work_items
+             SET status = 'cancelled', revision = revision + 1,
+                 claim_expires_at = NULL, assignee_instance_id = NULL,
+                 updated_at = ?, finished_at = ?
+             WHERE feature_id = ? AND status IN ('planned', 'ready', 'failed')",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(feature.feature_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        append_work_item_events(&mut transaction, feature.project_id, &cancelled_items, &now)
+            .await?;
+        let updated = sqlx::query(
+            "UPDATE features
+             SET status = 'cancelled', revision = revision + 1,
+                 updated_at = ?, cancelled_at = ?, completed_at = NULL
+             WHERE feature_id = ? AND status = 'active' AND revision = ?",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(feature.feature_id.to_string())
+        .bind(feature.revision as i64)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::Conflict(format!(
+                "feature {} changed while cancelling",
+                feature.feature_id
+            )));
+        }
+        append_project_event(
+            &mut transaction,
+            feature.project_id,
+            EventKind::FeatureUpdated,
+            EventEntityType::Feature,
+            &feature.feature_id.to_string(),
+            &now,
+        )
+        .await?;
+        let recipients = append_project_event(
+            &mut transaction,
+            feature.project_id,
+            EventKind::FeatureCancelled,
+            EventEntityType::Feature,
+            &feature.feature_id.to_string(),
+            &now,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.notify_repositories(&recipients);
+        self.get_feature(feature.feature_id).await
+    }
+
     #[cfg(test)]
     pub async fn create_work_item(&self, command: CreateWorkItem) -> Result<WorkItem, StoreError> {
         self.create_work_item_idempotent(command, None).await
@@ -141,7 +316,8 @@ impl SqliteStore {
             transaction.commit().await?;
             return self.get_work_item(WorkItemId::parse(&existing_id)?).await;
         }
-        ensure_feature_project(&mut transaction, command.feature_id, actor.project_id).await?;
+        ensure_active_feature_project(&mut transaction, command.feature_id, actor.project_id)
+            .await?;
         ensure_repository_project(
             &mut transaction,
             command.owner_repository_id,
@@ -688,15 +864,133 @@ fn work_item_from_row(
 }
 
 fn feature_from_row(row: &SqliteRow) -> Result<Feature, StoreError> {
+    let status: String = row.try_get("status")?;
     Ok(Feature {
         feature_id: FeatureId::parse(row.try_get("feature_id")?)?,
         project_id: ProjectId::parse(row.try_get("project_id")?)?,
         created_by_instance_id: InstanceId::parse(row.try_get("created_by_instance_id")?)?,
+        coordinator_repository_id: RepositoryId::parse(row.try_get("coordinator_repository_id")?)?,
         title: row.try_get("title")?,
         summary: row.try_get("summary")?,
+        status: status.parse().map_err(StoreError::Conflict)?,
+        revision: row.try_get::<i64, _>("revision")? as u64,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        completed_at: row.try_get("completed_at")?,
+        cancelled_at: row.try_get("cancelled_at")?,
     })
+}
+
+async fn get_feature_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    feature_id: FeatureId,
+) -> Result<Feature, StoreError> {
+    let row = sqlx::query("SELECT * FROM features WHERE feature_id = ?")
+        .bind(feature_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("feature {feature_id}")))?;
+    feature_from_row(&row)
+}
+
+fn ensure_feature_actor(feature: &Feature, actor: &ResolvedActor) -> Result<(), StoreError> {
+    if feature.project_id != actor.project_id {
+        return Err(StoreError::NotFound(format!(
+            "feature {} in actor project",
+            feature.feature_id
+        )));
+    }
+    if feature.coordinator_repository_id != actor.repository_id {
+        return Err(StoreError::Conflict(format!(
+            "feature {} can only be closed by coordinator repository {}",
+            feature.feature_id, feature.coordinator_repository_id
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_feature_revision(feature: &Feature, expected: u64) -> Result<(), StoreError> {
+    if feature.revision != expected {
+        return Err(StoreError::FeatureRevisionConflict {
+            feature_id: feature.feature_id,
+            expected,
+            actual: feature.revision,
+            current: Box::new(feature.clone()),
+        });
+    }
+    Ok(())
+}
+
+async fn ensure_feature_has_no_open_work(
+    transaction: &mut Transaction<'_, Sqlite>,
+    feature_id: FeatureId,
+) -> Result<(), StoreError> {
+    let open_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items
+         WHERE feature_id = ? AND status NOT IN ('completed', 'cancelled')",
+    )
+    .bind(feature_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if open_items != 0 {
+        return Err(StoreError::Conflict(format!(
+            "feature {feature_id} has {open_items} unfinished work item(s)"
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_feature_has_no_open_requests(
+    transaction: &mut Transaction<'_, Sqlite>,
+    feature_id: FeatureId,
+) -> Result<(), StoreError> {
+    let open_requests: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM requests
+         WHERE feature_id = ? AND status IN ('pending', 'claimed')",
+    )
+    .bind(feature_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if open_requests != 0 {
+        return Err(StoreError::Conflict(format!(
+            "feature {feature_id} has {open_requests} open repository request(s)"
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_feature_has_no_active_workers(
+    transaction: &mut Transaction<'_, Sqlite>,
+    feature_id: FeatureId,
+) -> Result<(), StoreError> {
+    let active_workers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM worker_runs wr
+         WHERE wr.status IN ('created', 'active') AND (
+             EXISTS (
+                 SELECT 1 FROM work_items wi
+                 WHERE wi.work_item_id = wr.work_item_id AND wi.feature_id = ?
+             ) OR EXISTS (
+                 SELECT 1 FROM worker_run_audit_items ai
+                 JOIN work_items wi ON wi.work_item_id = ai.work_item_id
+                 WHERE ai.worker_run_id = wr.worker_run_id AND wi.feature_id = ?
+             ) OR EXISTS (
+                 SELECT 1 FROM worker_run_audit_items ai
+                 JOIN work_items wi ON wi.work_item_id = ai.work_item_id
+                 WHERE ai.worker_run_id = wr.addresses_audit_run_id AND wi.feature_id = ?
+             )
+         )",
+    )
+    .bind(feature_id.to_string())
+    .bind(feature_id.to_string())
+    .bind(feature_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if active_workers != 0 {
+        return Err(StoreError::Conflict(format!(
+            "feature {feature_id} has {active_workers} active worker run(s)"
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_revision(current: &WorkItem, expected: u64) -> Result<(), StoreError> {
@@ -791,6 +1085,24 @@ async fn ensure_feature_project(
     if exists == 0 {
         return Err(StoreError::NotFound(format!(
             "feature {feature_id} in actor project"
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_active_feature_project(
+    transaction: &mut Transaction<'_, Sqlite>,
+    feature_id: FeatureId,
+    project_id: ProjectId,
+) -> Result<(), StoreError> {
+    ensure_feature_project(transaction, feature_id, project_id).await?;
+    let status: String = sqlx::query_scalar("SELECT status FROM features WHERE feature_id = ?")
+        .bind(feature_id.to_string())
+        .fetch_one(&mut **transaction)
+        .await?;
+    if status != FeatureStatus::Active.as_str() {
+        return Err(StoreError::Conflict(format!(
+            "feature {feature_id} is '{status}', expected 'active'"
         )));
     }
     Ok(())

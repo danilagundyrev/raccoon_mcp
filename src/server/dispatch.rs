@@ -4,6 +4,7 @@ pub(super) async fn dispatch(
     store: &SqliteStore,
     max_summary_bytes: u16,
     max_artifact_bytes: u32,
+    max_wait_seconds: u16,
     method: &str,
     params: &JsonMap<String, Value>,
 ) -> Result<Value, RpcError> {
@@ -34,22 +35,38 @@ pub(super) async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use bounded list_work_items pages, expected_revision for updates, and claim an owner-repository item before creating its executor worker run. The current linked executor must publish an implementation_report and complete before its orchestrator completes the item. Roles are executor, butler and auditor. Auditor scope contains completed work_item_ids and publishes exactly one audit_report; a later iteration waits for the previous audit and any created remediation executor to complete. Workers never register as repositories. Use ask_repository for durable questions and actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. Omit timeout_seconds for no server-side timeout. JSON-RPC batches are not supported.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use bounded list_work_items pages, expected_revision for updates, and claim an owner-repository item before creating its executor worker run. The current linked executor must publish an implementation_report and complete before its orchestrator completes the item. Roles are executor, butler and auditor. Auditor scope contains completed work_item_ids and publishes exactly one audit_report; a later iteration waits for the previous audit and any created remediation executor to complete. Workers never register as repositories. Use ask_repository for durable questions and actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for finite repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. JSON-RPC batches are not supported.",
             }))
         }
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({
-            "tools": tool_definitions(max_summary_bytes, max_artifact_bytes)
+            "tools": tool_definitions(max_summary_bytes, max_artifact_bytes, max_wait_seconds)
         })),
-        "tools/call" => call_tool(store, max_summary_bytes, max_artifact_bytes, params).await,
+        "tools/call" => {
+            call_tool(
+                store,
+                max_summary_bytes,
+                max_artifact_bytes,
+                max_wait_seconds,
+                params,
+            )
+            .await
+        }
         "resources/list" => Ok(json!({ "resources": list_resources() })),
         "resources/templates/list" => Ok(json!({
             "resourceTemplates": list_resource_templates(),
         })),
         "resources/read" => {
             let uri = require_string(params, "uri")?;
-            read_resource(store, max_summary_bytes, max_artifact_bytes, &uri).await
+            read_resource(
+                store,
+                max_summary_bytes,
+                max_artifact_bytes,
+                max_wait_seconds,
+                &uri,
+            )
+            .await
         }
         _ => Err(RpcError::new(-32601, "Method not found")
             .with_status(StatusCode::NOT_FOUND)
@@ -64,11 +81,12 @@ pub(super) async fn call_tool(
     store: &SqliteStore,
     max_summary_bytes: u16,
     max_artifact_bytes: u32,
+    max_wait_seconds: u16,
     params: &JsonMap<String, Value>,
 ) -> Result<Value, RpcError> {
     let tool_name = require_string(params, "name")?;
     let arguments = optional_arguments(params)?;
-    let definitions = tool_definitions(max_summary_bytes, max_artifact_bytes);
+    let definitions = tool_definitions(max_summary_bytes, max_artifact_bytes, max_wait_seconds);
     let input_schema = definitions
         .as_array()
         .and_then(|definitions| {
@@ -234,6 +252,32 @@ pub(super) async fn call_tool(
                 .list_features(project_id)
                 .await
                 .map(|features| json!({ "project_id": project_id, "features": features }))
+        }
+        "complete_feature" | "cancel_feature" => {
+            let parent_instance_id = parse_instance_id(&arguments)?;
+            let feature_id = parse_feature_id(&arguments)?;
+            let expected_revision = required_revision(&arguments)?;
+            match tool_name.as_str() {
+                "complete_feature" => {
+                    store
+                        .complete_feature(CompleteFeature {
+                            parent_instance_id,
+                            feature_id,
+                            expected_revision,
+                        })
+                        .await
+                }
+                _ => {
+                    store
+                        .cancel_feature(CancelFeature {
+                            parent_instance_id,
+                            feature_id,
+                            expected_revision,
+                        })
+                        .await
+                }
+            }
+            .map(|value| json!(value))
         }
         "create_work_item" => {
             let parent_instance_id = parse_instance_id(&arguments)?;
@@ -424,12 +468,30 @@ pub(super) async fn call_tool(
             let actor = parse_actor(&arguments)?;
             let cursor = optional_nonnegative_i64(&arguments, "cursor")?.unwrap_or(0);
             let kinds = optional_event_kinds(&arguments)?;
-            let timeout = optional_timeout_seconds(&arguments)?.map(Duration::from_secs);
+            let requested_timeout_seconds = optional_timeout_seconds(&arguments)?;
+            let effective_timeout_seconds =
+                effective_wait_seconds(requested_timeout_seconds, max_wait_seconds);
             let limit = optional_event_limit(&arguments)?.unwrap_or(20);
-            store
-                .wait_for_events(actor, cursor, &kinds, timeout, limit)
-                .await
-                .map(|value| json!(value))
+            let started_at = tokio::time::Instant::now();
+            store.wait_for_events(
+                actor,
+                cursor,
+                &kinds,
+                Duration::from_secs(effective_timeout_seconds),
+                limit,
+            )
+            .await
+            .map(|value| {
+                json!({
+                    "outcome": value.outcome,
+                    "events": value.events,
+                    "next_cursor": value.next_cursor,
+                    "has_more": value.has_more,
+                    "requested_timeout_seconds": requested_timeout_seconds,
+                    "effective_timeout_seconds": effective_timeout_seconds,
+                    "elapsed_ms": u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                })
+            })
         }
         "ask_repository" => {
             let actor = parse_actor(&arguments)?;
@@ -446,6 +508,8 @@ pub(super) async fn call_tool(
                     AskRepository {
                         actor,
                         target_repository_id,
+                        feature_id: optional_feature_id(&arguments, "feature_id")?,
+                        work_item_id: optional_work_item_id(&arguments, "work_item_id")?,
                         question_summary,
                         body,
                         context_refs,
@@ -588,10 +652,17 @@ pub(super) async fn call_tool(
     })
 }
 
+pub(super) fn effective_wait_seconds(requested: Option<u64>, maximum: u16) -> u64 {
+    requested
+        .unwrap_or(u64::from(maximum))
+        .min(u64::from(maximum))
+}
+
 pub(super) async fn read_resource(
     store: &SqliteStore,
     max_summary_bytes: u16,
     max_artifact_bytes: u32,
+    max_wait_seconds: u16,
     uri: &str,
 ) -> Result<Value, RpcError> {
     if uri == "hub://guide" {
@@ -606,13 +677,14 @@ pub(super) async fn read_resource(
                 "lease_note": "Call heartbeat before lease_expires_at. Repository identity and future mailbox state remain stable across orchestrator instances.",
                 "max_summary_bytes": max_summary_bytes,
                 "max_artifact_bytes": max_artifact_bytes,
+                "max_wait_seconds": max_wait_seconds,
                 "collection_limits": {
                     "context_refs": MAX_CONTEXT_REFS,
                     "audit_work_items": MAX_AUDIT_WORK_ITEMS,
                     "work_item_dependencies": MAX_WORK_ITEM_DEPENDENCIES,
                     "message_recipients": MAX_MESSAGE_RECIPIENTS,
                     "event_page": 50,
-                    "event_kind_filters": 12,
+                    "event_kind_filters": 15,
                     "inbox_page": 100,
                     "inbox_kind_filters": 3,
                     "work_item_page": 100
@@ -639,7 +711,9 @@ pub(super) async fn read_resource(
                     "Claim a ready item with expected_revision, then create an executor worker run linked by work_item_id.",
                     "The latest executor linked to the item publishes an implementation_report and completes its worker run.",
                     "Its assigned orchestrator then completes the item through update_work_item while the claim is still active.",
-                    "Every mutation increments revision and emits project-wide compact work_item_updated events; stale writes return the current card."
+                    "Every mutation increments revision and emits project-wide compact work_item_updated events; stale writes return the current card.",
+                    "The feature coordinator repository calls complete_feature with its current revision only after durable linked work, requests and workers are terminal; cancel_feature closes abandoned work under its stricter safety checks.",
+                    "Peer repositories stop waiting on feature_completed or feature_cancelled for the current feature and call disconnect_orchestrator before exit. MCP session DELETE is transport cleanup, not the durable completion signal."
                 ],
                 "audit_flow": [
                     "Create one auditor run for one or more work_item_ids; max_iterations defaults to one and is fixed per item.",
@@ -648,7 +722,7 @@ pub(super) async fn read_resource(
                     "A later audit waits for the previous auditor and any created remediation executor to complete, increments each item's iteration independently, and is rejected after depth is exhausted."
                 ],
                 "request_flow": [
-                    "Create a durable directed question with ask_repository; the target receives request_available.",
+                    "Create a durable directed question with ask_repository and include feature_id/work_item_id when it affects tracked work; a work-item link infers its feature. The target receives request_available.",
                     "One target actor atomically claims it; explicit renew, heartbeat, mutating actor activity and active event waiting extend only an unexpired claim.",
                     "answer_request atomically closes the request and delivers an answer message/artifact to the requester.",
                     "A retryable failure returns the request to pending; a terminal failure closes it and notifies the requester."
@@ -656,7 +730,7 @@ pub(super) async fn read_resource(
                 "messaging_flow": [
                     "Publish an immutable summary and optional artifact with publish_message.",
                     "Supply an actor-scoped idempotency_key to creation calls that may be retried; the same key requires an identical payload.",
-                    "Call wait_for_events with the last event cursor; omit timeout_seconds for an unbounded server wait. The server renews the waiting actor lease.",
+                    "Call wait_for_events with the last event cursor. Every call is finite: omitted or oversized timeout_seconds uses the configured maximum, while zero performs a non-blocking check. The server renews the waiting actor lease.",
                     "Use list_inbox to read pending headers without artifact bodies.",
                     "Use the kinds filter to select report, announcement or command headers.",
                     "Use read_message/read_artifact only for selected items.",

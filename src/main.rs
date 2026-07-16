@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         server::RuntimeConfig {
             max_summary_bytes: args.max_summary_bytes,
             max_artifact_bytes: args.max_artifact_bytes,
+            max_wait_seconds: args.max_wait_seconds,
             maintenance_interval: std::time::Duration::from_secs(u64::from(
                 args.maintenance_interval_seconds,
             )),

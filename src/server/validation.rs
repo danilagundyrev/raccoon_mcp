@@ -314,7 +314,7 @@ pub(super) fn optional_event_kinds(
     match arguments.get("kinds") {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(values)) => {
-            ensure_array_limit("kinds", values.len(), 12)?;
+            ensure_array_limit("kinds", values.len(), 15)?;
             let kinds = values
                 .iter()
                 .map(|value| {
@@ -620,6 +620,22 @@ pub(super) fn store_rpc_error(error: StoreError) -> RpcError {
                 "retry_after_seconds": retry_after_seconds,
             }))
         }
+        StoreError::FeatureRevisionConflict {
+            feature_id,
+            expected,
+            actual,
+            current,
+        } => RpcError::new(-32602, "Revision conflict").with_data(json!({
+            "code": "revision_conflict",
+            "message": format!(
+                "feature {feature_id} revision conflict: expected {expected}, actual {actual}"
+            ),
+            "resource_type": "feature",
+            "feature_id": feature_id,
+            "expected_revision": expected,
+            "actual_revision": actual,
+            "current": current,
+        })),
         StoreError::ClaimConflict {
             resource_type,
             resource_id,
@@ -644,6 +660,24 @@ pub(super) fn machine_error_data(code: &str, message: impl Into<String>) -> Valu
 }
 
 pub(super) fn store_error_payload(error: &StoreError) -> Value {
+    if let StoreError::FeatureRevisionConflict {
+        expected,
+        actual,
+        current,
+        ..
+    } = error
+    {
+        return json!({
+            "error": {
+                "code": "revision_conflict",
+                "message": error.to_string(),
+                "resource_type": "feature",
+                "expected_revision": expected,
+                "actual_revision": actual,
+                "current": current,
+            }
+        });
+    }
     if let StoreError::RevisionConflict {
         expected,
         actual,
@@ -668,6 +702,7 @@ pub(super) fn store_error_payload(error: &StoreError) -> Value {
         StoreError::NotFound(_) => "not_found",
         StoreError::Conflict(_) => "conflict",
         StoreError::RevisionConflict { .. } => unreachable!("handled above"),
+        StoreError::FeatureRevisionConflict { .. } => unreachable!("handled above"),
         StoreError::ClaimConflict { .. } => "claim_conflict",
         StoreError::Database(_)
         | StoreError::Io(_)
