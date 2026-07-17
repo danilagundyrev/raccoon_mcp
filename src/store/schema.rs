@@ -134,6 +134,14 @@ CREATE INDEX IF NOT EXISTS work_items_feature_status_idx
 CREATE INDEX IF NOT EXISTS work_items_owner_status_idx
     ON work_items(owner_repository_id, status, priority, created_at);
 
+CREATE INDEX IF NOT EXISTS work_items_implementation_artifact_idx
+    ON work_items(implementation_artifact_id, feature_id, work_item_id)
+    WHERE implementation_artifact_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS work_items_latest_audit_artifact_idx
+    ON work_items(latest_audit_artifact_id, feature_id, kind, work_item_id)
+    WHERE latest_audit_artifact_id IS NOT NULL;
+
 CREATE TRIGGER IF NOT EXISTS work_items_lineage_owner_immutable
 BEFORE UPDATE OF owner_repository_id ON work_items
 WHEN OLD.kind IN ('audit', 'remediation')

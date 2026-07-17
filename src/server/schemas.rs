@@ -335,7 +335,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "list_requests",
-            "description": "Discover compact durable requests visible to the actor repository.",
+            "description": "Discover compact durable requests visible to the actor repository, including handler_requirement and answer_requirement for routing without per-request reads.",
             "inputSchema": list_requests_schema(),
             "annotations": mutation_annotations(true)
         },
@@ -353,7 +353,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "list_artifacts",
-            "description": "Discover accessible artifact metadata without content. Orchestrators may recover explicitly project-shared WorkItem reports and linked coordination artifacts; request artifacts remain participant-private. Use read_artifact for the body.",
+            "description": "Discover accessible artifact metadata without content. Batch audit metadata separates audit_work_item_id from deterministic scoped_work_item_ids. Orchestrators may recover explicitly project-shared WorkItem reports and linked coordination artifacts; request artifacts remain participant-private. Use read_artifact for the body.",
             "inputSchema": list_artifacts_schema(),
             "annotations": mutation_annotations(true)
         },

@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ArtifactId, ArtifactKind, Feature, FeatureId, HandlerRequirement, InstanceId, Message,
-    MessageId, ProjectId, RepositoryId, RequestId, RequestStatus, ThreadId, WorkItemId, WorkerRole,
-    WorkerRunId, WorkerRunStatus,
+    AnswerRequirement, ArtifactId, ArtifactKind, Feature, FeatureId, HandlerRequirement,
+    InstanceId, Message, MessageId, ProjectId, RepositoryId, RequestId, RequestStatus, ThreadId,
+    WorkItemId, WorkerRole, WorkerRunId, WorkerRunStatus,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,6 +97,7 @@ pub struct RequestSummary {
     pub work_item_id: Option<WorkItemId>,
     pub status: RequestStatus,
     pub handler_requirement: HandlerRequirement,
+    pub answer_requirement: AnswerRequirement,
     pub question_summary: String,
     pub answer_message_id: Option<MessageId>,
     pub created_at: String,
@@ -127,6 +128,8 @@ pub struct ArtifactMetadata {
     pub content_type: String,
     pub feature_id: Option<FeatureId>,
     pub work_item_id: Option<WorkItemId>,
+    pub audit_work_item_id: Option<WorkItemId>,
+    pub scoped_work_item_ids: Vec<WorkItemId>,
     pub request_id: Option<RequestId>,
     pub message_id: Option<MessageId>,
     pub created_at: String,

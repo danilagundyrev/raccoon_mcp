@@ -920,8 +920,8 @@ pub(super) async fn read_resource(
                 "recovery_flow": [
                     "Retain connect_orchestrator.snapshot_event_cursor before reading recovery pages. It is captured in the same transaction as bootstrap counters and repository presence.",
                     "Treat durable list APIs as the source of truth and events only as wake-up hints. Use list_features(status, after_feature_id, limit) and list_work_items to recover the work graph without remembered entity IDs.",
-                    "Use actor-scoped list_worker_runs, list_requests, list_deliveries, list_messages and list_artifacts pages to recover execution and communication history. Their default page size is 20 and maximum is 50.",
-                    "list_artifacts returns metadata only; load selected bodies with read_artifact after actor-scoped authorization. Same-project orchestrators can recover accepted WorkItem reports and explicitly linked non-request coordination artifacts.",
+                    "Use actor-scoped list_worker_runs, list_requests, list_deliveries, list_messages and list_artifacts pages to recover execution and communication history. Their default page size is 20 and maximum is 50. Request summaries include both handler_requirement and answer_requirement.",
+                    "list_artifacts returns metadata only; load selected bodies with read_artifact after actor-scoped authorization. Same-project orchestrators can recover accepted WorkItem reports and explicitly linked non-request coordination artifacts. Batch audit rows expose audit_work_item_id and the complete deterministic scoped_work_item_ids array.",
                     "get_work_item includes the active or latest worker projection so a replacement orchestrator can resume the correct run lineage.",
                     "Continue each page with its next_cursor while has_more is true, retaining the same filters between pages. Then call wait_for_events with cursor=snapshot_event_cursor and reconcile newer events.",
                     "For durable event progress, choose a repository-local consumer_key. get_event_checkpoint reads it, wait_for_events uses it only when cursor is omitted, and commit_event_cursor advances it monotonically after processing. The server never auto-commits."
@@ -954,7 +954,7 @@ pub(super) async fn read_resource(
                     "Call ack_message after processing; broadcast recipients acknowledge independently."
                 ],
                 "artifact_access": [
-                    "An artifact accepted as a WorkItem implementation report or latest audit report is project-shared for orchestrators in that project.",
+                    "An artifact accepted as a WorkItem implementation report or published with persisted audit outcomes is project-shared for orchestrators in that project, including superseded audit iterations.",
                     "Attaching feature_id or work_item_id to a non-request message explicitly declares its artifact project-shared for same-project orchestrators.",
                     "An unlinked message artifact remains limited to its producer repository and message recipients.",
                     "Request question and answer artifacts remain limited to requester, target and producer even when the request also links a Feature or WorkItem.",

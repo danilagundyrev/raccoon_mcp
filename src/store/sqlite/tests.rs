@@ -3617,6 +3617,14 @@ async fn maintenance_reaps_expired_runtime_state_and_reports_metrics() {
             "artifacts_producer_kind_idx",
         ),
         (
+            "EXPLAIN QUERY PLAN SELECT work_item_id FROM work_items WHERE implementation_artifact_id = 'artifact'",
+            "work_items_implementation_artifact_idx",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT work_item_id FROM work_items WHERE latest_audit_artifact_id = 'artifact'",
+            "work_items_latest_audit_artifact_idx",
+        ),
+        (
             "EXPLAIN QUERY PLAN SELECT event_id FROM events WHERE recipient_repository_id = 'repository' AND kind = 'message_available' AND event_id > 0 ORDER BY event_id",
             "events_repository_kind_cursor_idx",
         ),
@@ -3632,6 +3640,42 @@ async fn maintenance_reaps_expired_runtime_state_and_reports_metrics() {
             "unexpected query plan: {plan}"
         );
     }
+    let shared_artifact_plan = sqlx::query(
+        "EXPLAIN QUERY PLAN
+         SELECT a.artifact_id FROM artifacts a
+         WHERE a.project_id = 'project' AND (
+             EXISTS (
+                 SELECT 1 FROM work_items shared_implementation
+                 JOIN features shared_feature
+                   ON shared_feature.feature_id = shared_implementation.feature_id
+                 WHERE shared_implementation.implementation_artifact_id = a.artifact_id
+                   AND shared_feature.project_id = a.project_id
+             ) OR EXISTS (
+                 SELECT 1 FROM audit_outcomes shared_audit
+                 JOIN work_items shared_audit_item
+                   ON shared_audit_item.work_item_id = shared_audit.audit_work_item_id
+                 JOIN features shared_audit_feature
+                   ON shared_audit_feature.feature_id = shared_audit_item.feature_id
+                 WHERE shared_audit.audit_artifact_id = a.artifact_id
+                   AND shared_audit_feature.project_id = a.project_id
+             )
+         ) ORDER BY a.created_at, a.artifact_id LIMIT 51",
+    )
+    .fetch_all(&store.pool)
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| row.try_get::<String, _>("detail").unwrap())
+    .collect::<Vec<_>>()
+    .join(" ");
+    assert!(
+        shared_artifact_plan.contains("work_items_implementation_artifact_idx"),
+        "unexpected shared-artifact query plan: {shared_artifact_plan}"
+    );
+    assert!(
+        shared_artifact_plan.contains("sqlite_autoindex_audit_outcomes"),
+        "unexpected shared-artifact query plan: {shared_artifact_plan}"
+    );
 
     store.expire_local_leases().await.unwrap();
     assert_eq!(
@@ -5079,7 +5123,7 @@ async fn discovery_lists_reconstruct_actor_visible_state_with_stable_pages() {
             body: None,
             context_refs: json!([]),
             handler_requirement: HandlerRequirement::OrchestratorAllowed,
-            answer_requirement: AnswerRequirement::SummaryAllowed,
+            answer_requirement: AnswerRequirement::ArtifactRequired,
         })
         .await
         .unwrap();
@@ -5156,6 +5200,10 @@ async fn discovery_lists_reconstruct_actor_visible_state_with_stable_pages() {
         .await
         .unwrap();
     assert_eq!(requests.items[0].request_id, request.request_id);
+    assert_eq!(
+        requests.items[0].answer_requirement,
+        AnswerRequirement::ArtifactRequired
+    );
     let deliveries = store
         .list_deliveries(
             ActorRef::Orchestrator(android.instance.instance_id),
@@ -5685,6 +5733,117 @@ async fn orchestrators_share_linked_artifacts_without_exposing_private_or_reques
     assert!(!web_artifact_ids.contains(&private.artifact_id));
     assert!(!web_artifact_ids.contains(&question_artifact_id));
     assert!(!web_artifact_ids.contains(&answer.artifact_id));
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn batch_audit_artifact_metadata_preserves_card_and_complete_scope() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "batch-audit-metadata",
+            "backend",
+            "C:/batch-audit/backend",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: connected.instance.instance_id,
+            title: "Batch audit metadata".to_owned(),
+            summary: "Recover every audited WorkItem deterministically".to_owned(),
+        })
+        .await
+        .unwrap();
+    let mut implementation_ids = Vec::new();
+    for label in ["API", "storage"] {
+        let item = store
+            .create_work_item(CreateWorkItem {
+                parent_instance_id: connected.instance.instance_id,
+                feature_id: feature.feature_id,
+                parent_work_item_id: None,
+                owner_repository_id: connected.repository.repository_id,
+                title: format!("Implement {label}"),
+                summary: format!("Implementation covered by the {label} audit scope"),
+                kind: WorkItemKind::Implementation,
+                audit_scope_work_item_ids: Vec::new(),
+                addresses_audit_run_id: None,
+                dependency_ids: Vec::new(),
+                priority: 0,
+                max_audit_iterations: 1,
+            })
+            .await
+            .unwrap();
+        complete_implementation_work(&store, &connected, feature.feature_id, &item).await;
+        implementation_ids.push(item.work_item_id);
+    }
+    implementation_ids.sort_by_key(ToString::to_string);
+
+    let audit_item = create_claimed_audit_item(
+        &store,
+        &connected,
+        feature.feature_id,
+        implementation_ids.clone(),
+        "batch metadata",
+    )
+    .await;
+    let auditor = create_auditor_run(&store, &connected, &audit_item, "Audit both items").await;
+    store
+        .activate_worker_run(auditor.worker_run_id)
+        .await
+        .unwrap();
+    let audit_artifact = store
+        .publish_message_with_audit_outcomes(
+            PublishMessage {
+                actor: ActorRef::Worker(auditor.worker_run_id),
+                kind: MessageKind::Report,
+                target: MessageTarget::Broadcast,
+                summary: "Batch audit passed".to_owned(),
+                body: Some("BATCH_AUDIT_REPORT".to_owned()),
+                artifact_kind: ArtifactKind::AuditReport,
+                artifact_title: None,
+                content_type: "text/markdown".to_owned(),
+                feature_id: Some(feature.feature_id),
+                work_item_id: None,
+                request_id: None,
+                thread_id: None,
+                correlation_id: None,
+                in_reply_to: None,
+            },
+            &implementation_ids
+                .iter()
+                .map(|work_item_id| audit_outcome(*work_item_id, AuditVerdict::Passed))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
+
+    for scoped_work_item_id in &implementation_ids {
+        let page = store
+            .list_artifacts(
+                ActorRef::Orchestrator(connected.instance.instance_id),
+                ArtifactListFilter {
+                    work_item_id: Some(*scoped_work_item_id),
+                    ..Default::default()
+                },
+                None,
+                20,
+            )
+            .await
+            .unwrap();
+        let metadata = page
+            .items
+            .iter()
+            .find(|metadata| metadata.artifact_id == audit_artifact.artifact_id)
+            .unwrap();
+        assert_eq!(metadata.work_item_id, None);
+        assert_eq!(metadata.audit_work_item_id, Some(audit_item.work_item_id));
+        assert_eq!(metadata.scoped_work_item_ids, implementation_ids);
+    }
 
     store.pool.close().await;
     remove_database(&path);

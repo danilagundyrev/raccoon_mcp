@@ -124,8 +124,8 @@ impl SqliteStore {
         };
         let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT request_id, project_id, requester_repository_id, target_repository_id,
-                    feature_id, work_item_id, status, handler_requirement, question_summary,
-                    answer_message_id, created_at, updated_at, finished_at
+                    feature_id, work_item_id, status, handler_requirement, answer_requirement,
+                    question_summary, answer_message_id, created_at, updated_at, finished_at
              FROM requests WHERE project_id = ",
         );
         query
@@ -349,27 +349,14 @@ impl SqliteStore {
         } else {
             None
         };
-        let linked_feature = "COALESCE(
-            (SELECT feature_id FROM messages WHERE artifact_id = a.artifact_id LIMIT 1),
-            (SELECT feature_id FROM work_items WHERE implementation_artifact_id = a.artifact_id OR latest_audit_artifact_id = a.artifact_id LIMIT 1),
-            (SELECT feature_id FROM requests WHERE question_artifact_id = a.artifact_id LIMIT 1))";
-        let linked_work_item = "COALESCE(
-            (SELECT work_item_id FROM messages WHERE artifact_id = a.artifact_id LIMIT 1),
-            (SELECT work_item_id FROM work_items WHERE implementation_artifact_id = a.artifact_id OR latest_audit_artifact_id = a.artifact_id LIMIT 1),
-            (SELECT work_item_id FROM requests WHERE question_artifact_id = a.artifact_id LIMIT 1))";
-        let linked_request = "COALESCE(
-            (SELECT request_id FROM messages WHERE artifact_id = a.artifact_id LIMIT 1),
-            (SELECT request_id FROM requests WHERE question_artifact_id = a.artifact_id LIMIT 1))";
-        let mut query = QueryBuilder::<Sqlite>::new(format!(
+        let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT a.artifact_id, a.project_id, a.producer_repository_id,
                     a.producer_instance_id, a.producer_worker_run_id, a.kind, a.title,
                     a.content_type, a.created_at,
-                    {linked_feature} AS feature_id,
-                    {linked_work_item} AS work_item_id,
-                    {linked_request} AS request_id,
-                    (SELECT message_id FROM messages WHERE artifact_id = a.artifact_id LIMIT 1) AS message_id
-             FROM artifacts a WHERE a.project_id = "
-        ));
+                    NULL AS feature_id, NULL AS work_item_id, NULL AS request_id,
+                    NULL AS message_id
+             FROM artifacts a WHERE a.project_id = ",
+        );
         query.push_bind(actor.project_id.to_string()).push(" AND ");
         push_artifact_access_predicate(
             &mut query,
@@ -383,7 +370,9 @@ impl SqliteStore {
             query
                 .push(" AND (EXISTS (SELECT 1 FROM messages linked_message WHERE linked_message.artifact_id = a.artifact_id AND linked_message.feature_id = ")
                 .push_bind(feature_id.to_string())
-                .push(") OR EXISTS (SELECT 1 FROM work_items linked_item WHERE (linked_item.implementation_artifact_id = a.artifact_id OR linked_item.latest_audit_artifact_id = a.artifact_id) AND linked_item.feature_id = ")
+                .push(") OR EXISTS (SELECT 1 FROM work_items linked_item WHERE linked_item.implementation_artifact_id = a.artifact_id AND linked_item.feature_id = ")
+                .push_bind(feature_id.to_string())
+                .push(") OR EXISTS (SELECT 1 FROM audit_outcomes linked_audit JOIN work_items linked_audit_item ON linked_audit_item.work_item_id = linked_audit.audit_work_item_id WHERE linked_audit.audit_artifact_id = a.artifact_id AND linked_audit_item.feature_id = ")
                 .push_bind(feature_id.to_string())
                 .push(") OR EXISTS (SELECT 1 FROM requests linked_request WHERE linked_request.question_artifact_id = a.artifact_id AND linked_request.feature_id = ")
                 .push_bind(feature_id.to_string())
@@ -393,9 +382,14 @@ impl SqliteStore {
             query
                 .push(" AND (EXISTS (SELECT 1 FROM messages linked_message WHERE linked_message.artifact_id = a.artifact_id AND linked_message.work_item_id = ")
                 .push_bind(work_item_id.to_string())
-                .push(") OR EXISTS (SELECT 1 FROM work_items linked_item WHERE (linked_item.implementation_artifact_id = a.artifact_id OR linked_item.latest_audit_artifact_id = a.artifact_id) AND linked_item.work_item_id = ")
+                .push(") OR EXISTS (SELECT 1 FROM work_items linked_item WHERE linked_item.implementation_artifact_id = a.artifact_id AND linked_item.work_item_id = ")
                 .push_bind(work_item_id.to_string())
-                .push(") OR EXISTS (SELECT 1 FROM requests linked_request WHERE linked_request.question_artifact_id = a.artifact_id AND linked_request.work_item_id = ")
+                .push(") OR EXISTS (SELECT 1 FROM audit_outcomes linked_audit WHERE linked_audit.audit_artifact_id = a.artifact_id AND (linked_audit.audit_work_item_id = ")
+                .push_bind(work_item_id.to_string())
+                .push(" OR linked_audit.scoped_work_item_id = ")
+                .push_bind(work_item_id.to_string())
+                .push("))")
+                .push(" OR EXISTS (SELECT 1 FROM requests linked_request WHERE linked_request.question_artifact_id = a.artifact_id AND linked_request.work_item_id = ")
                 .push_bind(work_item_id.to_string())
                 .push("))");
         }
@@ -423,11 +417,12 @@ impl SqliteStore {
             .push_bind(i64::from(limit) + 1);
         let rows = query.build().fetch_all(&self.pool).await?;
         let has_more = rows.len() > usize::from(limit);
-        let items = rows
+        let mut items = rows
             .iter()
             .take(usize::from(limit))
             .map(artifact_metadata_from_row)
             .collect::<Result<Vec<_>, _>>()?;
+        populate_artifact_metadata_links(&self.pool, &mut items).await?;
         Ok(ArtifactPage {
             next_cursor: items.last().map(|item| item.artifact_id),
             items,
@@ -459,6 +454,112 @@ fn push_history_cursor<'a>(
             .push(" > ")
             .push_bind(id)
             .push("))");
+    }
+    Ok(())
+}
+
+async fn populate_artifact_metadata_links(
+    pool: &SqlitePool,
+    items: &mut [ArtifactMetadata],
+) -> Result<(), StoreError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let positions = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.artifact_id, index))
+        .collect::<HashMap<_, _>>();
+    let artifact_ids = items
+        .iter()
+        .map(|item| item.artifact_id)
+        .collect::<Vec<_>>();
+
+    let mut links = QueryBuilder::<Sqlite>::new(
+        "SELECT artifact_id, 1 AS relation_order, feature_id, work_item_id,
+                NULL AS audit_work_item_id, NULL AS scoped_work_item_id,
+                request_id, message_id
+         FROM messages WHERE artifact_id IN (",
+    );
+    push_artifact_id_bindings(&mut links, &artifact_ids);
+    links.push(
+        ") UNION ALL
+         SELECT question_artifact_id, 2, feature_id, work_item_id, NULL, NULL,
+                request_id, NULL
+         FROM requests WHERE question_artifact_id IN (",
+    );
+    push_artifact_id_bindings(&mut links, &artifact_ids);
+    links.push(
+        ") UNION ALL
+         SELECT implementation_artifact_id, 3, feature_id, work_item_id,
+                NULL, NULL, NULL, NULL
+         FROM work_items WHERE implementation_artifact_id IN (",
+    );
+    push_artifact_id_bindings(&mut links, &artifact_ids);
+    links.push(
+        ") UNION ALL
+         SELECT outcome.audit_artifact_id, 4, audit_item.feature_id, NULL,
+                outcome.audit_work_item_id, outcome.scoped_work_item_id, NULL, NULL
+         FROM audit_outcomes outcome
+         JOIN work_items audit_item ON audit_item.work_item_id = outcome.audit_work_item_id
+         WHERE outcome.audit_artifact_id IN (",
+    );
+    push_artifact_id_bindings(&mut links, &artifact_ids);
+    links.push(
+        ") ORDER BY artifact_id, relation_order, scoped_work_item_id,
+                    work_item_id, request_id, message_id",
+    );
+    for row in links.build().fetch_all(pool).await? {
+        let artifact_id = ArtifactId::parse(row.try_get("artifact_id")?)?;
+        let metadata = &mut items[positions[&artifact_id]];
+        set_optional_id(
+            &mut metadata.feature_id,
+            row.try_get("feature_id")?,
+            FeatureId::parse,
+        )?;
+        set_optional_id(
+            &mut metadata.work_item_id,
+            row.try_get("work_item_id")?,
+            WorkItemId::parse,
+        )?;
+        set_optional_id(
+            &mut metadata.audit_work_item_id,
+            row.try_get("audit_work_item_id")?,
+            WorkItemId::parse,
+        )?;
+        set_optional_id(
+            &mut metadata.request_id,
+            row.try_get("request_id")?,
+            RequestId::parse,
+        )?;
+        set_optional_id(
+            &mut metadata.message_id,
+            row.try_get("message_id")?,
+            MessageId::parse,
+        )?;
+        if let Some(scoped_work_item_id) =
+            parse_optional_id(row.try_get("scoped_work_item_id")?, WorkItemId::parse)?
+        {
+            metadata.scoped_work_item_ids.push(scoped_work_item_id);
+        }
+    }
+    Ok(())
+}
+
+fn push_artifact_id_bindings(query: &mut QueryBuilder<'_, Sqlite>, artifact_ids: &[ArtifactId]) {
+    let mut separated = query.separated(", ");
+    for artifact_id in artifact_ids {
+        separated.push_bind(artifact_id.to_string());
+    }
+}
+
+fn set_optional_id<T: Copy>(
+    target: &mut Option<T>,
+    raw: Option<String>,
+    parse: impl Fn(&str) -> Result<T, uuid::Error>,
+) -> Result<(), StoreError> {
+    if target.is_none() {
+        *target = parse_optional_id(raw, parse)?;
     }
     Ok(())
 }
@@ -506,6 +607,10 @@ fn request_summary_from_row(row: &SqliteRow) -> Result<RequestSummary, StoreErro
             .map_err(StoreError::Conflict)?,
         handler_requirement: row
             .try_get::<String, _>("handler_requirement")?
+            .parse()
+            .map_err(StoreError::Conflict)?,
+        answer_requirement: row
+            .try_get::<String, _>("answer_requirement")?
             .parse()
             .map_err(StoreError::Conflict)?,
         question_summary: row.try_get("question_summary")?,
@@ -561,6 +666,8 @@ fn artifact_metadata_from_row(row: &SqliteRow) -> Result<ArtifactMetadata, Store
         content_type: row.try_get("content_type")?,
         feature_id: parse_optional_id(row.try_get("feature_id")?, FeatureId::parse)?,
         work_item_id: parse_optional_id(row.try_get("work_item_id")?, WorkItemId::parse)?,
+        audit_work_item_id: None,
+        scoped_work_item_ids: Vec::new(),
         request_id: parse_optional_id(row.try_get("request_id")?, RequestId::parse)?,
         message_id: parse_optional_id(row.try_get("message_id")?, MessageId::parse)?,
         created_at: row.try_get("created_at")?,

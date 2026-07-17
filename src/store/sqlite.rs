@@ -411,11 +411,19 @@ fn push_artifact_access_predicate<'a>(
     if allow_project_shared {
         query.push(
             " OR EXISTS (
-                SELECT 1 FROM work_items shared_item
-                JOIN features shared_feature ON shared_feature.feature_id = shared_item.feature_id
-                WHERE (shared_item.implementation_artifact_id = a.artifact_id
-                       OR shared_item.latest_audit_artifact_id = a.artifact_id)
+                SELECT 1 FROM work_items shared_implementation
+                JOIN features shared_feature
+                  ON shared_feature.feature_id = shared_implementation.feature_id
+                WHERE shared_implementation.implementation_artifact_id = a.artifact_id
                   AND shared_feature.project_id = a.project_id
+            ) OR EXISTS (
+                SELECT 1 FROM audit_outcomes shared_audit
+                JOIN work_items shared_audit_item
+                  ON shared_audit_item.work_item_id = shared_audit.audit_work_item_id
+                JOIN features shared_audit_feature
+                  ON shared_audit_feature.feature_id = shared_audit_item.feature_id
+                WHERE shared_audit.audit_artifact_id = a.artifact_id
+                  AND shared_audit_feature.project_id = a.project_id
             ) OR EXISTS (
                 SELECT 1 FROM messages shared_message
                 WHERE shared_message.artifact_id = a.artifact_id

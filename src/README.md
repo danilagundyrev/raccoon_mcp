@@ -510,13 +510,15 @@ Acknowledgement closes a delivery for one repository. It does not delete the mes
 
 Artifact bodies always require an actor-scoped `read_artifact` call. Authorization depends on how the artifact participates in coordination:
 
-- an artifact accepted as a WorkItem's `implementation_artifact_id` or `latest_audit_artifact_id` is readable by orchestrators in the same project;
+- an artifact accepted as a WorkItem's `implementation_artifact_id`, or published with persisted audit outcomes, is readable by orchestrators in the same project; older audit iterations remain recoverable after `latest_audit_artifact_id` advances;
 - adding `feature_id` or `work_item_id` to a non-request message explicitly makes its artifact project-shared for same-project orchestrators;
 - an unlinked message artifact remains readable only by its producer repository and message recipients;
 - request question and answer artifacts remain limited to the requester, target, and producer even when the request links a Feature or WorkItem;
 - worker actors keep repository/run-scoped access and do not inherit orchestrator-wide project visibility.
 
-`list_artifacts` applies the same rules and returns metadata only. Linking a normal message to a Feature or WorkItem is therefore an authorization decision, not just a tracing label. Use no typed link for repository-private content, and use `request_id` for participant-private question/answer content.
+`list_artifacts` applies the same rules and returns metadata only. For ordinary message, implementation, and remediation artifacts, `work_item_id` is the direct linked card. A batch audit artifact instead exposes its audit card through `audit_work_item_id` and every reviewed implementation through the deterministic `scoped_work_item_ids` array; it never collapses that scope into one arbitrary ID.
+
+Linking a normal message to a Feature or WorkItem is therefore an authorization decision, not just a tracing label. Use no typed link for repository-private content, and use `request_id` for participant-private question/answer content.
 
 ## Audits and remediation
 
@@ -622,7 +624,7 @@ A new or replacement orchestrator does not need remembered entity IDs. After con
 1. retain the returned `snapshot_event_cursor`;
 2. page through `list_features`, optionally filtering by `active`;
 3. page through `list_work_items` for relevant features;
-4. use `list_worker_runs` and `list_requests` to recover execution and question state;
+4. use `list_worker_runs` and `list_requests` to recover execution and question state; request summaries include both handler and answer requirements, so routing does not require one `read_request` call per row;
 5. use `list_deliveries` for mailbox history and `list_messages` for linked headers;
 6. use `list_artifacts` to find metadata, then selectively call `read_artifact`;
 7. call `wait_for_events` with `cursor: snapshot_event_cursor` and reconcile newer events.
@@ -762,7 +764,7 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 | `release_request_claim` | Return an owned request to pending. |
 | `answer_request` | Close an owned request, enforce its answer requirement, and record provenance. |
 | `fail_request` | Requeue a retryable request or terminally fail it. |
-| `list_requests` | Discover visible request history by participant, linked entity, or status. |
+| `list_requests` | Discover visible request history, including handler and answer requirements, by participant, linked entity, or status. |
 
 ### Messages and events
 
@@ -772,7 +774,7 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 | `list_inbox` | List pending headers with pagination and kind filtering. |
 | `list_deliveries` | List pending, acknowledged, or all deliveries for the actor repository. |
 | `list_messages` | Discover accessible message headers by linked entity, thread, kind, producer, or recipient. |
-| `list_artifacts` | Discover authorized artifact metadata, including project-shared linked reports, without loading content. |
+| `list_artifacts` | Discover authorized artifact metadata, including complete batch-audit scope, without loading content. |
 | `read_message` | Read an accessible message envelope. |
 | `read_artifact` | Read authorized full content; orchestrators can recover explicitly project-shared linked artifacts. |
 | `ack_message` | Idempotently acknowledge a delivery. |

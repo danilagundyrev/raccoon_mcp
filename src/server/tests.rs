@@ -1280,6 +1280,24 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
             .unwrap()
             .contains("project-shared")
     );
+    assert!(
+        list_artifacts_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("scoped_work_item_ids")
+    );
+    let list_requests_tool = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "list_requests")
+        .unwrap();
+    assert!(
+        list_requests_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("answer_requirement")
+    );
     let read_artifact_tool = tools
         .as_array()
         .unwrap()
