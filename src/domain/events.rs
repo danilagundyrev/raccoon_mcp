@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ProjectId, RepositoryId};
+use super::{FeatureId, ProjectId, RepositoryId, RequestId, WorkItemId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventCheckpoint {
@@ -128,6 +128,12 @@ pub struct HubEvent {
     pub kind: EventKind,
     pub entity_type: EventEntityType,
     pub entity_id: String,
+    pub feature_id: Option<FeatureId>,
+    pub owner_repository_id: Option<RepositoryId>,
+    pub entity_status: Option<String>,
+    pub entity_revision: Option<u64>,
+    pub work_item_id: Option<WorkItemId>,
+    pub request_id: Option<RequestId>,
     pub created_at: String,
 }
 

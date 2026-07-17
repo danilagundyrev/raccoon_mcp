@@ -177,14 +177,7 @@ impl SqliteStore {
             created_at: now.clone(),
         };
         insert_message(&mut transaction, &message).await?;
-        insert_message_fanout(
-            &mut transaction,
-            actor.project_id,
-            message.message_id,
-            &recipient_ids,
-            &now,
-        )
-        .await?;
+        insert_message_fanout(&mut transaction, &message, &recipient_ids).await?;
         record_idempotent_result(
             &mut transaction,
             &actor_key,
@@ -395,15 +388,13 @@ impl SqliteStore {
 
 async fn insert_message_fanout(
     transaction: &mut Transaction<'_, Sqlite>,
-    project_id: ProjectId,
-    message_id: MessageId,
+    message: &Message,
     recipient_ids: &[RepositoryId],
-    created_at: &str,
 ) -> Result<(), StoreError> {
     let mut targets =
         QueryBuilder::<Sqlite>::new("INSERT INTO message_targets(message_id, repository_id) ");
     targets.push_values(recipient_ids, |mut row, repository_id| {
-        row.push_bind(message_id.to_string())
+        row.push_bind(message.message_id.to_string())
             .push_bind(repository_id.to_string());
     });
     targets.build().execute(&mut **transaction).await?;
@@ -412,10 +403,10 @@ async fn insert_message_fanout(
         "INSERT INTO deliveries(message_id, recipient_repository_id, status, created_at, acked_at, acked_by_instance_id, acked_by_worker_run_id) ",
     );
     deliveries.push_values(recipient_ids, |mut row, repository_id| {
-        row.push_bind(message_id.to_string())
+        row.push_bind(message.message_id.to_string())
             .push_bind(repository_id.to_string())
             .push_bind("pending")
-            .push_bind(created_at)
+            .push_bind(&message.created_at)
             .push_bind(Option::<String>::None)
             .push_bind(Option::<String>::None)
             .push_bind(Option::<String>::None);
@@ -423,15 +414,25 @@ async fn insert_message_fanout(
     deliveries.build().execute(&mut **transaction).await?;
 
     let mut events = QueryBuilder::<Sqlite>::new(
-        "INSERT INTO events(project_id, recipient_repository_id, kind, entity_type, entity_id, created_at) ",
+        "INSERT INTO events(
+             project_id, recipient_repository_id, kind, entity_type, entity_id,
+             feature_id, owner_repository_id, entity_status, entity_revision,
+             work_item_id, request_id, created_at
+         ) ",
     );
     events.push_values(recipient_ids, |mut row, repository_id| {
-        row.push_bind(project_id.to_string())
+        row.push_bind(message.project_id.to_string())
             .push_bind(repository_id.to_string())
             .push_bind(EventKind::MessageAvailable.as_str())
             .push_bind(EventEntityType::Message.as_str())
-            .push_bind(message_id.to_string())
-            .push_bind(created_at);
+            .push_bind(message.message_id.to_string())
+            .push_bind(message.feature_id.map(|id| id.to_string()))
+            .push_bind(Option::<String>::None)
+            .push_bind(Option::<String>::None)
+            .push_bind(Option::<i64>::None)
+            .push_bind(message.work_item_id.map(|id| id.to_string()))
+            .push_bind(message.request_id.map(|id| id.to_string()))
+            .push_bind(&message.created_at);
     });
     events.build().execute(&mut **transaction).await?;
     Ok(())

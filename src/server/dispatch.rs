@@ -35,7 +35,7 @@ pub(super) async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, retain snapshot_event_cursor, then read hub://guide for the complete machine-readable workflow. Recover durable state through bounded list_features, list_work_items, list_worker_runs, list_requests, list_deliveries, list_messages and metadata-only list_artifacts pages; then wait strictly after the snapshot watermark. Same-project orchestrators may recover accepted WorkItem reports and non-request artifacts explicitly linked to a Feature/WorkItem; unlinked and request artifacts retain their narrower authorization. Events are wake-up hints, not the source of truth. Named repository event consumers use get_event_checkpoint and explicit monotonic commit_event_cursor; returned pages never auto-commit. Model shared work with create_feature/create_work_item and expected_revision, and claim an owner-repository item before creating its matching worker run. Spawn a fresh executor child for each independent implementation WorkItem; same-lineage remediation may reuse that child context but always gets a new worker_run_id. Audit cards use fresh auditor children with no executor/remediation conversation history and carry repository-local scope. Every audit_report includes exact structured audit_outcomes; remediation requires a later fresh passing audit, and Feature completion requires verified coverage for every accepted implementation report. Workers never register as repositories. Use ask_repository for durable questions: orchestrator_allowed permits an answer from coordination state already in hand, while butler_required can be claimed and answered only by a fresh request-scoped butler linked through request_id. Use actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for finite repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. JSON-RPC batches are not supported.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, retain snapshot_event_cursor, then read hub://guide for the complete machine-readable workflow. Recover durable state through bounded list_features, list_work_items, list_worker_runs, list_requests, list_deliveries, list_messages and metadata-only list_artifacts pages; then wait strictly after the snapshot watermark. Same-project orchestrators may recover accepted WorkItem reports and non-request artifacts explicitly linked to a Feature/WorkItem; unlinked and request artifacts retain their narrower authorization. Events are wake-up hints, not the source of truth. Their compact headers contain post-mutation routing/status fields and may be filtered by feature_id and owner_repository_id before selective entity reads. Named repository event consumers use get_event_checkpoint and explicit monotonic commit_event_cursor; returned pages never auto-commit. Model shared work with create_feature/create_work_item and expected_revision, and claim an owner-repository item before creating its matching worker run. Spawn a fresh executor child for each independent implementation WorkItem; same-lineage remediation may reuse that child context but always gets a new worker_run_id. Audit cards use fresh auditor children with no executor/remediation conversation history and carry repository-local scope. Every audit_report includes exact structured audit_outcomes; remediation requires a later fresh passing audit, and Feature completion requires verified coverage for every accepted implementation report. Workers never register as repositories. Use ask_repository for durable questions: orchestrator_allowed permits an answer from coordination state already in hand, while butler_required can be claimed and answered only by a fresh request-scoped butler linked through request_id. Use actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for finite repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. JSON-RPC batches are not supported.",
             }))
         }
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
@@ -514,18 +514,24 @@ pub(super) async fn call_tool(
             let cursor = optional_nonnegative_i64(&arguments, "cursor")?;
             let consumer_key = optional_consumer_key(&arguments)?;
             let kinds = optional_event_kinds(&arguments)?;
+            let feature_id = optional_feature_id(&arguments, "feature_id")?;
+            let owner_repository_id = optional_repository_id(&arguments, "owner_repository_id")?;
             let requested_timeout_seconds = optional_timeout_seconds(&arguments)?;
             let effective_timeout_seconds =
                 effective_wait_seconds(requested_timeout_seconds, max_wait_seconds);
             let limit = optional_event_limit(&arguments)?.unwrap_or(20);
             let started_at = tokio::time::Instant::now();
-            store.wait_for_events_from(
+            store.wait_for_events_filtered(
                 actor,
-                cursor,
-                consumer_key.as_deref(),
-                &kinds,
-                Duration::from_secs(effective_timeout_seconds),
-                limit,
+                EventWaitOptions {
+                    cursor,
+                    consumer_key: consumer_key.as_deref(),
+                    kinds: &kinds,
+                    feature_id,
+                    owner_repository_id,
+                    timeout: Duration::from_secs(effective_timeout_seconds),
+                    limit,
+                },
             )
             .await
             .map(|value| {
@@ -946,13 +952,19 @@ pub(super) async fn read_resource(
                 "messaging_flow": [
                     "Publish an immutable summary and optional artifact with publish_message.",
                     "Supply an actor-scoped idempotency_key to creation calls that may be retried; the same key requires an identical payload.",
-                    "Call wait_for_events with an explicit last event cursor or a consumer_key whose checkpoint should be used. Explicit cursor wins. Every call is finite and never auto-commits; call commit_event_cursor only after processing.",
+                    "Call wait_for_events with an explicit last event cursor or a consumer_key whose checkpoint should be used. Explicit cursor wins. Add feature_id and owner_repository_id filters when only one routing scope matters. Every call is finite and never auto-commits; call commit_event_cursor only after processing.",
                     "Use list_inbox for pending headers; use list_deliveries when acknowledged history is also needed.",
                     "Use list_messages and metadata-only list_artifacts to recover accessible history without loading bodies.",
                     "Use the kinds filter to select report, announcement or command headers.",
                     "Use read_message/read_artifact only for selected items.",
                     "Call ack_message after processing; broadcast recipients acknowledge independently."
                 ],
+                "event_headers": {
+                    "routing_fields": ["feature_id", "owner_repository_id", "work_item_id", "request_id"],
+                    "snapshot_fields": ["entity_status", "entity_revision"],
+                    "filters": ["kinds", "feature_id", "owner_repository_id"],
+                    "hydration": "Headers are immutable post-mutation snapshots. Load the full message, request, worker, Feature or WorkItem only when the header is relevant."
+                },
                 "artifact_access": [
                     "An artifact accepted as a WorkItem implementation report or published with persisted audit outcomes is project-shared for orchestrators in that project, including superseded audit iterations.",
                     "Attaching feature_id or work_item_id to a non-request message explicitly declares its artifact project-shared for same-project orchestrators.",
@@ -967,7 +979,7 @@ pub(super) async fn read_resource(
                     "maintenance": "A frequent indexed lease/session sweep disconnects expired actors and requeues expired request claims. Retention is disabled by default; when configured, each pass deletes at most 1000 old events and 1000 idempotency records.",
                     "shutdown": "Graceful shutdown stops accepting calls, cancels session waiters and expires local actor and claim leases."
                 },
-                "current_scope": "Project/repository presence, feature/work graph with optimistic revisions and claims, linked worker/audit runs, bounded recovery/history discovery, immutable messaging/artifacts, reliable delivery, event waiting and claimed repository requests.",
+                "current_scope": "Project/repository presence, feature/work graph with optimistic revisions and claims, linked worker/audit runs, bounded recovery/history discovery, immutable messaging/artifacts, reliable delivery, compact filterable event headers and claimed repository requests.",
                 "resource_scope": "Feature and work-item cards are addressable resources. Actor-sensitive inbox, message and artifact reads remain tools so producer, delivery, request-participant and project-shared-link authorization receive explicit actor identity.",
             }),
         ));

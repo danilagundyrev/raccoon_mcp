@@ -2179,6 +2179,7 @@ async fn append_project_event(
     entity_id: &str,
     now: &str,
 ) -> Result<Vec<RepositoryId>, StoreError> {
+    let metadata = load_event_metadata(transaction, entity_type, entity_id).await?;
     let rows = sqlx::query("SELECT repository_id FROM repositories WHERE project_id = ?")
         .bind(project_id.to_string())
         .fetch_all(&mut **transaction)
@@ -2186,14 +2187,17 @@ async fn append_project_event(
     let mut recipients = Vec::with_capacity(rows.len());
     for row in rows {
         let repository_id = RepositoryId::parse(row.try_get("repository_id")?)?;
-        append_event(
+        insert_event(
             transaction,
-            project_id,
-            repository_id,
-            kind,
-            entity_type,
-            entity_id,
-            now,
+            NewEvent {
+                project_id,
+                recipient_repository_id: repository_id,
+                kind,
+                entity_type,
+                entity_id,
+                created_at: now,
+            },
+            &metadata,
         )
         .await?;
         recipients.push(repository_id);

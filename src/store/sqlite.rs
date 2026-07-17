@@ -99,6 +99,16 @@ pub struct SqliteStore {
     notifications: Arc<NotificationHub>,
 }
 
+pub struct EventWaitOptions<'a> {
+    pub cursor: Option<i64>,
+    pub consumer_key: Option<&'a str>,
+    pub kinds: &'a [EventKind],
+    pub feature_id: Option<FeatureId>,
+    pub owner_repository_id: Option<RepositoryId>,
+    pub timeout: Duration,
+    pub limit: u8,
+}
+
 #[derive(Default)]
 struct NotificationHub {
     by_repository: StdMutex<HashMap<RepositoryId, Arc<Notify>>>,
@@ -124,6 +134,25 @@ struct ResolvedActor {
     repository_id: RepositoryId,
     instance_id: Option<InstanceId>,
     worker_run_id: Option<WorkerRunId>,
+}
+
+#[derive(Default)]
+struct EventMetadata {
+    feature_id: Option<FeatureId>,
+    owner_repository_id: Option<RepositoryId>,
+    entity_status: Option<String>,
+    entity_revision: Option<u64>,
+    work_item_id: Option<WorkItemId>,
+    request_id: Option<RequestId>,
+}
+
+struct NewEvent<'a> {
+    project_id: ProjectId,
+    recipient_repository_id: RepositoryId,
+    kind: EventKind,
+    entity_type: EventEntityType,
+    entity_id: &'a str,
+    created_at: &'a str,
 }
 
 impl SqliteStore {
@@ -461,20 +490,142 @@ async fn append_event(
     entity_id: &str,
     created_at: &str,
 ) -> Result<(), StoreError> {
+    let metadata = load_event_metadata(transaction, entity_type, entity_id).await?;
+    insert_event(
+        transaction,
+        NewEvent {
+            project_id,
+            recipient_repository_id,
+            kind,
+            entity_type,
+            entity_id,
+            created_at,
+        },
+        &metadata,
+    )
+    .await
+}
+
+async fn insert_event(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event: NewEvent<'_>,
+    metadata: &EventMetadata,
+) -> Result<(), StoreError> {
     sqlx::query(
         "INSERT INTO events(
-             project_id, recipient_repository_id, kind, entity_type, entity_id, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?)",
+             project_id, recipient_repository_id, kind, entity_type, entity_id,
+             feature_id, owner_repository_id, entity_status, entity_revision,
+             work_item_id, request_id, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(project_id.to_string())
-    .bind(recipient_repository_id.to_string())
-    .bind(kind.as_str())
-    .bind(entity_type.as_str())
-    .bind(entity_id)
-    .bind(created_at)
+    .bind(event.project_id.to_string())
+    .bind(event.recipient_repository_id.to_string())
+    .bind(event.kind.as_str())
+    .bind(event.entity_type.as_str())
+    .bind(event.entity_id)
+    .bind(metadata.feature_id.map(|id| id.to_string()))
+    .bind(metadata.owner_repository_id.map(|id| id.to_string()))
+    .bind(&metadata.entity_status)
+    .bind(metadata.entity_revision.map(|revision| revision as i64))
+    .bind(metadata.work_item_id.map(|id| id.to_string()))
+    .bind(metadata.request_id.map(|id| id.to_string()))
+    .bind(event.created_at)
     .execute(&mut **transaction)
     .await?;
     Ok(())
+}
+
+async fn load_event_metadata(
+    transaction: &mut Transaction<'_, Sqlite>,
+    entity_type: EventEntityType,
+    entity_id: &str,
+) -> Result<EventMetadata, StoreError> {
+    let row = match entity_type {
+        EventEntityType::Feature => {
+            sqlx::query(
+                "SELECT feature_id, coordinator_repository_id AS owner_repository_id,
+                    status AS entity_status, revision AS entity_revision,
+                    NULL AS work_item_id, NULL AS request_id
+             FROM features WHERE feature_id = ?",
+            )
+            .bind(entity_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+        }
+        EventEntityType::WorkItem => {
+            sqlx::query(
+                "SELECT feature_id, owner_repository_id, status AS entity_status,
+                    revision AS entity_revision, work_item_id, NULL AS request_id
+             FROM work_items WHERE work_item_id = ?",
+            )
+            .bind(entity_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+        }
+        EventEntityType::WorkerRun => {
+            sqlx::query(
+                "SELECT COALESCE(item.feature_id, request.feature_id) AS feature_id,
+                    worker.repository_id AS owner_repository_id,
+                    worker.status AS entity_status, NULL AS entity_revision,
+                    worker.work_item_id, worker.request_id
+             FROM worker_runs worker
+             LEFT JOIN work_items item ON item.work_item_id = worker.work_item_id
+             LEFT JOIN requests request ON request.request_id = worker.request_id
+             WHERE worker.worker_run_id = ?",
+            )
+            .bind(entity_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+        }
+        EventEntityType::Request => {
+            sqlx::query(
+                "SELECT feature_id, target_repository_id AS owner_repository_id,
+                    status AS entity_status, NULL AS entity_revision,
+                    work_item_id, request_id
+             FROM requests WHERE request_id = ?",
+            )
+            .bind(entity_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+        }
+        EventEntityType::Message => {
+            sqlx::query(
+                "SELECT feature_id, NULL AS owner_repository_id,
+                    NULL AS entity_status, NULL AS entity_revision,
+                    work_item_id, request_id
+             FROM messages WHERE message_id = ?",
+            )
+            .bind(entity_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+        }
+    }
+    .ok_or_else(|| {
+        StoreError::NotFound(format!("{} event entity {entity_id}", entity_type.as_str()))
+    })?;
+    event_metadata_from_row(&row)
+}
+
+fn event_metadata_from_row(row: &SqliteRow) -> Result<EventMetadata, StoreError> {
+    let revision = row
+        .try_get::<Option<i64>, _>("entity_revision")?
+        .map(|revision| {
+            u64::try_from(revision).map_err(|_| {
+                StoreError::Conflict(format!("stored event revision {revision} is invalid"))
+            })
+        })
+        .transpose()?;
+    Ok(EventMetadata {
+        feature_id: parse_optional_id(row.try_get("feature_id")?, FeatureId::parse)?,
+        owner_repository_id: parse_optional_id(
+            row.try_get("owner_repository_id")?,
+            RepositoryId::parse,
+        )?,
+        entity_status: row.try_get("entity_status")?,
+        entity_revision: revision,
+        work_item_id: parse_optional_id(row.try_get("work_item_id")?, WorkItemId::parse)?,
+        request_id: parse_optional_id(row.try_get("request_id")?, RequestId::parse)?,
+    })
 }
 
 fn resolved_actor_key(actor: &ResolvedActor) -> String {
@@ -1433,6 +1584,19 @@ fn event_from_row(row: &SqliteRow) -> Result<HubEvent, StoreError> {
         kind: kind.parse().map_err(StoreError::Conflict)?,
         entity_type: entity_type.parse().map_err(StoreError::Conflict)?,
         entity_id: row.try_get("entity_id")?,
+        feature_id: parse_optional_id(row.try_get("feature_id")?, FeatureId::parse)?,
+        owner_repository_id: parse_optional_id(
+            row.try_get("owner_repository_id")?,
+            RepositoryId::parse,
+        )?,
+        entity_status: row.try_get("entity_status")?,
+        entity_revision: row
+            .try_get::<Option<i64>, _>("entity_revision")?
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::Conflict("stored event revision is invalid".to_owned()))?,
+        work_item_id: parse_optional_id(row.try_get("work_item_id")?, WorkItemId::parse)?,
+        request_id: parse_optional_id(row.try_get("request_id")?, RequestId::parse)?,
         created_at: row.try_get("created_at")?,
     })
 }

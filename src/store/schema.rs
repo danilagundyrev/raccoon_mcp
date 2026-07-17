@@ -554,6 +554,12 @@ CREATE TABLE IF NOT EXISTS events (
         'message', 'worker_run', 'request', 'feature', 'work_item'
     )),
     entity_id TEXT NOT NULL,
+    feature_id TEXT REFERENCES features(feature_id) ON DELETE SET NULL,
+    owner_repository_id TEXT REFERENCES repositories(repository_id) ON DELETE SET NULL,
+    entity_status TEXT,
+    entity_revision INTEGER CHECK(entity_revision IS NULL OR entity_revision >= 1),
+    work_item_id TEXT REFERENCES work_items(work_item_id) ON DELETE SET NULL,
+    request_id TEXT REFERENCES requests(request_id) ON DELETE SET NULL,
     created_at TEXT NOT NULL
 );
 
@@ -571,6 +577,14 @@ CREATE INDEX IF NOT EXISTS events_repository_cursor_idx
 
 CREATE INDEX IF NOT EXISTS events_repository_kind_cursor_idx
     ON events(recipient_repository_id, kind, event_id);
+
+CREATE INDEX IF NOT EXISTS events_repository_feature_cursor_idx
+    ON events(recipient_repository_id, feature_id, event_id)
+    WHERE feature_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS events_repository_owner_cursor_idx
+    ON events(recipient_repository_id, owner_repository_id, event_id)
+    WHERE owner_repository_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS events_retention_idx
     ON events(created_at, event_id);

@@ -33,7 +33,7 @@ use crate::{
         WorkItemStatus, WorkerRole, WorkerRunId, WorkerRunListFilter, WorkerRunStatus,
         validate_key,
     },
-    store::{SqliteStore, StoreError},
+    store::{EventWaitOptions, SqliteStore, StoreError},
 };
 
 mod dispatch;

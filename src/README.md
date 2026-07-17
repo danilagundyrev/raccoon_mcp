@@ -642,6 +642,8 @@ Durable queries are the source of truth. Events only tell an orchestrator that i
   "instance_id": "<instance-id>",
   "cursor": 0,
   "kinds": ["message_available", "request_available", "work_item_updated"],
+  "feature_id": "<feature-id>",
+  "owner_repository_id": "<repository-id>",
   "limit": 20,
   "timeout_seconds": 30
 }
@@ -660,6 +662,8 @@ Rules:
 - `outcome: "deadline"` is a normal empty result, not completion or an error;
 - each response reports `requested_timeout_seconds`, `effective_timeout_seconds`, and `elapsed_ms`;
 - when `has_more` is true, fetch the next page immediately using the new cursor.
+
+`feature_id` and `owner_repository_id` are optional server-side filters. Returned headers include those fields plus `entity_status`, `entity_revision`, and linked `work_item_id`/`request_id` where applicable. Use the compact header to decide whether the event matters, then load the full entity only when necessary. Status and revision are immutable snapshots captured after the mutation; they do not change when the entity changes later.
 
 Named consumers are scoped by `(repository_id, consumer_key)`. Two orchestrators in one repository should use different keys unless they intentionally share progress. `get_event_checkpoint` returns cursor `0` for a new key without creating it. Commits are monotonic and cannot point beyond the current event high-water mark.
 
@@ -778,7 +782,7 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 | `read_message` | Read an accessible message envelope. |
 | `read_artifact` | Read authorized full content; orchestrators can recover explicitly project-shared linked artifacts. |
 | `ack_message` | Idempotently acknowledge a delivery. |
-| `wait_for_events` | Wait for repository events within the configured finite ceiling. |
+| `wait_for_events` | Wait for compact repository event headers with optional Feature/owner filters and a finite ceiling. |
 | `get_event_checkpoint` | Read a repository-scoped named consumer cursor. |
 | `commit_event_cursor` | Monotonically commit a cursor after processing its page. |
 
@@ -1045,6 +1049,8 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
 7. Consume repository events.
    - Call `wait_for_events` with the actor ID, relevant filters, a bounded page limit, and
      either an explicit last `next_cursor` or a `consumer_key`. Explicit cursor wins.
+   - Use `feature_id` and `owner_repository_id` filters when only one feature or owner
+     matters. Inspect compact status, revision, and linked IDs before loading full entities.
    - Omit `timeout_seconds` to use the server's configured finite ceiling. Values above
      that ceiling are clamped; zero performs a non-blocking check.
    - An `outcome: "deadline"` response is a non-event. While the shared task is still

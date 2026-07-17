@@ -1,4 +1,4 @@
 mod schema;
 mod sqlite;
 
-pub use sqlite::{SqliteStore, StoreError};
+pub use sqlite::{EventWaitOptions, SqliteStore, StoreError};

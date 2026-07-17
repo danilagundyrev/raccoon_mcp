@@ -175,6 +175,11 @@ fn event_wait_schema_has_explicit_finite_timeout_contract() {
     assert_eq!(schema["properties"]["limit"]["maximum"], 50);
     assert_eq!(schema["properties"]["timeout_seconds"]["maximum"], 60);
     assert_eq!(schema["properties"]["consumer_key"]["maxLength"], 64);
+    assert_eq!(schema["properties"]["feature_id"]["format"], "uuid");
+    assert_eq!(
+        schema["properties"]["owner_repository_id"]["format"],
+        "uuid"
+    );
     assert!(schema["properties"]["cursor"].get("default").is_none());
     assert!(
         schema["properties"]["timeout_seconds"]
@@ -607,6 +612,10 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
     );
     assert_eq!(guide_payload["collection_limits"]["event_page"], 50);
     assert_eq!(guide_payload["collection_limits"]["event_kind_filters"], 16);
+    assert_eq!(
+        guide_payload["event_headers"]["filters"],
+        json!(["kinds", "feature_id", "owner_repository_id"])
+    );
     assert!(
         guide_payload["work_flow"]
             .as_array()
@@ -1032,16 +1041,28 @@ async fn sessions_isolate_cancellation_and_cancel_long_waits() {
 #[test]
 fn event_wait_arguments_enforce_public_limits() {
     let mut arguments = JsonMap::new();
+    let feature_id = FeatureId::new();
+    let owner_repository_id = RepositoryId::new();
     arguments.insert("timeout_seconds".to_owned(), json!(65_535));
     arguments.insert("limit".to_owned(), json!(50));
     arguments.insert(
         "kinds".to_owned(),
         json!(["message_available", "worker_run_completed"]),
     );
+    arguments.insert("feature_id".to_owned(), json!(feature_id));
+    arguments.insert("owner_repository_id".to_owned(), json!(owner_repository_id));
 
     assert_eq!(optional_timeout_seconds(&arguments).unwrap(), Some(65_535));
     assert_eq!(optional_event_limit(&arguments).unwrap(), Some(50));
     assert_eq!(optional_event_kinds(&arguments).unwrap().len(), 2);
+    assert_eq!(
+        optional_feature_id(&arguments, "feature_id").unwrap(),
+        Some(feature_id)
+    );
+    assert_eq!(
+        optional_repository_id(&arguments, "owner_repository_id").unwrap(),
+        Some(owner_repository_id)
+    );
 
     arguments.insert("limit".to_owned(), json!(51));
     assert!(optional_event_limit(&arguments).is_err());

@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+struct EventFilters<'a> {
+    kinds: &'a [EventKind],
+    feature_id: Option<FeatureId>,
+    owner_repository_id: Option<RepositoryId>,
+}
+
 impl SqliteStore {
     #[cfg(test)]
     pub async fn wait_for_events(
@@ -14,6 +21,7 @@ impl SqliteStore {
             .await
     }
 
+    #[cfg(test)]
     pub async fn wait_for_events_from(
         &self,
         actor_ref: ActorRef,
@@ -23,34 +31,67 @@ impl SqliteStore {
         timeout: Duration,
         limit: u8,
     ) -> Result<EventBatch, StoreError> {
-        let deadline = Instant::now() + timeout;
-        if cursor.is_some_and(|cursor| cursor < 0) {
+        self.wait_for_events_filtered(
+            actor_ref,
+            EventWaitOptions {
+                cursor,
+                consumer_key,
+                kinds,
+                feature_id: None,
+                owner_repository_id: None,
+                timeout,
+                limit,
+            },
+        )
+        .await
+    }
+
+    pub async fn wait_for_events_filtered(
+        &self,
+        actor_ref: ActorRef,
+        options: EventWaitOptions<'_>,
+    ) -> Result<EventBatch, StoreError> {
+        let filters = EventFilters {
+            kinds: options.kinds,
+            feature_id: options.feature_id,
+            owner_repository_id: options.owner_repository_id,
+        };
+        let deadline = Instant::now() + options.timeout;
+        if options.cursor.is_some_and(|cursor| cursor < 0) {
             return Err(StoreError::Conflict(
                 "event cursor must be non-negative".to_owned(),
             ));
         }
-        if !(1..=50).contains(&limit) {
+        if !(1..=50).contains(&options.limit) {
             return Err(StoreError::Conflict(
                 "event limit must be between 1 and 50".to_owned(),
             ));
         }
-        let consumer_key = consumer_key
+        let consumer_key = options
+            .consumer_key
             .map(|key| crate::domain::validate_key("consumer_key", key))
             .transpose()
             .map_err(StoreError::Conflict)?;
-        let fallback_cursor = cursor.unwrap_or(0);
+        let fallback_cursor = options.cursor.unwrap_or(0);
 
-        if timeout.is_zero() {
+        if options.timeout.is_zero() {
             let (actor, resolved_cursor) = self
-                .prepare_event_wait(actor_ref, cursor, consumer_key.as_deref())
+                .prepare_event_wait(actor_ref, options.cursor, consumer_key.as_deref())
                 .await?;
             return self
-                .wait_for_events_until(actor_ref, actor, resolved_cursor, kinds, limit, deadline)
+                .wait_for_events_until(
+                    actor_ref,
+                    actor,
+                    resolved_cursor,
+                    filters,
+                    options.limit,
+                    deadline,
+                )
                 .await;
         }
         let prepared = match timeout_at(
             deadline,
-            self.prepare_event_wait(actor_ref, cursor, consumer_key.as_deref()),
+            self.prepare_event_wait(actor_ref, options.cursor, consumer_key.as_deref()),
         )
         .await
         {
@@ -60,7 +101,14 @@ impl SqliteStore {
         let (actor, resolved_cursor) = prepared;
         match timeout_at(
             deadline,
-            self.wait_for_events_until(actor_ref, actor, resolved_cursor, kinds, limit, deadline),
+            self.wait_for_events_until(
+                actor_ref,
+                actor,
+                resolved_cursor,
+                filters,
+                options.limit,
+                deadline,
+            ),
         )
         .await
         {
@@ -217,7 +265,7 @@ impl SqliteStore {
         actor_ref: ActorRef,
         actor: ResolvedActor,
         cursor: i64,
-        kinds: &[EventKind],
+        filters: EventFilters<'_>,
         limit: u8,
         deadline: Instant,
     ) -> Result<EventBatch, StoreError> {
@@ -244,7 +292,7 @@ impl SqliteStore {
             notified.as_mut().enable();
 
             let batch = self
-                .fetch_events(repository_id, cursor, kinds, limit)
+                .fetch_events(repository_id, cursor, filters, limit)
                 .await?;
             if !batch.events.is_empty() {
                 return Ok(batch);
@@ -281,24 +329,36 @@ impl SqliteStore {
         &self,
         repository_id: RepositoryId,
         cursor: i64,
-        kinds: &[EventKind],
+        filters: EventFilters<'_>,
         limit: u8,
     ) -> Result<EventBatch, StoreError> {
         let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT event_id, project_id, recipient_repository_id, kind, entity_type, entity_id, created_at \
+            "SELECT event_id, project_id, recipient_repository_id, kind, entity_type, entity_id,
+                    feature_id, owner_repository_id, entity_status, entity_revision,
+                    work_item_id, request_id, created_at \
              FROM events WHERE recipient_repository_id = ",
         );
         query
             .push_bind(repository_id.to_string())
             .push(" AND event_id > ")
             .push_bind(cursor);
-        if !kinds.is_empty() {
+        if !filters.kinds.is_empty() {
             query.push(" AND kind IN (");
             let mut separated = query.separated(", ");
-            for kind in kinds {
+            for kind in filters.kinds {
                 separated.push_bind(kind.as_str());
             }
             separated.push_unseparated(")");
+        }
+        if let Some(feature_id) = filters.feature_id {
+            query
+                .push(" AND feature_id = ")
+                .push_bind(feature_id.to_string());
+        }
+        if let Some(owner_repository_id) = filters.owner_repository_id {
+            query
+                .push(" AND owner_repository_id = ")
+                .push_bind(owner_repository_id.to_string());
         }
         query
             .push(" ORDER BY event_id LIMIT ")

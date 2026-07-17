@@ -3078,6 +3078,250 @@ async fn queued_message_is_returned_as_repository_event() {
 }
 
 #[tokio::test]
+async fn event_headers_expose_routing_fields_and_support_feature_owner_filters() {
+    let (store, path) = test_store(90).await;
+    let backend = store
+        .connect_orchestrator(connect_command(
+            "event-headers",
+            "backend",
+            "C:/event-headers/backend",
+        ))
+        .await
+        .unwrap();
+    let android = store
+        .connect_orchestrator(connect_command(
+            "event-headers",
+            "android",
+            "C:/event-headers/android",
+        ))
+        .await
+        .unwrap();
+    let web = store
+        .connect_orchestrator(connect_command(
+            "event-headers",
+            "web",
+            "C:/event-headers/web",
+        ))
+        .await
+        .unwrap();
+
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: backend.instance.instance_id,
+            title: "Indexed event headers".to_owned(),
+            summary: "Route without loading every entity".to_owned(),
+        })
+        .await
+        .unwrap();
+    let feature_events = store
+        .wait_for_events_filtered(
+            ActorRef::Orchestrator(backend.instance.instance_id),
+            EventWaitOptions {
+                cursor: Some(0),
+                consumer_key: None,
+                kinds: &[EventKind::FeatureCreated],
+                feature_id: Some(feature.feature_id),
+                owner_repository_id: Some(backend.repository.repository_id),
+                timeout: Duration::ZERO,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(feature_events.events.len(), 1);
+    let feature_event = &feature_events.events[0];
+    assert_eq!(feature_event.feature_id, Some(feature.feature_id));
+    assert_eq!(
+        feature_event.owner_repository_id,
+        Some(backend.repository.repository_id)
+    );
+    assert_eq!(feature_event.entity_status.as_deref(), Some("active"));
+    assert_eq!(feature_event.entity_revision, Some(1));
+    assert_eq!(feature_event.work_item_id, None);
+    assert_eq!(feature_event.request_id, None);
+
+    let item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: android.repository.repository_id,
+            title: "Android event owner".to_owned(),
+            summary: "Expose owner and revision in the event header".to_owned(),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    let item_events = store
+        .wait_for_events_filtered(
+            ActorRef::Orchestrator(backend.instance.instance_id),
+            EventWaitOptions {
+                cursor: Some(feature_events.next_cursor),
+                consumer_key: None,
+                kinds: &[EventKind::WorkItemCreated],
+                feature_id: Some(feature.feature_id),
+                owner_repository_id: Some(android.repository.repository_id),
+                timeout: Duration::ZERO,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(item_events.events.len(), 1);
+    let item_event = &item_events.events[0];
+    assert_eq!(item_event.feature_id, Some(feature.feature_id));
+    assert_eq!(
+        item_event.owner_repository_id,
+        Some(android.repository.repository_id)
+    );
+    assert_eq!(item_event.entity_status.as_deref(), Some("ready"));
+    assert_eq!(item_event.entity_revision, Some(item.revision));
+    assert_eq!(item_event.work_item_id, Some(item.work_item_id));
+
+    let unrelated_owner = store
+        .wait_for_events_filtered(
+            ActorRef::Orchestrator(backend.instance.instance_id),
+            EventWaitOptions {
+                cursor: Some(feature_events.next_cursor),
+                consumer_key: None,
+                kinds: &[EventKind::WorkItemCreated],
+                feature_id: Some(feature.feature_id),
+                owner_repository_id: Some(web.repository.repository_id),
+                timeout: Duration::ZERO,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(unrelated_owner.outcome, WaitOutcome::Deadline);
+    assert!(unrelated_owner.events.is_empty());
+
+    let claimed = store
+        .claim_work_item(
+            android.instance.instance_id,
+            item.work_item_id,
+            item.revision,
+        )
+        .await
+        .unwrap();
+    let worker = store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: android.instance.instance_id,
+            role: WorkerRole::Executor,
+            task_summary: "Verify enriched worker event".to_owned(),
+            context_refs: json!([]),
+            addresses_audit_run_id: None,
+            work_item_id: Some(claimed.work_item_id),
+            request_id: None,
+        })
+        .await
+        .unwrap();
+    let worker_events = store
+        .wait_for_events_filtered(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            EventWaitOptions {
+                cursor: Some(0),
+                consumer_key: None,
+                kinds: &[EventKind::WorkerRunCreated],
+                feature_id: Some(feature.feature_id),
+                owner_repository_id: Some(android.repository.repository_id),
+                timeout: Duration::ZERO,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(worker_events.events.len(), 1);
+    let worker_event = &worker_events.events[0];
+    assert_eq!(worker_event.entity_id, worker.worker_run_id.to_string());
+    assert_eq!(worker_event.feature_id, Some(feature.feature_id));
+    assert_eq!(
+        worker_event.owner_repository_id,
+        Some(android.repository.repository_id)
+    );
+    assert_eq!(worker_event.entity_status.as_deref(), Some("created"));
+    assert_eq!(worker_event.entity_revision, None);
+    assert_eq!(worker_event.work_item_id, Some(item.work_item_id));
+    assert_eq!(worker_event.request_id, None);
+
+    let request = store
+        .ask_repository(AskRepository {
+            actor: ActorRef::Orchestrator(backend.instance.instance_id),
+            target_repository_id: android.repository.repository_id,
+            feature_id: Some(feature.feature_id),
+            work_item_id: Some(item.work_item_id),
+            question_summary: "Inspect the Android contract".to_owned(),
+            body: None,
+            context_refs: json!([]),
+            handler_requirement: HandlerRequirement::ButlerRequired,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
+        })
+        .await
+        .unwrap();
+    let request_events = store
+        .wait_for_events_filtered(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            EventWaitOptions {
+                cursor: Some(worker_events.next_cursor),
+                consumer_key: None,
+                kinds: &[EventKind::RequestAvailable],
+                feature_id: Some(feature.feature_id),
+                owner_repository_id: Some(android.repository.repository_id),
+                timeout: Duration::ZERO,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(request_events.events.len(), 1);
+    let request_event = &request_events.events[0];
+    assert_eq!(request_event.entity_status.as_deref(), Some("pending"));
+    assert_eq!(request_event.work_item_id, Some(item.work_item_id));
+    assert_eq!(request_event.request_id, Some(request.request_id));
+
+    let butler = store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: android.instance.instance_id,
+            role: WorkerRole::Butler,
+            task_summary: "Inspect the requested contract".to_owned(),
+            context_refs: json!([]),
+            addresses_audit_run_id: None,
+            work_item_id: None,
+            request_id: Some(request.request_id),
+        })
+        .await
+        .unwrap();
+    let butler_events = store
+        .wait_for_events_filtered(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            EventWaitOptions {
+                cursor: Some(request_events.next_cursor),
+                consumer_key: None,
+                kinds: &[EventKind::WorkerRunCreated],
+                feature_id: Some(feature.feature_id),
+                owner_repository_id: Some(android.repository.repository_id),
+                timeout: Duration::ZERO,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(butler_events.events.len(), 1);
+    let butler_event = &butler_events.events[0];
+    assert_eq!(butler_event.entity_id, butler.worker_run_id.to_string());
+    assert_eq!(butler_event.work_item_id, None);
+    assert_eq!(butler_event.request_id, Some(request.request_id));
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn snapshot_cursor_and_named_consumers_recover_without_shared_progress() {
     let (store, path) = test_store(90).await;
     let backend = store
@@ -3627,6 +3871,14 @@ async fn maintenance_reaps_expired_runtime_state_and_reports_metrics() {
         (
             "EXPLAIN QUERY PLAN SELECT event_id FROM events WHERE recipient_repository_id = 'repository' AND kind = 'message_available' AND event_id > 0 ORDER BY event_id",
             "events_repository_kind_cursor_idx",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT event_id FROM events WHERE recipient_repository_id = 'repository' AND feature_id = 'feature' AND event_id > 0 ORDER BY event_id",
+            "events_repository_feature_cursor_idx",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT event_id FROM events WHERE recipient_repository_id = 'repository' AND owner_repository_id = 'owner' AND event_id > 0 ORDER BY event_id",
+            "events_repository_owner_cursor_idx",
         ),
     ] {
         let plan_rows = sqlx::query(query).fetch_all(&store.pool).await.unwrap();

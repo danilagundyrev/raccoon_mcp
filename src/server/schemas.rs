@@ -248,7 +248,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "wait_for_events",
-            "description": "Wait for append-only events addressed to the actor's repository. An explicit cursor wins; otherwise consumer_key uses its durable checkpoint, or zero is used when both are absent. Returned pages never auto-commit a checkpoint.",
+            "description": "Wait for compact append-only event headers addressed to the actor's repository, optionally filtered by Feature and owner repository. An explicit cursor wins; otherwise consumer_key uses its durable checkpoint, or zero is used when both are absent. Returned pages never auto-commit a checkpoint.",
             "inputSchema": wait_for_events_schema(max_wait_seconds),
             "annotations": {
                 "readOnlyHint": false,
@@ -824,6 +824,22 @@ pub(super) fn wait_for_events_schema(max_wait_seconds: u16) -> Value {
         }),
     );
     properties.insert("consumer_key".to_owned(), consumer_key_schema());
+    properties.insert(
+        "feature_id".to_owned(),
+        json!({
+            "type": "string",
+            "format": "uuid",
+            "description": "Return only event headers linked to this Feature."
+        }),
+    );
+    properties.insert(
+        "owner_repository_id".to_owned(),
+        json!({
+            "type": "string",
+            "format": "uuid",
+            "description": "Return only event headers owned by this repository."
+        }),
+    );
     properties.insert(
         "kinds".to_owned(),
         json!({
