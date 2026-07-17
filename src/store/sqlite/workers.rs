@@ -85,13 +85,17 @@ impl SqliteStore {
                 .await?
                 .try_get("project_id")?,
         )?;
+        if let Some(request_id) = command.request_id {
+            validate_butler_request_link(&mut transaction, request_id, repository_id, project_id)
+                .await?;
+        }
         sqlx::query(
             "INSERT INTO worker_runs(
                  worker_run_id, repository_id, parent_instance_id, role, status,
                  task_summary, context_refs_json, result_summary, error_summary, addresses_audit_run_id,
-                 work_item_id,
+                 work_item_id, request_id,
                  created_at, activated_at, last_heartbeat_at, lease_expires_at, finished_at
-             ) VALUES (?, ?, ?, ?, 'created', ?, ?, NULL, NULL, ?, ?, ?, NULL, ?, ?, NULL)",
+             ) VALUES (?, ?, ?, ?, 'created', ?, ?, NULL, NULL, ?, ?, ?, ?, NULL, ?, ?, NULL)",
         )
         .bind(worker_run_id.to_string())
         .bind(repository_id.to_string())
@@ -101,6 +105,7 @@ impl SqliteStore {
         .bind(&context_refs_json)
         .bind(command.addresses_audit_run_id.map(|id| id.to_string()))
         .bind(command.work_item_id.map(|id| id.to_string()))
+        .bind(command.request_id.map(|id| id.to_string()))
         .bind(&now)
         .bind(&now)
         .bind(&worker_lease_expires_at)
@@ -420,4 +425,45 @@ impl SqliteStore {
         self.notifications.notify(worker.repository_id);
         self.get_worker_run(worker_run_id).await
     }
+}
+
+async fn validate_butler_request_link(
+    transaction: &mut Transaction<'_, Sqlite>,
+    request_id: RequestId,
+    repository_id: RepositoryId,
+    project_id: ProjectId,
+) -> Result<(), StoreError> {
+    let row = sqlx::query(
+        "SELECT status, target_repository_id, project_id
+         FROM requests WHERE request_id = ?",
+    )
+    .bind(request_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("request {request_id}")))?;
+    let target_repository_id = RepositoryId::parse(row.try_get("target_repository_id")?)?;
+    let request_project_id = ProjectId::parse(row.try_get("project_id")?)?;
+    let status: String = row.try_get("status")?;
+    if target_repository_id != repository_id
+        || request_project_id != project_id
+        || status != RequestStatus::Pending.as_str()
+    {
+        return Err(StoreError::Conflict(format!(
+            "butler request {request_id} must be pending in its parent repository and project"
+        )));
+    }
+    let blocking_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM worker_runs
+         WHERE request_id = ? AND role = 'butler'
+           AND status IN ('created', 'active', 'completed')",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if blocking_attempts != 0 {
+        return Err(StoreError::Conflict(format!(
+            "request {request_id} already has an active or completed butler attempt"
+        )));
+    }
+    Ok(())
 }

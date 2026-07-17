@@ -375,6 +375,8 @@ async fn unknown_answer_argument_is_rejected_before_request_mutation() {
             question_summary: "Return the contract".to_owned(),
             body: None,
             context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
         })
         .await
         .unwrap();
@@ -597,6 +599,30 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
             .iter()
             .filter_map(Value::as_str)
             .any(|step| step.contains("Higher numeric priority"))
+    );
+    assert!(
+        guide_payload["worker_flow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|step| step.contains("fresh executor child context"))
+    );
+    assert!(
+        guide_payload["audit_flow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|step| step.contains("no executor or remediation conversation history"))
+    );
+    assert!(
+        guide_payload["request_flow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|step| step.contains("butler_required"))
     );
 
     drop(store);
@@ -1022,6 +1048,22 @@ fn request_tools_expose_actor_scoping_and_payload_limits() {
     let ask = ask_repository_schema(2048, 65_536);
     assert_eq!(ask["properties"]["question_summary"]["maxLength"], 2048);
     assert_eq!(ask["properties"]["body"]["maxLength"], 65_536);
+    assert_eq!(
+        ask["properties"]["handler_requirement"]["enum"],
+        json!(["orchestrator_allowed", "butler_required"])
+    );
+    assert_eq!(
+        ask["properties"]["handler_requirement"]["default"],
+        "orchestrator_allowed"
+    );
+    assert_eq!(
+        ask["properties"]["answer_requirement"]["enum"],
+        json!(["summary_allowed", "artifact_required"])
+    );
+    assert_eq!(
+        ask["properties"]["answer_requirement"]["default"],
+        "summary_allowed"
+    );
 
     let tools = tool_definitions(2048, 65_536, 60);
     let names = tools
@@ -1048,6 +1090,16 @@ fn request_tools_expose_actor_scoping_and_payload_limits() {
     for link in ["feature_id", "work_item_id", "request_id"] {
         assert_eq!(publish["properties"][link]["format"], "uuid");
     }
+    let create_worker = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "create_worker_run")
+        .unwrap();
+    assert_eq!(
+        create_worker["inputSchema"]["properties"]["request_id"]["format"],
+        "uuid"
+    );
 }
 
 #[test]

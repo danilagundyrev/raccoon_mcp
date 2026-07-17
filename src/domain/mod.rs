@@ -28,8 +28,8 @@ pub use presence::{
 };
 pub use project::{Project, ProjectOverview, Repository, RepositoryPresence};
 pub use requests::{
-    AnswerRequest, AnswerRequestResult, AskRepository, CoordinationRequest, FailRequest,
-    RequestStatus,
+    AnswerRequest, AnswerRequestResult, AnswerRequirement, AskRepository, CoordinationRequest,
+    FailRequest, HandlerRequirement, RequestStatus,
 };
 pub use work::{
     CancelFeature, CompleteFeature, CreateFeature, CreateWorkItem, Feature, FeatureStatus,

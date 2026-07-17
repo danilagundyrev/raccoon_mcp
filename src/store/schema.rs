@@ -177,11 +177,17 @@ CREATE TABLE IF NOT EXISTS worker_runs (
     error_summary TEXT,
     addresses_audit_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE RESTRICT,
     work_item_id TEXT REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+    request_id TEXT REFERENCES requests(request_id) ON DELETE RESTRICT,
     created_at TEXT NOT NULL,
     activated_at TEXT,
     last_heartbeat_at TEXT NOT NULL,
     lease_expires_at TEXT NOT NULL,
-    finished_at TEXT
+    finished_at TEXT,
+    CHECK(
+        (role = 'butler' AND request_id IS NOT NULL
+            AND work_item_id IS NULL AND addresses_audit_run_id IS NULL)
+        OR (role <> 'butler' AND request_id IS NULL)
+    )
 );
 
 CREATE INDEX IF NOT EXISTS worker_runs_repository_status_idx
@@ -201,6 +207,10 @@ CREATE INDEX IF NOT EXISTS worker_runs_active_metrics_idx
 CREATE INDEX IF NOT EXISTS worker_runs_work_item_status_idx
     ON worker_runs(work_item_id, role, status)
     WHERE work_item_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS worker_runs_request_status_idx
+    ON worker_runs(request_id)
+    WHERE role = 'butler' AND status IN ('created', 'active', 'completed');
 
 CREATE TABLE IF NOT EXISTS work_item_audit_scope (
     audit_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE CASCADE,
@@ -415,6 +425,12 @@ CREATE TABLE IF NOT EXISTS requests (
     feature_id TEXT REFERENCES features(feature_id) ON DELETE RESTRICT,
     work_item_id TEXT REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
     status TEXT NOT NULL CHECK(status IN ('pending', 'claimed', 'answered', 'failed')),
+    handler_requirement TEXT NOT NULL CHECK(handler_requirement IN (
+        'orchestrator_allowed', 'butler_required'
+    )),
+    answer_requirement TEXT NOT NULL CHECK(answer_requirement IN (
+        'summary_allowed', 'artifact_required'
+    )),
     question_summary TEXT NOT NULL,
     question_artifact_id TEXT REFERENCES artifacts(artifact_id) ON DELETE SET NULL,
     context_refs_json TEXT NOT NULL,
@@ -424,11 +440,17 @@ CREATE TABLE IF NOT EXISTS requests (
     failure_summary TEXT,
     failure_retryable INTEGER CHECK(failure_retryable IN (0, 1)),
     answer_message_id TEXT REFERENCES messages(message_id) ON DELETE SET NULL,
+    answer_provenance TEXT CHECK(answer_provenance IS NULL OR answer_provenance IN (
+        'orchestrator', 'butler'
+    )),
+    answered_by_instance_id TEXT REFERENCES agent_instances(instance_id) ON DELETE SET NULL,
+    answered_by_worker_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     finished_at TEXT,
     CHECK(requester_repository_id <> target_repository_id),
-    CHECK(NOT (claimed_by_instance_id IS NOT NULL AND claimed_by_worker_run_id IS NOT NULL))
+    CHECK(NOT (claimed_by_instance_id IS NOT NULL AND claimed_by_worker_run_id IS NOT NULL)),
+    CHECK(NOT (answered_by_instance_id IS NOT NULL AND answered_by_worker_run_id IS NOT NULL))
 );
 
 CREATE INDEX IF NOT EXISTS requests_target_status_idx

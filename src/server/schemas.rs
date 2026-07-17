@@ -86,6 +86,11 @@ pub(super) fn tool_definitions(
                         "type": "string",
                         "format": "uuid",
                         "description": "Claimed implementation, audit or remediation work item. Its kind must match the worker role."
+                    },
+                    "request_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Required only for a request-scoped butler. The butler may claim and answer only this request."
                     }
                 },
                 "required": ["instance_id", "role", "task_summary"]
@@ -254,7 +259,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "ask_repository",
-            "description": "Create a durable question for one repository. The target receives a request_available event and may atomically claim it.",
+            "description": "Create a durable question for one repository. Select whether coordination-state answers are allowed or a linked request-scoped butler is required.",
             "inputSchema": ask_repository_schema(max_summary_bytes, max_artifact_bytes),
             "annotations": mutation_annotations(false)
         },
@@ -266,7 +271,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "claim_request",
-            "description": "Atomically claim a pending request, or take over a claim whose lease expired.",
+            "description": "Atomically claim a pending request, or take over an expired claim. butler_required requests accept only their active linked butler.",
             "inputSchema": actor_entity_schema("request_id"),
             "annotations": mutation_annotations(false)
         },
@@ -284,7 +289,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "answer_request",
-            "description": "Atomically close an owned request and deliver an answer message with an optional artifact to the requester.",
+            "description": "Atomically close an owned request and deliver its answer. artifact_required requests require a non-empty body; provenance is recorded from the answering actor.",
             "inputSchema": answer_request_schema(max_summary_bytes, max_artifact_bytes),
             "annotations": mutation_annotations(false)
         },
@@ -713,6 +718,24 @@ pub(super) fn ask_repository_schema(max_summary_bytes: u16, max_artifact_bytes: 
             "type": "array",
             "maxItems": MAX_CONTEXT_REFS,
             "items": { "type": "object" }
+        }),
+    );
+    properties.insert(
+        "handler_requirement".to_owned(),
+        json!({
+            "type": "string",
+            "enum": ["orchestrator_allowed", "butler_required"],
+            "default": "orchestrator_allowed",
+            "description": "Use butler_required when answering requires current repository investigation."
+        }),
+    );
+    properties.insert(
+        "answer_requirement".to_owned(),
+        json!({
+            "type": "string",
+            "enum": ["summary_allowed", "artifact_required"],
+            "default": "summary_allowed",
+            "description": "artifact_required makes answer_request require a non-empty body."
         }),
     );
     properties.insert("idempotency_key".to_owned(), idempotency_key_schema());

@@ -35,7 +35,7 @@ pub(super) async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use bounded list_work_items pages and expected_revision, and claim an owner-repository item before creating its matching worker run. Implementation and remediation cards use executors; audit cards use fresh auditors and carry their own repository-local scope. Every audit_report includes exact structured audit_outcomes; remediation requires a later passing audit, and Feature completion requires verified coverage for every accepted implementation report. Workers never register as repositories. Use ask_repository for durable questions and actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for finite repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. JSON-RPC batches are not supported.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use bounded list_work_items pages and expected_revision, and claim an owner-repository item before creating its matching worker run. Spawn a fresh executor child for each independent implementation WorkItem; same-lineage remediation may reuse that child context but always gets a new worker_run_id. Audit cards use fresh auditor children with no executor/remediation conversation history and carry repository-local scope. Every audit_report includes exact structured audit_outcomes; remediation requires a later fresh passing audit, and Feature completion requires verified coverage for every accepted implementation report. Workers never register as repositories. Use ask_repository for durable questions: orchestrator_allowed permits an answer from coordination state already in hand, while butler_required can be claimed and answered only by a fresh request-scoped butler linked through request_id. Use actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for finite repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. JSON-RPC batches are not supported.",
             }))
         }
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
@@ -176,6 +176,9 @@ pub(super) async fn call_tool(
                         .transpose()?,
                         work_item_id: optional_string(&arguments, "work_item_id")?
                             .map(|value| WorkItemId::parse(&value).map_err(invalid_uuid))
+                            .transpose()?,
+                        request_id: optional_string(&arguments, "request_id")?
+                            .map(|value| RequestId::parse(&value).map_err(invalid_uuid))
                             .transpose()?,
                     },
                     idempotency_key.as_deref(),
@@ -550,6 +553,20 @@ pub(super) async fn call_tool(
                         question_summary,
                         body,
                         context_refs,
+                        handler_requirement: optional_string(&arguments, "handler_requirement")?
+                            .map(|value| {
+                                value
+                                    .parse::<HandlerRequirement>()
+                                    .map_err(invalid_argument)
+                            })
+                            .transpose()?
+                            .unwrap_or(HandlerRequirement::OrchestratorAllowed),
+                        answer_requirement: optional_string(&arguments, "answer_requirement")?
+                            .map(|value| {
+                                value.parse::<AnswerRequirement>().map_err(invalid_argument)
+                            })
+                            .transpose()?
+                            .unwrap_or(AnswerRequirement::SummaryAllowed),
                     },
                     idempotency_key.as_deref(),
                 )
@@ -740,6 +757,8 @@ pub(super) async fn read_resource(
                     "The orchestrator calls create_worker_run before spawning a child.",
                     "The child receives worker_run_id and calls activate_worker_run.",
                     "The child calls complete_worker_run or fail_worker_run before exiting.",
+                    "Use one fresh executor child context per independent implementation WorkItem. Never move it to an unrelated WorkItem.",
+                    "Same-lineage remediation may continue in the original executor child when that context remains healthy, but create a new linked remediation worker_run_id. Use a fresh remediation child if the original is unavailable, saturated, repeatedly confused, or anchored to a fundamentally rejected approach.",
                     "A failed or abandoned audit/remediation worker may be replaced on the same reclaimed work item; an active or completed attempt blocks replacement.",
                     "A worker never calls connect_orchestrator and never creates a repository identity."
                 ],
@@ -755,16 +774,19 @@ pub(super) async fn read_resource(
                 ],
                 "audit_flow": [
                     "Create one kind=audit work item in the repository that owns every completed implementation in audit_scope_work_item_ids; split cross-repository batches.",
-                    "The owner repository claims the audit card and creates a fresh auditor linked by work_item_id. Its scope and iteration are derived from the card.",
+                    "The owner repository claims the audit card and spawns a fresh auditor child with no executor or remediation conversation history, linked by work_item_id. Pass only specification, acceptance criteria, IDs, artifact references and current repository state; scope and iteration are derived from the card.",
                     "The auditor publishes exactly one audit_report with one audit_outcomes verdict per scoped item and completes; the owner orchestrator then completes the audit card without implementation_artifact_id.",
                     "A changes_required batch permits one kind=remediation work item only when every changes_required item has remaining depth; partially reopened batches are rejected. Completing remediation produces pending_reaudit, never verified.",
-                    "A later fresh auditor must pass each remediated item. A final non-passing verdict produces verification_blocked; increase_audit_depth requires the current revision, an explicit reason, and user authorization.",
+                    "A later fresh auditor child must pass each remediated item. Orchestrator review and executor self-review are supplemental, never formal verification. A final non-passing verdict produces verification_blocked; increase_audit_depth requires the current revision, an explicit reason, and user authorization.",
                     "The Feature coordinator calls complete_feature only after every accepted implementation report has verification_status=verified."
                 ],
                 "request_flow": [
-                    "Create a durable directed question with ask_repository and include feature_id/work_item_id when it affects tracked work; a work-item link infers its feature. The target receives request_available.",
-                    "One target actor atomically claims it; explicit renew, heartbeat, mutating actor activity and active event waiting extend only an unexpired claim.",
-                    "answer_request atomically closes the request and delivers an answer message/artifact to the requester.",
+                    "Create a durable directed question with ask_repository and include feature_id/work_item_id when it affects tracked work; a work-item link infers its feature. Set answer_requirement=artifact_required when a non-empty answer body is mandatory. The target receives request_available.",
+                    "Use handler_requirement=orchestrator_allowed only when the target can answer from coordination state, existing reports, scope or ownership already in hand. Use butler_required whenever current source inspection, contract verification, multi-file tracing, commands or tests are required.",
+                    "For butler_required, create a fresh role=butler worker with this request_id before spawning it. Only that active linked butler can claim and answer the request, and it cannot handle a different request.",
+                    "One permitted target actor atomically claims it; explicit renew, heartbeat, mutating actor activity and active event waiting extend only an unexpired claim.",
+                    "answer_request atomically closes the request and delivers an answer message/artifact to the requester. The stored answer_provenance and answered_by fields distinguish a direct orchestrator answer from a butler-produced answer.",
+                    "While an outgoing request remains unresolved, include request_answered and request_failed in wait_for_events filters, then read_request and selectively load its answer message/artifact.",
                     "A retryable failure returns the request to pending; a terminal failure closes it and notifies the requester."
                 ],
                 "messaging_flow": [

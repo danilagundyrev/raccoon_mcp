@@ -114,6 +114,7 @@ async fn create_auditor_run(
             task_summary: summary.to_owned(),
             context_refs: json!([]),
             addresses_audit_run_id: None,
+            request_id: None,
             work_item_id: Some(audit_item.work_item_id),
         })
         .await
@@ -296,6 +297,7 @@ async fn complete_implementation_work(
             task_summary: format!("Implement {}", item.title),
             context_refs: json!([]),
             addresses_audit_run_id: None,
+            request_id: None,
             work_item_id: Some(item.work_item_id),
         })
         .await
@@ -537,6 +539,8 @@ async fn feature_completion_is_revisioned_coordinator_owned_and_waits_for_linked
             question_summary: "Confirm Android scope".to_owned(),
             body: None,
             context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
         })
         .await
         .unwrap();
@@ -726,6 +730,8 @@ async fn repository_request_infers_and_validates_work_item_feature_scope() {
             question_summary: "Confirm the client contract".to_owned(),
             body: None,
             context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
         })
         .await
         .unwrap();
@@ -741,6 +747,8 @@ async fn repository_request_infers_and_validates_work_item_feature_scope() {
                 question_summary: "Invalid scope".to_owned(),
                 body: None,
                 context_refs: json!([]),
+                handler_requirement: HandlerRequirement::OrchestratorAllowed,
+                answer_requirement: AnswerRequirement::SummaryAllowed,
             })
             .await
             .is_err()
@@ -1005,6 +1013,7 @@ async fn worker_run_completes_full_lifecycle_in_parent_repository() {
             task_summary: "Implement a fake endpoint".to_owned(),
             context_refs: json!([{ "kind": "message", "id": "message-1" }]),
             addresses_audit_run_id: None,
+            request_id: None,
             work_item_id: None,
         })
         .await
@@ -1069,10 +1078,11 @@ async fn completed_worker_run_rejects_reactivation() {
     let created = store
         .create_worker_run(CreateWorkerRun {
             parent_instance_id: connected.instance.instance_id,
-            role: WorkerRole::Butler,
+            role: WorkerRole::Executor,
             task_summary: "Inspect a fake contract".to_owned(),
             context_refs: json!([]),
             addresses_audit_run_id: None,
+            request_id: None,
             work_item_id: None,
         })
         .await
@@ -1110,6 +1120,7 @@ async fn concurrent_finish_transitions_cannot_overwrite_each_other() {
             task_summary: "Race two terminal transitions".to_owned(),
             context_refs: json!([]),
             addresses_audit_run_id: None,
+            request_id: None,
             work_item_id: None,
         })
         .await
@@ -1148,10 +1159,11 @@ async fn expired_worker_run_cannot_complete_or_fail() {
     let worker = store
         .create_worker_run(CreateWorkerRun {
             parent_instance_id: connected.instance.instance_id,
-            role: WorkerRole::Butler,
+            role: WorkerRole::Executor,
             task_summary: "Expire before finishing".to_owned(),
             context_refs: json!([]),
             addresses_audit_run_id: None,
+            request_id: None,
             work_item_id: None,
         })
         .await
@@ -1408,6 +1420,7 @@ async fn active_worker_can_publish_without_creating_repository() {
             task_summary: "Publish fake report".to_owned(),
             context_refs: json!([]),
             addresses_audit_run_id: None,
+            request_id: None,
             work_item_id: None,
         })
         .await
@@ -1570,6 +1583,7 @@ async fn expired_worker_cannot_renew_or_publish() {
             task_summary: "Expire this worker".to_owned(),
             context_refs: json!([]),
             addresses_audit_run_id: None,
+            request_id: None,
             work_item_id: None,
         })
         .await
@@ -1976,6 +1990,7 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
             task_summary: "Address the complete audit report".to_owned(),
             context_refs: json!([]),
             addresses_audit_run_id: Some(first_audit.worker_run_id),
+            request_id: None,
             work_item_id: Some(remediation_item.work_item_id),
         })
         .await
@@ -2370,6 +2385,7 @@ async fn worker_role_must_match_the_claimed_work_item_kind() {
                 task_summary: "Executor cannot claim audit work".to_owned(),
                 context_refs: json!([]),
                 addresses_audit_run_id: None,
+                request_id: None,
                 work_item_id: Some(audit_item.work_item_id),
             })
             .await,
@@ -2383,6 +2399,7 @@ async fn worker_role_must_match_the_claimed_work_item_kind() {
                 task_summary: "Auditor requires at least one item".to_owned(),
                 context_refs: json!([]),
                 addresses_audit_run_id: None,
+                request_id: None,
                 work_item_id: None,
             })
             .await,
@@ -2623,6 +2640,7 @@ async fn abandoned_auditor_can_be_retried_on_the_same_audit_card() {
                 task_summary: "Overlapping attempt".to_owned(),
                 context_refs: json!([]),
                 addresses_audit_run_id: None,
+                request_id: None,
                 work_item_id: Some(audit_item.work_item_id),
             })
             .await,
@@ -2677,6 +2695,7 @@ async fn failed_remediation_executor_can_be_retried_on_the_same_card() {
         task_summary: "Remediation attempt".to_owned(),
         context_refs: json!([]),
         addresses_audit_run_id: Some(audit_run.worker_run_id),
+        request_id: None,
         work_item_id: Some(remediation.work_item_id),
     };
     let first = store.create_worker_run(worker_command()).await.unwrap();
@@ -2951,6 +2970,8 @@ async fn maintenance_reaps_expired_runtime_state_and_reports_metrics() {
             question_summary: "Operational request".to_owned(),
             body: None,
             context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
         })
         .await
         .unwrap();
@@ -3150,6 +3171,8 @@ async fn only_one_actor_can_claim_the_same_request() {
             question_summary: "Which response fields are guaranteed?".to_owned(),
             body: Some("Need the complete API contract.".to_owned()),
             context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
         })
         .await
         .unwrap();
@@ -3215,6 +3238,8 @@ async fn expired_claim_can_be_taken_over_and_retryable_failure_requeues() {
             question_summary: "Can this request be retried?".to_owned(),
             body: None,
             context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
         })
         .await
         .unwrap();
@@ -3278,6 +3303,8 @@ async fn answer_atomically_closes_request_and_delivers_artifact() {
             question_summary: "Return the contract".to_owned(),
             body: None,
             context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
         })
         .await
         .unwrap();
@@ -3358,6 +3385,8 @@ async fn claim_owner_can_renew_release_and_terminally_fail_request() {
             question_summary: "Resolve ownership rules".to_owned(),
             body: None,
             context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
         })
         .await
         .unwrap();
@@ -3487,6 +3516,7 @@ async fn creation_idempotency_replays_result_and_rejects_changed_payload() {
         task_summary: "Idempotent worker".to_owned(),
         context_refs: json!([]),
         addresses_audit_run_id: None,
+        request_id: None,
         work_item_id: None,
     };
     let first_worker = store
@@ -3526,6 +3556,8 @@ async fn creation_idempotency_replays_result_and_rejects_changed_payload() {
         question_summary: "Idempotent question".to_owned(),
         body: None,
         context_refs: json!([]),
+        handler_requirement: HandlerRequirement::OrchestratorAllowed,
+        answer_requirement: AnswerRequirement::SummaryAllowed,
     };
     let first_request = store
         .ask_repository_idempotent(request_command.clone(), Some("request-key"))
@@ -3590,6 +3622,8 @@ async fn actor_activity_renews_only_unexpired_request_claims() {
             question_summary: "Renew me".to_owned(),
             body: None,
             context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
         })
         .await
         .unwrap();
@@ -3655,6 +3689,8 @@ async fn three_worker_runs_claim_and_answer_independent_requests() {
                     question_summary: format!("Question {index}"),
                     body: None,
                     context_refs: json!([]),
+                    handler_requirement: HandlerRequirement::OrchestratorAllowed,
+                    answer_requirement: AnswerRequirement::SummaryAllowed,
                 })
                 .await
                 .unwrap(),
@@ -3666,6 +3702,7 @@ async fn three_worker_runs_claim_and_answer_independent_requests() {
                 task_summary: format!("Answer question {index}"),
                 context_refs: json!([]),
                 addresses_audit_run_id: None,
+                request_id: Some(requests[index].request_id),
                 work_item_id: None,
             })
             .await
@@ -3745,6 +3782,197 @@ async fn three_worker_runs_claim_and_answer_independent_requests() {
 }
 
 #[tokio::test]
+async fn request_handler_policy_enforces_butler_scope_and_records_provenance() {
+    let (store, path) = test_store(90).await;
+    let requester = store
+        .connect_orchestrator(connect_command("handler-policy", "web", "C:/handler/web"))
+        .await
+        .unwrap();
+    let target = store
+        .connect_orchestrator(connect_command(
+            "handler-policy",
+            "backend",
+            "C:/handler/backend",
+        ))
+        .await
+        .unwrap();
+
+    let status_request = store
+        .ask_repository(AskRepository {
+            actor: ActorRef::Orchestrator(requester.instance.instance_id),
+            target_repository_id: target.repository.repository_id,
+            feature_id: None,
+            work_item_id: None,
+            question_summary: "Is backend work still in progress?".to_owned(),
+            body: None,
+            context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
+        })
+        .await
+        .unwrap();
+    store
+        .claim_request(
+            ActorRef::Orchestrator(target.instance.instance_id),
+            status_request.request_id,
+        )
+        .await
+        .unwrap();
+    let status_answer = store
+        .answer_request(AnswerRequest {
+            actor: ActorRef::Orchestrator(target.instance.instance_id),
+            request_id: status_request.request_id,
+            answer_summary: "Backend work is active".to_owned(),
+            body: None,
+            content_type: "text/plain".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(status_answer.request.answer_provenance).unwrap(),
+        json!("orchestrator")
+    );
+    assert_eq!(
+        status_answer.request.answered_by_instance_id,
+        Some(target.instance.instance_id)
+    );
+    assert_eq!(status_answer.request.answered_by_worker_run_id, None);
+
+    let technical_request = store
+        .ask_repository(AskRepository {
+            actor: ActorRef::Orchestrator(requester.instance.instance_id),
+            target_repository_id: target.repository.repository_id,
+            feature_id: None,
+            work_item_id: None,
+            question_summary: "Trace the authentication contract".to_owned(),
+            body: Some("Inspect the current code and return the exact flow.".to_owned()),
+            context_refs: json!([]),
+            handler_requirement: HandlerRequirement::ButlerRequired,
+            answer_requirement: AnswerRequirement::ArtifactRequired,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .claim_request(
+                ActorRef::Orchestrator(target.instance.instance_id),
+                technical_request.request_id,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let butler = store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: target.instance.instance_id,
+            role: WorkerRole::Butler,
+            task_summary: "Inspect the authentication contract".to_owned(),
+            context_refs: json!([]),
+            addresses_audit_run_id: None,
+            request_id: Some(technical_request.request_id),
+            work_item_id: None,
+        })
+        .await
+        .unwrap();
+    let butler = store
+        .activate_worker_run(butler.worker_run_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: target.instance.instance_id,
+                role: WorkerRole::Butler,
+                task_summary: "Overlapping butler".to_owned(),
+                context_refs: json!([]),
+                addresses_audit_run_id: None,
+                request_id: Some(technical_request.request_id),
+                work_item_id: None,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let unrelated_request = store
+        .ask_repository(AskRepository {
+            actor: ActorRef::Orchestrator(requester.instance.instance_id),
+            target_repository_id: target.repository.repository_id,
+            feature_id: None,
+            work_item_id: None,
+            question_summary: "Is the deployment ready?".to_owned(),
+            body: None,
+            context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .claim_request(
+                ActorRef::Worker(butler.worker_run_id),
+                unrelated_request.request_id,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    store
+        .claim_request(
+            ActorRef::Worker(butler.worker_run_id),
+            technical_request.request_id,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .answer_request(AnswerRequest {
+                actor: ActorRef::Worker(butler.worker_run_id),
+                request_id: technical_request.request_id,
+                answer_summary: "Authentication flow traced".to_owned(),
+                body: None,
+                content_type: "text/markdown".to_owned(),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        store
+            .get_request(technical_request.request_id)
+            .await
+            .unwrap()
+            .status,
+        RequestStatus::Claimed
+    );
+    let technical_answer = store
+        .answer_request(AnswerRequest {
+            actor: ActorRef::Worker(butler.worker_run_id),
+            request_id: technical_request.request_id,
+            answer_summary: "Authentication flow traced".to_owned(),
+            body: Some("The verified contract and code references.".to_owned()),
+            content_type: "text/markdown".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(technical_answer.request.answer_provenance).unwrap(),
+        json!("butler")
+    );
+    assert_eq!(
+        technical_answer.request.answered_by_worker_run_id,
+        Some(butler.worker_run_id)
+    );
+    assert!(technical_answer.artifact.is_some());
+
+    store
+        .complete_worker_run(butler.worker_run_id, "Request answered")
+        .await
+        .unwrap();
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn work_graph_unlocks_dependency_and_links_worker_report() {
     let (store, path) = test_store(90).await;
     let backend = store
@@ -3816,6 +4044,7 @@ async fn work_graph_unlocks_dependency_and_links_worker_report() {
             task_summary: "Implement API".to_owned(),
             context_refs: json!([]),
             addresses_audit_run_id: None,
+            request_id: None,
             work_item_id: Some(api.work_item_id),
         })
         .await
@@ -4322,6 +4551,7 @@ async fn verification_requires_remediation_and_passing_reaudit_before_feature_co
             task_summary: "Address audit".to_owned(),
             context_refs: json!([]),
             addresses_audit_run_id: Some(first_audit.worker_run_id),
+            request_id: None,
             work_item_id: Some(remediation.work_item_id),
         })
         .await
@@ -4770,6 +5000,7 @@ async fn completed_worker_reports_survive_orchestrator_claim_takeover() {
             task_summary: "Implement".to_owned(),
             context_refs: json!([]),
             addresses_audit_run_id: None,
+            request_id: None,
             work_item_id: Some(item.work_item_id),
         })
         .await

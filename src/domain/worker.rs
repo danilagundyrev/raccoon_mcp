@@ -3,7 +3,7 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{InstanceId, RepositoryId, WorkItemId, WorkerRunId};
+use super::{InstanceId, RepositoryId, RequestId, WorkItemId, WorkerRunId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +89,7 @@ pub struct CreateWorkerRun {
     pub context_refs: Value,
     pub addresses_audit_run_id: Option<WorkerRunId>,
     pub work_item_id: Option<WorkItemId>,
+    pub request_id: Option<RequestId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -112,6 +113,7 @@ pub struct WorkerRun {
     pub audit_scope: Vec<AuditScopeItem>,
     pub addresses_audit_run_id: Option<WorkerRunId>,
     pub work_item_id: Option<WorkItemId>,
+    pub request_id: Option<RequestId>,
     pub created_at: String,
     pub activated_at: Option<String>,
     pub last_heartbeat_at: String,

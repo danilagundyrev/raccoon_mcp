@@ -262,6 +262,8 @@ First, the orchestrator records the worker run:
 
 The linked item must have a live claim owned by the parent orchestrator. Creating the linked executor changes it from `claimed` to `in_progress`.
 
+Spawn a new executor child context for every independent implementation WorkItem. Do not turn one long-lived child into a general repository worker that moves across unrelated cards. The context may be retained for remediation of that same WorkItem lineage after an independent audit, but remediation still receives a new `worker_run_id` and `addresses_audit_run_id`. Use a fresh remediation child when the original context is unavailable, saturated, repeatedly confused, or anchored to an approach the audit rejected fundamentally.
+
 Then spawn the child agent through the client/orchestrator mechanism and provide at least:
 
 - `worker_run_id`;
@@ -364,6 +366,8 @@ An executor asks another repository:
   "work_item_id": "<work-item-id>",
   "question_summary": "What response shape does the checkout UI need?",
   "body": "Please confirm fields, optional values, and error states.",
+  "handler_requirement": "butler_required",
+  "answer_requirement": "artifact_required",
   "context_refs": [
     {
       "type": "work_item",
@@ -391,9 +395,16 @@ The worker does not have to terminate merely because it asked a question. An act
 
 ### Receiver
 
-The target repository receives `request_available`. The orchestrator may answer directly or create a `butler` worker:
+The target repository receives `request_available`. Choose the handling policy when creating the request:
 
-1. Create a `butler` worker run.
+- `handler_requirement: "orchestrator_allowed"` permits a direct answer when the target already has the evidence in coordination state: status, ownership, scope, or an existing report/artifact. This is the default.
+- `handler_requirement: "butler_required"` requires a fresh request-scoped butler when the answer needs current source inspection, exact API/DTO verification, multi-file tracing, commands, tests, or other repository investigation. Answer length is irrelevant.
+- `answer_requirement: "summary_allowed"` permits a summary-only answer. This is the default.
+- `answer_requirement: "artifact_required"` makes `answer_request` reject a missing or empty `body` without changing request state.
+
+For a `butler_required` request:
+
+1. Create a `butler` worker run with this exact `request_id`.
 2. Spawn the child and give it `worker_run_id` and `request_id`.
 3. Activate the worker.
 4. Read the request and its optional question artifact.
@@ -401,6 +412,18 @@ The target repository receives `request_available`. The orchestrator may answer 
 6. Inspect the local repository.
 7. Answer the request.
 8. Complete the worker run.
+
+```json
+{
+  "instance_id": "<target-orchestrator-instance-id>",
+  "role": "butler",
+  "request_id": "<request-id>",
+  "task_summary": "Inspect the checkout response contract",
+  "context_refs": []
+}
+```
+
+The butler must be a fresh child for this directed request and cannot claim or answer a different request. A butler receives only the exact question, answer requirement, Feature/WorkItem links, and relevant artifact references; it independently discovers authoritative repository details. The returned request records `answer_provenance` plus the answering instance or worker-run ID.
 
 Example answer:
 
@@ -495,7 +518,7 @@ Audit work is part of the shared work graph. Create an `audit` work item owned b
 }
 ```
 
-The owner repository claims this card normally. It then creates a fresh auditor whose `work_item_id` is the claimed audit card. The server derives the scope and iteration from that card:
+The owner repository claims this card normally. It then creates a fresh auditor child with no executor or remediation conversation history whose `work_item_id` is the claimed audit card. Give it only the specification, acceptance criteria, IDs, artifact references, and current repository state. The server derives the scope and iteration from that card:
 
 ```json
 {
@@ -549,7 +572,7 @@ If the report contains findings, create exactly one `remediation` work item in t
 }
 ```
 
-Claim that card, then create its executor with both `work_item_id` and the same `addresses_audit_run_id`. The executor publishes an `implementation_report`; an orchestrator holding the active repository claim completes the remediation card with that artifact. A failed or abandoned executor can likewise be retried on the same reclaimed remediation card, but attempts cannot overlap and a completed attempt is final.
+Claim that card, then create its executor with both `work_item_id` and the same `addresses_audit_run_id`. The executor publishes an `implementation_report`; an orchestrator holding the active repository claim completes the remediation card with that artifact. The original executor child may receive this focused same-lineage remediation turn when its context remains healthy, but the server-side remediation run is always new. Otherwise spawn a fresh remediation child. A failed or abandoned executor can likewise be retried on the same reclaimed remediation card, but attempts cannot overlap and a completed attempt is final.
 
 A batch audit still has exactly one remediation card. Therefore every `changes_required` item in that audit must have remaining audit depth before the card can be created. If several items became `verification_blocked`, explicitly increase depth for all of them first; reopening only part of the batch is rejected and does not mutate neighbouring items.
 
@@ -680,7 +703,7 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 
 | Tool | Purpose |
 | --- | --- |
-| `create_worker_run` | Create a role-matched worker for a claimed card, or a request-scoped butler. |
+| `create_worker_run` | Create a role-matched worker for a claimed card, or a butler linked to one `request_id`. |
 | `activate_worker_run` | Move a created run to active. The child agent's first call. |
 | `heartbeat_worker_run` | Extend an active worker lease. |
 | `get_worker_run` | Read worker status, scope, and result data. |
@@ -691,12 +714,12 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 
 | Tool | Purpose |
 | --- | --- |
-| `ask_repository` | Create a durable question for one repository. |
+| `ask_repository` | Create a durable question with explicit handler and answer requirements. |
 | `read_request` | Read a request as its requester or target repository. |
 | `claim_request` | Claim a pending request or an expired claim. |
 | `renew_request_claim` | Renew an owned request claim. |
 | `release_request_claim` | Return an owned request to pending. |
-| `answer_request` | Close an owned request and deliver an answer artifact. |
+| `answer_request` | Close an owned request, enforce its answer requirement, and record provenance. |
 | `fail_request` | Requeue a retryable request or terminally fail it. |
 
 ### Messages and events
@@ -899,6 +922,8 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
    - Before spawning a child agent, claim the owner work item when the run implements a
      specific item, then call `create_worker_run` with role `executor` and that
      `work_item_id`.
+   - Spawn one fresh executor child context for each independent implementation WorkItem.
+     Never reuse that child for an unrelated WorkItem.
    - `create_worker_run` records the run but does not spawn a process. Spawn the child
      through the available agent runtime only after the server returns `worker_run_id`.
    - Pass the child its `worker_run_id`, task, acceptance criteria, relevant feature and
@@ -912,14 +937,32 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
    - The parent rereads the work item and completes it through `update_work_item` with the
      returned implementation artifact ID and current revision. A worker terminal state
      alone does not finish the work item.
+   - The same executor child may receive a focused remediation turn for its own WorkItem
+     lineage when its context remains healthy, but create a new remediation `worker_run_id`
+     linked through `addresses_audit_run_id`. Spawn a fresh remediation child when the old
+     context is unavailable, saturated, repeatedly confused, or anchored to a rejected
+     approach.
 
 5. Use durable requests for cross-repository questions.
    - When progress depends on information from another repository, call `ask_repository`
      so the question has an explicit target, state, owner, and answer.
    - Include a compact question summary, full body when useful, and `context_refs` that
      let the receiver identify the feature and work involved.
-   - The target repository may answer through its orchestrator or create a `butler`
-     worker run. The answering actor uses `read_request`, `claim_request`, and then
+   - Set `handler_requirement: orchestrator_allowed` only when the target can answer from
+     coordination state, ownership, scope, or an existing report already in hand. Set
+     `butler_required` whenever the answer requires current code inspection, exact contract
+     verification, multi-file tracing, commands, or tests.
+   - For `butler_required`, create and spawn a fresh role `butler` worker linked with that
+     exact `request_id`. It may claim and answer only that request and must not be reused
+     for unrelated questions. Give it the narrow request context and let it inspect the
+     authoritative checkout itself.
+   - Use `answer_requirement: artifact_required` when a non-empty answer body is mandatory;
+     otherwise `summary_allowed` is sufficient. The returned request provenance identifies
+     whether an orchestrator or butler produced the answer.
+   - While an outgoing request is unresolved, include `request_answered` and
+     `request_failed` in `wait_for_events` filters. Read the durable request after either
+     event instead of treating the event header as the answer payload.
+   - The permitted answering actor uses `read_request`, `claim_request`, and then
      `answer_request`, `release_request_claim`, or `fail_request`.
    - A blocked executor may remain active in `wait_for_events` and continue after
      `request_answered`. Alternatively it may report the blocked state to its parent and
@@ -952,14 +995,18 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
    - Create a repository-owned `audit` work item whose `audit_scope_work_item_ids`
      contains only completed implementation cards from that same repository. Split a
      cross-repository review into one card per owner.
-   - The owner repository claims the audit card, creates a fresh role `auditor` worker
-     linked by `work_item_id`, and requires exactly one `audit_report` with one structured
-     `audit_outcomes` verdict per scoped item before completing both the worker and audit card.
+   - The owner repository claims the audit card and spawns a fresh role `auditor` child
+     with no executor/remediation conversation history, linked by `work_item_id`. Give it
+     only the specification, acceptance criteria, IDs, artifact references, and current
+     repository state. Require exactly one `audit_report` with one structured
+     `audit_outcomes` verdict per scoped item before completing both worker and audit card.
    - If the report contains actionable findings, create at most one `remediation` card
      linked by `addresses_audit_run_id`; claim it and create a matching executor with
      both the card and audit-run links.
    - Treat remediation completion as `pending_reaudit`, not verified. Start a later audit
-     card only after the prior audit card and any remediation card are completed.
+     card only after the prior audit card and any remediation card are completed, and use
+     another fresh auditor child. Orchestrator review and executor self-review are only
+     supplemental and never replace the formal audit.
    - Never exceed `max_audit_iterations` automatically. If verification becomes blocked,
      ask the user before calling `increase_audit_depth` with a reason and current revision.
    - Do not create an endless review loop for minor preferences. Stop when the configured

@@ -21,18 +21,18 @@ use tokio::{
 };
 
 use crate::domain::{
-    ActorRef, AgentInstance, AnswerRequest, AnswerRequestResult, Artifact, ArtifactId,
-    ArtifactKind, AskRepository, AuditOutcomeInput, AuditScopeItem, AuditVerdict, CancelFeature,
-    CompleteFeature, ConnectOrchestrator, ConnectResult, CoordinationRequest, CreateFeature,
-    CreateWorkItem, CreateWorkerRun, DeliveryAck, EventBatch, EventEntityType, EventKind,
-    FailRequest, Feature, FeatureId, FeatureStatus, HubEvent, InboxItem, InboxPage,
-    IncreaseAuditDepth, InstanceId, LeaseMaintenanceReport, MAX_AUDIT_WORK_ITEMS, MAX_CONTEXT_REFS,
-    MAX_MESSAGE_RECIPIENTS, MAX_WORK_ITEM_DEPENDENCIES, Message, MessageId, MessageKind,
-    MessageTarget, OperationalMetrics, PresenceStatus, Project, ProjectId, ProjectOverview,
-    PublishMessage, PublishResult, Repository, RepositoryId, RepositoryPresence,
-    RepositoryPresenceFilter, RequestId, RequestStatus, RetentionReport, ThreadId, UpdateWorkItem,
-    VerificationStatus, WaitOutcome, WorkItem, WorkItemId, WorkItemKind, WorkItemPage,
-    WorkItemStatus, WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
+    ActorRef, AgentInstance, AnswerRequest, AnswerRequestResult, AnswerRequirement, Artifact,
+    ArtifactId, ArtifactKind, AskRepository, AuditOutcomeInput, AuditScopeItem, AuditVerdict,
+    CancelFeature, CompleteFeature, ConnectOrchestrator, ConnectResult, CoordinationRequest,
+    CreateFeature, CreateWorkItem, CreateWorkerRun, DeliveryAck, EventBatch, EventEntityType,
+    EventKind, FailRequest, Feature, FeatureId, FeatureStatus, HandlerRequirement, HubEvent,
+    InboxItem, InboxPage, IncreaseAuditDepth, InstanceId, LeaseMaintenanceReport,
+    MAX_AUDIT_WORK_ITEMS, MAX_CONTEXT_REFS, MAX_MESSAGE_RECIPIENTS, MAX_WORK_ITEM_DEPENDENCIES,
+    Message, MessageId, MessageKind, MessageTarget, OperationalMetrics, PresenceStatus, Project,
+    ProjectId, ProjectOverview, PublishMessage, PublishResult, Repository, RepositoryId,
+    RepositoryPresence, RepositoryPresenceFilter, RequestId, RequestStatus, RetentionReport,
+    ThreadId, UpdateWorkItem, VerificationStatus, WaitOutcome, WorkItem, WorkItemId, WorkItemKind,
+    WorkItemPage, WorkItemStatus, WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
 };
 
 use super::schema::{CREATE_SCHEMA, SCHEMA_VERSION};
@@ -493,6 +493,7 @@ fn worker_run_fingerprint(command: &CreateWorkerRun) -> Result<String, StoreErro
         "context_refs": command.context_refs,
         "addresses_audit_run_id": command.addresses_audit_run_id,
         "work_item_id": command.work_item_id,
+        "request_id": command.request_id,
     }))
 }
 
@@ -532,6 +533,8 @@ fn ask_repository_fingerprint(command: &AskRepository) -> Result<String, StoreEr
         "question_summary": command.question_summary,
         "body": command.body,
         "context_refs": command.context_refs,
+        "handler_requirement": command.handler_requirement,
+        "answer_requirement": command.answer_requirement,
     }))
 }
 
@@ -698,6 +701,11 @@ fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreErr
                     "auditor run cannot address another audit run".to_owned(),
                 ));
             }
+            if command.request_id.is_some() {
+                return Err(StoreError::Conflict(
+                    "auditor run cannot link a repository request".to_owned(),
+                ));
+            }
         }
         WorkerRole::Executor => {
             if command.addresses_audit_run_id.is_some() && command.work_item_id.is_none() {
@@ -705,11 +713,21 @@ fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreErr
                     "remediation executor requires a claimed remediation work_item_id".to_owned(),
                 ));
             }
+            if command.request_id.is_some() {
+                return Err(StoreError::Conflict(
+                    "executor run cannot link a repository request".to_owned(),
+                ));
+            }
         }
         WorkerRole::Butler => {
             if command.addresses_audit_run_id.is_some() || command.work_item_id.is_some() {
                 return Err(StoreError::Conflict(
                     "butler run cannot declare audit scope or remediation link".to_owned(),
+                ));
+            }
+            if command.request_id.is_none() {
+                return Err(StoreError::Conflict(
+                    "butler run requires one request_id".to_owned(),
                 ));
             }
         }
@@ -1258,6 +1276,7 @@ fn worker_run_from_row(row: &SqliteRow) -> Result<WorkerRun, StoreError> {
             WorkerRunId::parse,
         )?,
         work_item_id: parse_optional_id(row.try_get("work_item_id")?, WorkItemId::parse)?,
+        request_id: parse_optional_id(row.try_get("request_id")?, RequestId::parse)?,
         created_at: row.try_get("created_at")?,
         activated_at: row.try_get("activated_at")?,
         last_heartbeat_at: row.try_get("last_heartbeat_at")?,
@@ -1349,6 +1368,9 @@ fn event_from_row(row: &SqliteRow) -> Result<HubEvent, StoreError> {
 
 fn request_from_row(row: &SqliteRow) -> Result<CoordinationRequest, StoreError> {
     let status: String = row.try_get("status")?;
+    let handler_requirement: String = row.try_get("handler_requirement")?;
+    let answer_requirement: String = row.try_get("answer_requirement")?;
+    let answer_provenance: Option<String> = row.try_get("answer_provenance")?;
     let context_refs_json: String = row.try_get("context_refs_json")?;
     Ok(CoordinationRequest {
         request_id: RequestId::parse(row.try_get("request_id")?)?,
@@ -1366,6 +1388,8 @@ fn request_from_row(row: &SqliteRow) -> Result<CoordinationRequest, StoreError> 
             WorkerRunId::parse,
         )?,
         status: status.parse().map_err(StoreError::Conflict)?,
+        handler_requirement: handler_requirement.parse().map_err(StoreError::Conflict)?,
+        answer_requirement: answer_requirement.parse().map_err(StoreError::Conflict)?,
         question_summary: row.try_get("question_summary")?,
         question_artifact_id: parse_optional_id(
             row.try_get("question_artifact_id")?,
@@ -1384,6 +1408,17 @@ fn request_from_row(row: &SqliteRow) -> Result<CoordinationRequest, StoreError> 
         failure_summary: row.try_get("failure_summary")?,
         failure_retryable: row.try_get::<Option<bool>, _>("failure_retryable")?,
         answer_message_id: parse_optional_id(row.try_get("answer_message_id")?, MessageId::parse)?,
+        answer_provenance: answer_provenance
+            .map(|value| value.parse().map_err(StoreError::Conflict))
+            .transpose()?,
+        answered_by_instance_id: parse_optional_id(
+            row.try_get("answered_by_instance_id")?,
+            InstanceId::parse,
+        )?,
+        answered_by_worker_run_id: parse_optional_id(
+            row.try_get("answered_by_worker_run_id")?,
+            WorkerRunId::parse,
+        )?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         finished_at: row.try_get("finished_at")?,

@@ -76,10 +76,12 @@ impl SqliteStore {
             "INSERT INTO requests(
                  request_id, project_id, requester_repository_id, target_repository_id,
                  created_by_instance_id, created_by_worker_run_id, feature_id, work_item_id,
-                 status, question_summary, question_artifact_id, context_refs_json, claimed_by_instance_id,
+                 status, handler_requirement, answer_requirement,
+                 question_summary, question_artifact_id, context_refs_json, claimed_by_instance_id,
                  claimed_by_worker_run_id, claim_expires_at, failure_summary, failure_retryable,
-                 answer_message_id, created_at, updated_at, finished_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL)",
+                 answer_message_id, answer_provenance, answered_by_instance_id,
+                 answered_by_worker_run_id, created_at, updated_at, finished_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL)",
         )
         .bind(request_id.to_string())
         .bind(actor.project_id.to_string())
@@ -89,6 +91,8 @@ impl SqliteStore {
         .bind(actor.worker_run_id.map(|id| id.to_string()))
         .bind(feature_id.map(|id| id.to_string()))
         .bind(work_item_id.map(|id| id.to_string()))
+        .bind(command.handler_requirement.as_str())
+        .bind(command.answer_requirement.as_str())
         .bind(command.question_summary)
         .bind(question_artifact.as_ref().map(|artifact| artifact.artifact_id.to_string()))
         .bind(context_refs_json)
@@ -165,6 +169,20 @@ impl SqliteStore {
         let actor = self
             .resolve_actor(&mut transaction, actor_ref, &now)
             .await?;
+        let request_row = sqlx::query("SELECT * FROM requests WHERE request_id = ?")
+            .bind(request_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("request {request_id}")))?;
+        let request = request_from_row(&request_row)?;
+        if request.project_id != actor.project_id
+            || request.target_repository_id != actor.repository_id
+        {
+            return Err(StoreError::NotFound(format!(
+                "request {request_id} in actor repository"
+            )));
+        }
+        ensure_request_handler(&mut transaction, &request, &actor).await?;
         let claim_expires_at = (Utc::now() + self.request_claim_lease_duration)
             .to_rfc3339_opts(SecondsFormat::Micros, true);
         let result = sqlx::query(
@@ -318,7 +336,18 @@ impl SqliteStore {
             .await?
             .ok_or_else(|| StoreError::NotFound(format!("request {}", command.request_id)))?;
         let request = request_from_row(&request_row)?;
+        ensure_request_handler(&mut transaction, &request, &actor).await?;
         ensure_active_request_claim(&request, &actor, &now)?;
+        if request.answer_requirement == AnswerRequirement::ArtifactRequired
+            && command
+                .body
+                .as_deref()
+                .is_none_or(|body| body.trim().is_empty())
+        {
+            return Err(StoreError::Conflict(
+                "request requires a non-empty answer artifact body".to_owned(),
+            ));
+        }
 
         let artifact = command.body.map(|content| Artifact {
             artifact_id: ArtifactId::new(),
@@ -361,15 +390,24 @@ impl SqliteStore {
         )
         .await?;
         let (owner_column, owner_id) = actor_owner(&actor);
+        let answer_provenance = if actor.worker_run_id.is_some() {
+            "butler"
+        } else {
+            "orchestrator"
+        };
         let query = format!(
             "UPDATE requests
              SET status = 'answered', answer_message_id = ?, claim_expires_at = NULL,
-                 updated_at = ?, finished_at = ?
+                 answer_provenance = ?, answered_by_instance_id = ?,
+                 answered_by_worker_run_id = ?, updated_at = ?, finished_at = ?
              WHERE request_id = ? AND target_repository_id = ? AND status = 'claimed'
                AND {owner_column} = ? AND claim_expires_at > ?"
         );
         let result = sqlx::query(&query)
             .bind(message.message_id.to_string())
+            .bind(answer_provenance)
+            .bind(actor.instance_id.map(|id| id.to_string()))
+            .bind(actor.worker_run_id.map(|id| id.to_string()))
             .bind(&now)
             .bind(&now)
             .bind(command.request_id.to_string())
@@ -475,6 +513,44 @@ impl SqliteStore {
         transaction.commit().await?;
         self.notifications.notify(recipient);
         self.get_request(command.request_id).await
+    }
+}
+
+async fn ensure_request_handler(
+    transaction: &mut Transaction<'_, Sqlite>,
+    request: &CoordinationRequest,
+    actor: &ResolvedActor,
+) -> Result<(), StoreError> {
+    match (actor.instance_id, actor.worker_run_id) {
+        (Some(_), None)
+            if request.handler_requirement == HandlerRequirement::OrchestratorAllowed =>
+        {
+            Ok(())
+        }
+        (Some(_), None) => Err(StoreError::Conflict(
+            "request requires its linked butler worker".to_owned(),
+        )),
+        (None, Some(worker_run_id)) => {
+            let valid: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM worker_runs
+                     WHERE worker_run_id = ? AND repository_id = ?
+                       AND role = 'butler' AND request_id = ? AND status = 'active'
+                 )",
+            )
+            .bind(worker_run_id.to_string())
+            .bind(actor.repository_id.to_string())
+            .bind(request.request_id.to_string())
+            .fetch_one(&mut **transaction)
+            .await?;
+            if valid == 0 {
+                return Err(StoreError::Conflict(
+                    "request workers must be the active butler linked to this request".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(StoreError::Conflict("invalid request actor".to_owned())),
     }
 }
 
