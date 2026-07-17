@@ -136,6 +136,50 @@ async fn complete_audit_work_item(
         .unwrap()
 }
 
+async fn fail_reopen_and_claim_work_item(
+    store: &SqliteStore,
+    connected: &ConnectResult,
+    work_item_id: WorkItemId,
+) -> WorkItem {
+    let active = store.get_work_item(work_item_id).await.unwrap();
+    let failed = store
+        .update_work_item(UpdateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            work_item_id,
+            expected_revision: active.revision,
+            title: None,
+            summary: None,
+            owner_repository_id: None,
+            parent_work_item_id: None,
+            dependency_ids: None,
+            priority: None,
+            status: Some(WorkItemStatus::Failed),
+            implementation_artifact_id: None,
+        })
+        .await
+        .unwrap();
+    let ready = store
+        .update_work_item(UpdateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            work_item_id,
+            expected_revision: failed.revision,
+            title: None,
+            summary: None,
+            owner_repository_id: None,
+            parent_work_item_id: None,
+            dependency_ids: None,
+            priority: None,
+            status: Some(WorkItemStatus::Ready),
+            implementation_artifact_id: None,
+        })
+        .await
+        .unwrap();
+    store
+        .claim_work_item(connected.instance.instance_id, work_item_id, ready.revision)
+        .await
+        .unwrap()
+}
+
 async fn feature_with_completed_item_and_audit(
     store: &SqliteStore,
     connected: &ConnectResult,
@@ -2193,6 +2237,313 @@ async fn worker_role_must_match_the_claimed_work_item_kind() {
                 work_item_id: None,
             })
             .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn audit_and_remediation_owner_repository_is_immutable() {
+    let (store, path) = test_store(90).await;
+    let backend = store
+        .connect_orchestrator(connect_command("owner-lock", "backend", "C:/owner/backend"))
+        .await
+        .unwrap();
+    let web = store
+        .connect_orchestrator(connect_command("owner-lock", "web", "C:/owner/web"))
+        .await
+        .unwrap();
+
+    let (audited_feature, _, audit_run) =
+        feature_with_completed_item_and_audit(&store, &backend, "remediation owner").await;
+    let remediation = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: audited_feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: backend.repository.repository_id,
+            title: "Repository-local remediation".to_owned(),
+            summary: "Must remain in backend".to_owned(),
+            kind: WorkItemKind::Remediation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: Some(audit_run.worker_run_id),
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .update_work_item(UpdateWorkItem {
+                parent_instance_id: backend.instance.instance_id,
+                work_item_id: remediation.work_item_id,
+                expected_revision: remediation.revision,
+                title: None,
+                summary: None,
+                owner_repository_id: Some(web.repository.repository_id),
+                parent_work_item_id: None,
+                dependency_ids: None,
+                priority: None,
+                status: None,
+                implementation_artifact_id: None,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(
+        sqlx::query("UPDATE work_items SET owner_repository_id = ? WHERE work_item_id = ?")
+            .bind(web.repository.repository_id.to_string())
+            .bind(remediation.work_item_id.to_string())
+            .execute(&store.pool)
+            .await
+            .is_err()
+    );
+
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: backend.instance.instance_id,
+            title: "Audit owner".to_owned(),
+            summary: "Audit must stay beside its code".to_owned(),
+        })
+        .await
+        .unwrap();
+    let implementation = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: backend.repository.repository_id,
+            title: "Backend implementation".to_owned(),
+            summary: "Completed target".to_owned(),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE work_items SET status = 'completed' WHERE work_item_id = ?")
+        .bind(implementation.work_item_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let audit_item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: backend.repository.repository_id,
+            title: "Backend audit".to_owned(),
+            summary: "Repository-local audit".to_owned(),
+            kind: WorkItemKind::Audit,
+            audit_scope_work_item_ids: vec![implementation.work_item_id],
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .update_work_item(UpdateWorkItem {
+                parent_instance_id: backend.instance.instance_id,
+                work_item_id: audit_item.work_item_id,
+                expected_revision: audit_item.revision,
+                title: None,
+                summary: None,
+                owner_repository_id: Some(web.repository.repository_id),
+                parent_work_item_id: None,
+                dependency_ids: None,
+                priority: None,
+                status: None,
+                implementation_artifact_id: None,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(
+        sqlx::query("UPDATE work_items SET owner_repository_id = ? WHERE work_item_id = ?")
+            .bind(web.repository.repository_id.to_string())
+            .bind(audit_item.work_item_id.to_string())
+            .execute(&store.pool)
+            .await
+            .is_err()
+    );
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn abandoned_auditor_can_be_retried_on_the_same_audit_card() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "audit-retry",
+            "backend",
+            "C:/retry/backend",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: connected.instance.instance_id,
+            title: "Retry audit".to_owned(),
+            summary: "Transient auditor failure".to_owned(),
+        })
+        .await
+        .unwrap();
+    let implementation = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: "Completed implementation".to_owned(),
+            summary: "Audit target".to_owned(),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE work_items SET status = 'completed' WHERE work_item_id = ?")
+        .bind(implementation.work_item_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let audit_item = create_claimed_audit_item(
+        &store,
+        &connected,
+        feature.feature_id,
+        vec![implementation.work_item_id],
+        "retry target",
+    )
+    .await;
+    let first = create_auditor_run(&store, &connected, &audit_item, "First attempt").await;
+    store
+        .activate_worker_run(first.worker_run_id)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE worker_runs SET lease_expires_at = ? WHERE worker_run_id = ?")
+        .bind("1970-01-01T00:00:00Z")
+        .bind(first.worker_run_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE work_items SET claim_expires_at = ? WHERE work_item_id = ?")
+        .bind("1970-01-01T00:00:00Z")
+        .bind(audit_item.work_item_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    store.run_lease_maintenance().await.unwrap();
+    assert_eq!(
+        store
+            .get_worker_run(first.worker_run_id)
+            .await
+            .unwrap()
+            .status,
+        WorkerRunStatus::Abandoned
+    );
+    let expired_item = store.get_work_item(audit_item.work_item_id).await.unwrap();
+    let retried_item = store
+        .claim_work_item(
+            connected.instance.instance_id,
+            audit_item.work_item_id,
+            expired_item.revision,
+        )
+        .await
+        .unwrap();
+    let second = create_auditor_run(&store, &connected, &retried_item, "Second attempt").await;
+    assert_ne!(first.worker_run_id, second.worker_run_id);
+    assert!(matches!(
+        store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: connected.instance.instance_id,
+                role: WorkerRole::Auditor,
+                task_summary: "Overlapping attempt".to_owned(),
+                context_refs: json!([]),
+                addresses_audit_run_id: None,
+                work_item_id: Some(audit_item.work_item_id),
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn failed_remediation_executor_can_be_retried_on_the_same_card() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "remediation-retry",
+            "backend",
+            "C:/retry/remediation",
+        ))
+        .await
+        .unwrap();
+    let (feature, _, audit_run) =
+        feature_with_completed_item_and_audit(&store, &connected, "retry remediation").await;
+    let remediation = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: "Retry remediation".to_owned(),
+            summary: "Transient executor failure".to_owned(),
+            kind: WorkItemKind::Remediation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: Some(audit_run.worker_run_id),
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    let remediation = store
+        .claim_work_item(
+            connected.instance.instance_id,
+            remediation.work_item_id,
+            remediation.revision,
+        )
+        .await
+        .unwrap();
+    let worker_command = || CreateWorkerRun {
+        parent_instance_id: connected.instance.instance_id,
+        role: WorkerRole::Executor,
+        task_summary: "Remediation attempt".to_owned(),
+        context_refs: json!([]),
+        addresses_audit_run_id: Some(audit_run.worker_run_id),
+        work_item_id: Some(remediation.work_item_id),
+    };
+    let first = store.create_worker_run(worker_command()).await.unwrap();
+    store
+        .activate_worker_run(first.worker_run_id)
+        .await
+        .unwrap();
+    store
+        .fail_worker_run(first.worker_run_id, "Transient failure")
+        .await
+        .unwrap();
+    fail_reopen_and_claim_work_item(&store, &connected, remediation.work_item_id).await;
+    let second = store.create_worker_run(worker_command()).await.unwrap();
+    assert_ne!(first.worker_run_id, second.worker_run_id);
+    assert!(matches!(
+        store.create_worker_run(worker_command()).await,
         Err(StoreError::Conflict(_))
     ));
 

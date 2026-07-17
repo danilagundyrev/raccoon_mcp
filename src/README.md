@@ -480,7 +480,7 @@ Acknowledgement closes a delivery for one repository. It does not delete the mes
 
 Set `max_audit_iterations` on an implementation work item to a value from 1 to 10. The default is 2: one initial audit and room for one post-remediation audit.
 
-Audit work is part of the shared work graph. Create an `audit` work item owned by the repository that contains the code. Every scoped implementation must already be completed, belong to the same Feature, and have the same owner repository. Split cross-repository review into separate audit cards.
+Audit work is part of the shared work graph. Create an `audit` work item owned by the repository that contains the code. Every scoped implementation must already be completed, belong to the same Feature, and have the same owner repository. Split cross-repository review into separate audit cards. The owner of an audit or remediation card is immutable after creation because changing it would invalidate the stored scope or lineage.
 
 ```json
 {
@@ -523,7 +523,7 @@ The auditor activates, examines its local checkout, and publishes exactly one `a
 }
 ```
 
-Without its own `audit_report`, the auditor cannot complete. A second report from the same run is rejected. After the worker completes, its parent orchestrator completes the audit work item through `update_work_item` without an `implementation_artifact_id`.
+Without its own `audit_report`, the auditor cannot complete. A second report from the same run is rejected. After the worker completes, its parent orchestrator completes the audit work item through `update_work_item` without an `implementation_artifact_id`. If an auditor attempt fails or its lease is abandoned, reclaim the same audit card and create a fresh worker run; another active attempt or any completed attempt blocks replacement.
 
 If the report contains findings, create exactly one `remediation` work item in the same repository:
 
@@ -540,7 +540,7 @@ If the report contains findings, create exactly one `remediation` work item in t
 }
 ```
 
-Claim that card, then create its executor with both `work_item_id` and the same `addresses_audit_run_id`. The executor publishes an `implementation_report`; its orchestrator completes the remediation card with that artifact.
+Claim that card, then create its executor with both `work_item_id` and the same `addresses_audit_run_id`. The executor publishes an `implementation_report`; its orchestrator completes the remediation card with that artifact. A failed or abandoned executor can likewise be retried on the same reclaimed remediation card, but attempts cannot overlap and a completed attempt is final.
 
 The next audit card is allowed only after the prior audit card and any remediation card complete. Every scoped implementation must still have remaining audit depth. Remediation cannot be created retroactively after a later audit iteration starts.
 

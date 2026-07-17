@@ -109,6 +109,7 @@ impl SqliteStore {
 
         let (work_item_recipients, audit_scope) = super::work::attach_worker_to_work_item(
             &mut transaction,
+            worker_run_id,
             &command,
             repository_id,
             project_id,

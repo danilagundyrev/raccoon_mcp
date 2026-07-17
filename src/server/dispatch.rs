@@ -714,6 +714,7 @@ pub(super) async fn read_resource(
                     "The orchestrator calls create_worker_run before spawning a child.",
                     "The child receives worker_run_id and calls activate_worker_run.",
                     "The child calls complete_worker_run or fail_worker_run before exiting.",
+                    "A failed or abandoned audit/remediation worker may be replaced on the same reclaimed work item; an active or completed attempt blocks replacement.",
                     "A worker never calls connect_orchestrator and never creates a repository identity."
                 ],
                 "work_flow": [

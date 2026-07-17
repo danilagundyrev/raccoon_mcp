@@ -202,7 +202,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "update_work_item",
-            "description": "Update a work item using optimistic expected_revision. Completion requires an implementation_report artifact.",
+            "description": "Update a work item using optimistic expected_revision. Completing implementation or remediation requires implementation_artifact_id from its completed executor; completing audit requires its completed auditor and audit_report and rejects implementation_artifact_id.",
             "inputSchema": update_work_item_schema(max_summary_bytes),
             "annotations": mutation_annotations(false)
         },
@@ -477,7 +477,11 @@ pub(super) fn update_work_item_schema(max_summary_bytes: u16) -> Value {
                 "type": "string",
                 "enum": ["planned", "ready", "claimed", "in_progress", "blocked", "completed", "failed", "cancelled"]
             },
-            "implementation_artifact_id": { "type": "string", "format": "uuid" }
+            "implementation_artifact_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Accepted only when completing implementation or remediation work; audit completion derives its report from the linked auditor."
+            }
         },
         "required": ["instance_id", "work_item_id", "expected_revision"]
     })

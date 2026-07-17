@@ -1138,6 +1138,24 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
             .unwrap()
             .contains(&json!("expected_revision"))
     );
+    let update_tool = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "update_work_item")
+        .unwrap();
+    assert!(
+        update_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("audit_report")
+    );
+    assert!(
+        update["properties"]["implementation_artifact_id"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("audit completion")
+    );
     let create = create_work_item_schema(2048);
     assert_eq!(create["properties"]["dependency_ids"]["uniqueItems"], true);
     assert_eq!(create["properties"]["max_audit_iterations"]["maximum"], 10);

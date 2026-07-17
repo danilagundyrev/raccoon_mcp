@@ -593,6 +593,11 @@ impl SqliteStore {
             .owner_repository_id
             .unwrap_or(current.owner_repository_id);
         if next_owner != current.owner_repository_id {
+            if current.kind != WorkItemKind::Implementation {
+                return Err(StoreError::Conflict(
+                    "audit and remediation owner_repository_id is immutable".to_owned(),
+                ));
+            }
             ensure_editable_shape(&current)?;
             ensure_repository_project(&mut transaction, next_owner, actor.project_id).await?;
         }
@@ -1740,6 +1745,7 @@ async fn append_work_item_events(
 
 pub(super) async fn attach_worker_to_work_item(
     transaction: &mut Transaction<'_, Sqlite>,
+    worker_run_id: WorkerRunId,
     command: &CreateWorkerRun,
     repository_id: RepositoryId,
     project_id: ProjectId,
@@ -1766,25 +1772,30 @@ pub(super) async fn attach_worker_to_work_item(
                 ));
             }
         }
-        (WorkerRole::Auditor, WorkItemKind::Audit) => {
-            let run_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM worker_runs
-                 WHERE work_item_id = ? AND role = 'auditor'",
-            )
-            .bind(work_item_id.to_string())
-            .fetch_one(&mut **transaction)
-            .await?;
-            if run_count != 1 {
-                return Err(StoreError::Conflict(
-                    "an audit work item can link exactly one auditor run".to_owned(),
-                ));
-            }
-        }
+        (WorkerRole::Auditor, WorkItemKind::Audit) => {}
         _ => {
             return Err(StoreError::Conflict(format!(
                 "{} workers cannot attach to {} work items",
                 command.role,
                 item.kind.as_str()
+            )));
+        }
+    }
+    if matches!(item.kind, WorkItemKind::Audit | WorkItemKind::Remediation) {
+        let blocking_attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM worker_runs
+             WHERE work_item_id = ? AND worker_run_id <> ?
+               AND status IN ('created', 'active', 'completed')",
+        )
+        .bind(work_item_id.to_string())
+        .bind(worker_run_id.to_string())
+        .fetch_one(&mut **transaction)
+        .await?;
+        if blocking_attempts != 0 {
+            return Err(StoreError::Conflict(format!(
+                "{} work item {} already has an active or completed worker attempt",
+                item.kind.as_str(),
+                item.work_item_id
             )));
         }
     }

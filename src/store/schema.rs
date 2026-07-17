@@ -129,6 +129,14 @@ CREATE INDEX IF NOT EXISTS work_items_feature_status_idx
 CREATE INDEX IF NOT EXISTS work_items_owner_status_idx
     ON work_items(owner_repository_id, status, priority, created_at);
 
+CREATE TRIGGER IF NOT EXISTS work_items_lineage_owner_immutable
+BEFORE UPDATE OF owner_repository_id ON work_items
+WHEN OLD.kind IN ('audit', 'remediation')
+  AND NEW.owner_repository_id <> OLD.owner_repository_id
+BEGIN
+    SELECT RAISE(ABORT, 'audit and remediation owner repository is immutable');
+END;
+
 CREATE UNIQUE INDEX IF NOT EXISTS work_items_one_remediation_per_audit_idx
     ON work_items(addresses_audit_run_id)
     WHERE kind = 'remediation' AND addresses_audit_run_id IS NOT NULL;
@@ -185,9 +193,9 @@ CREATE INDEX IF NOT EXISTS worker_runs_active_metrics_idx
     ON worker_runs(status, lease_expires_at)
     WHERE status = 'active';
 
-CREATE UNIQUE INDEX IF NOT EXISTS worker_runs_one_remediation_per_audit_idx
-    ON worker_runs(addresses_audit_run_id)
-    WHERE addresses_audit_run_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS worker_runs_work_item_status_idx
+    ON worker_runs(work_item_id, role, status)
+    WHERE work_item_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS work_item_audit_scope (
     audit_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE CASCADE,
@@ -227,8 +235,7 @@ CREATE TABLE IF NOT EXISTS worker_run_audit_items (
     work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
     audit_iteration INTEGER NOT NULL CHECK(audit_iteration BETWEEN 1 AND 10),
     max_iterations INTEGER NOT NULL CHECK(max_iterations BETWEEN 1 AND 10),
-    PRIMARY KEY(worker_run_id, work_item_id),
-    UNIQUE(work_item_id, audit_iteration)
+    PRIMARY KEY(worker_run_id, work_item_id)
 );
 
 CREATE INDEX IF NOT EXISTS worker_run_audit_items_work_item_idx
