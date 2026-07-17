@@ -113,16 +113,13 @@ fn closed_tool_schemas_reject_unknown_members_recursively() {
         .unwrap()
         .get("inputSchema")
         .unwrap();
-    let nested = validate_tool_argument_members(
+    let removed_worker_scope = validate_tool_argument_members(
         "create_worker_run",
         json!({
             "instance_id": InstanceId::new(),
             "role": "auditor",
             "task_summary": "Audit",
-            "audit_work_items": [{
-                "work_item_id": WorkItemId::new(),
-                "unexpected": true
-            }]
+            "audit_work_items": [{ "work_item_id": WorkItemId::new() }]
         })
         .as_object()
         .unwrap(),
@@ -130,8 +127,8 @@ fn closed_tool_schemas_reject_unknown_members_recursively() {
     )
     .unwrap_err();
     assert_eq!(
-        nested.data.as_ref().unwrap()["argument_path"],
-        "arguments.audit_work_items[0].unexpected"
+        removed_worker_scope.data.as_ref().unwrap()["argument_path"],
+        "arguments.audit_work_items"
     );
 
     let connect_schema = tools
@@ -1054,7 +1051,7 @@ fn collection_cardinality_limits_match_runtime_and_schemas() {
         .map(|_| Value::String(RepositoryId::new().to_string()))
         .collect::<Vec<_>>();
     let audit_items = (0..=MAX_AUDIT_WORK_ITEMS)
-        .map(|_| json!({ "work_item_id": WorkItemId::new() }))
+        .map(|_| Value::String(WorkItemId::new().to_string()))
         .collect::<Vec<_>>();
 
     let mut arguments = JsonMap::new();
@@ -1065,8 +1062,11 @@ fn collection_cardinality_limits_match_runtime_and_schemas() {
         Value::Array(repository_ids),
     );
     assert!(optional_repository_ids(&arguments).is_err());
-    arguments.insert("audit_work_items".to_owned(), Value::Array(audit_items));
-    assert!(optional_audit_work_items(&arguments).is_err());
+    arguments.insert(
+        "audit_scope_work_item_ids".to_owned(),
+        Value::Array(audit_items),
+    );
+    assert!(optional_audit_scope_work_item_ids(&arguments).is_err());
 
     assert_eq!(
         create_work_item_schema(1024)["properties"]["dependency_ids"]["maxItems"],
@@ -1076,15 +1076,8 @@ fn collection_cardinality_limits_match_runtime_and_schemas() {
         publish_message_schema(1024, 4096)["properties"]["target_repository_ids"]["maxItems"],
         MAX_MESSAGE_RECIPIENTS
     );
-    let worker = tool_definitions(1024, 4096, 60)
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|tool| tool["name"] == "create_worker_run")
-        .unwrap()
-        .clone();
     assert_eq!(
-        worker["inputSchema"]["properties"]["audit_work_items"]["maxItems"],
+        create_work_item_schema(1024)["properties"]["audit_scope_work_item_ids"]["maxItems"],
         MAX_AUDIT_WORK_ITEMS
     );
 }
@@ -1148,6 +1141,11 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
     let create = create_work_item_schema(2048);
     assert_eq!(create["properties"]["dependency_ids"]["uniqueItems"], true);
     assert_eq!(create["properties"]["max_audit_iterations"]["maximum"], 10);
+    assert_eq!(create["properties"]["max_audit_iterations"]["default"], 2);
+    assert_eq!(
+        create["properties"]["kind"]["enum"],
+        json!(["implementation", "audit", "remediation"])
+    );
     assert!(
         create["properties"]["priority"]["description"]
             .as_str()
@@ -1164,16 +1162,14 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
 
     let mut audit_arguments = JsonMap::new();
     audit_arguments.insert(
-        "audit_work_items".to_owned(),
-        json!([{ "work_item_id": WorkItemId::new() }]),
+        "audit_scope_work_item_ids".to_owned(),
+        json!([WorkItemId::new()]),
     );
     assert_eq!(
-        optional_audit_work_items(&audit_arguments).unwrap().len(),
+        optional_work_item_ids(&audit_arguments, "audit_scope_work_item_ids")
+            .unwrap()
+            .unwrap()
+            .len(),
         1
     );
-    audit_arguments.insert(
-        "audit_work_items".to_owned(),
-        json!([{ "work_item_id": WorkItemId::new(), "max_iterations": 3 }]),
-    );
-    assert!(optional_audit_work_items(&audit_arguments).is_err());
 }

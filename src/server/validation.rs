@@ -259,6 +259,16 @@ pub(super) fn optional_work_item_ids(
     }
 }
 
+pub(super) fn optional_audit_scope_work_item_ids(
+    arguments: &JsonMap<String, Value>,
+) -> Result<Option<Vec<WorkItemId>>, RpcError> {
+    let ids = optional_work_item_ids(arguments, "audit_scope_work_item_ids")?;
+    if let Some(ids) = &ids {
+        ensure_array_limit("audit_scope_work_item_ids", ids.len(), MAX_AUDIT_WORK_ITEMS)?;
+    }
+    Ok(ids)
+}
+
 pub(super) fn optional_validated_summary(
     arguments: &JsonMap<String, Value>,
     field_name: &str,
@@ -391,40 +401,6 @@ pub(super) fn optional_repository_ids(
         }
         Some(_) => Err(invalid_argument(
             "'target_repository_ids' must be an array when provided".to_owned(),
-        )),
-    }
-}
-
-pub(super) fn optional_audit_work_items(
-    arguments: &JsonMap<String, Value>,
-) -> Result<Vec<AuditWorkItemInput>, RpcError> {
-    match arguments.get("audit_work_items") {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(values)) => {
-            ensure_array_limit("audit_work_items", values.len(), MAX_AUDIT_WORK_ITEMS)?;
-            let items = values.iter().map(|value| {
-                let object = value.as_object().ok_or_else(|| {
-                    invalid_argument("every audit_work_item must be an object".to_owned())
-                })?;
-                if object.keys().any(|key| key != "work_item_id") {
-                    return Err(invalid_argument(
-                        "audit_work_item only accepts work_item_id; audit depth is stored on the work-item card"
-                            .to_owned(),
-                    ));
-                }
-                let work_item_id = WorkItemId::parse(&require_string(object, "work_item_id")?)
-                    .map_err(invalid_uuid)?;
-                Ok(AuditWorkItemInput { work_item_id })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-            ensure_unique_strings(
-                "audit_work_items",
-                items.iter().map(|item| item.work_item_id.to_string()),
-            )?;
-            Ok(items)
-        }
-        Some(_) => Err(invalid_argument(
-            "'audit_work_items' must be an array when provided".to_owned(),
         )),
     }
 }

@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 use super::*;
 use crate::domain::{
-    AnswerRequest, AskRepository, AuditWorkItemInput, CancelFeature, CompleteFeature, FailRequest,
-    FeatureStatus, RequestStatus, WorkItemId, WorkerRole,
+    AnswerRequest, AskRepository, CancelFeature, CompleteFeature, FailRequest, FeatureStatus,
+    RequestStatus, WorkItemId, WorkerRole,
 };
 
 fn temp_database_path() -> PathBuf {
@@ -59,6 +59,83 @@ fn publish_command(
     }
 }
 
+async fn create_claimed_audit_item(
+    store: &SqliteStore,
+    connected: &ConnectResult,
+    feature_id: FeatureId,
+    scope: Vec<WorkItemId>,
+    label: &str,
+) -> WorkItem {
+    let item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: format!("Audit {label}"),
+            summary: format!("Independent review of {label}"),
+            kind: WorkItemKind::Audit,
+            audit_scope_work_item_ids: scope,
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .claim_work_item(
+            connected.instance.instance_id,
+            item.work_item_id,
+            item.revision,
+        )
+        .await
+        .unwrap()
+}
+
+async fn create_auditor_run(
+    store: &SqliteStore,
+    connected: &ConnectResult,
+    audit_item: &WorkItem,
+    summary: &str,
+) -> WorkerRun {
+    store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: connected.instance.instance_id,
+            role: WorkerRole::Auditor,
+            task_summary: summary.to_owned(),
+            context_refs: json!([]),
+            addresses_audit_run_id: None,
+            work_item_id: Some(audit_item.work_item_id),
+        })
+        .await
+        .unwrap()
+}
+
+async fn complete_audit_work_item(
+    store: &SqliteStore,
+    connected: &ConnectResult,
+    audit_item_id: WorkItemId,
+) -> WorkItem {
+    let current = store.get_work_item(audit_item_id).await.unwrap();
+    store
+        .update_work_item(UpdateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            work_item_id: audit_item_id,
+            expected_revision: current.revision,
+            title: None,
+            summary: None,
+            owner_repository_id: None,
+            parent_work_item_id: None,
+            dependency_ids: None,
+            priority: None,
+            status: Some(WorkItemStatus::Completed),
+            implementation_artifact_id: None,
+        })
+        .await
+        .unwrap()
+}
+
 async fn feature_with_completed_item_and_audit(
     store: &SqliteStore,
     connected: &ConnectResult,
@@ -82,6 +159,9 @@ async fn feature_with_completed_item_and_audit(
             summary: "Completed audit target".to_owned(),
             dependency_ids: Vec::new(),
             priority: 0,
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
             max_audit_iterations: 2,
         })
         .await
@@ -91,20 +171,21 @@ async fn feature_with_completed_item_and_audit(
         .execute(&store.pool)
         .await
         .unwrap();
-    let audit = store
-        .create_worker_run(CreateWorkerRun {
-            parent_instance_id: connected.instance.instance_id,
-            role: WorkerRole::Auditor,
-            task_summary: format!("Audit {label} item"),
-            context_refs: json!([]),
-            audit_work_items: vec![AuditWorkItemInput {
-                work_item_id: item.work_item_id,
-            }],
-            addresses_audit_run_id: None,
-            work_item_id: None,
-        })
-        .await
-        .unwrap();
+    let audit_item = create_claimed_audit_item(
+        store,
+        connected,
+        feature.feature_id,
+        vec![item.work_item_id],
+        label,
+    )
+    .await;
+    let audit = create_auditor_run(
+        store,
+        connected,
+        &audit_item,
+        &format!("Audit {label} item"),
+    )
+    .await;
     store
         .activate_worker_run(audit.worker_run_id)
         .await
@@ -132,6 +213,7 @@ async fn feature_with_completed_item_and_audit(
         .complete_worker_run(audit.worker_run_id, "Audit complete")
         .await
         .unwrap();
+    complete_audit_work_item(store, connected, audit_item.work_item_id).await;
     (feature, item, audit)
 }
 
@@ -450,6 +532,9 @@ async fn repository_request_infers_and_validates_work_item_feature_scope() {
             summary: "Explain the contract".to_owned(),
             dependency_ids: Vec::new(),
             priority: 0,
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
             max_audit_iterations: 1,
         })
         .await
@@ -516,6 +601,9 @@ async fn feature_cancellation_cancels_unclaimed_items_but_rejects_active_work() 
             summary: "Not started".to_owned(),
             dependency_ids: Vec::new(),
             priority: 0,
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
             max_audit_iterations: 1,
         })
         .await
@@ -553,6 +641,9 @@ async fn feature_cancellation_cancels_unclaimed_items_but_rejects_active_work() 
             summary: "Already claimed".to_owned(),
             dependency_ids: Vec::new(),
             priority: 0,
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
             max_audit_iterations: 1,
         })
         .await
@@ -621,29 +712,37 @@ async fn terminal_features_reject_new_audit_and_remediation_workers() {
         }
 
         let new_audit = store
-            .create_worker_run(CreateWorkerRun {
+            .create_work_item(CreateWorkItem {
                 parent_instance_id: connected.instance.instance_id,
-                role: WorkerRole::Auditor,
-                task_summary: "Audit terminal feature".to_owned(),
-                context_refs: json!([]),
-                audit_work_items: vec![AuditWorkItemInput {
-                    work_item_id: item.work_item_id,
-                }],
+                feature_id: feature.feature_id,
+                parent_work_item_id: None,
+                owner_repository_id: connected.repository.repository_id,
+                title: "Audit terminal feature".to_owned(),
+                summary: "Must be rejected".to_owned(),
+                kind: WorkItemKind::Audit,
+                audit_scope_work_item_ids: vec![item.work_item_id],
                 addresses_audit_run_id: None,
-                work_item_id: None,
+                dependency_ids: Vec::new(),
+                priority: 0,
+                max_audit_iterations: 1,
             })
             .await;
         assert!(matches!(new_audit, Err(StoreError::Conflict(_))));
 
         let remediation = store
-            .create_worker_run(CreateWorkerRun {
+            .create_work_item(CreateWorkItem {
                 parent_instance_id: connected.instance.instance_id,
-                role: WorkerRole::Executor,
-                task_summary: "Remediate terminal feature".to_owned(),
-                context_refs: json!([]),
-                audit_work_items: Vec::new(),
+                feature_id: feature.feature_id,
+                parent_work_item_id: None,
+                owner_repository_id: connected.repository.repository_id,
+                title: "Remediate terminal feature".to_owned(),
+                summary: "Must be rejected".to_owned(),
+                kind: WorkItemKind::Remediation,
+                audit_scope_work_item_ids: Vec::new(),
                 addresses_audit_run_id: Some(audit.worker_run_id),
-                work_item_id: None,
+                dependency_ids: Vec::new(),
+                priority: 0,
+                max_audit_iterations: 1,
             })
             .await;
         assert!(matches!(remediation, Err(StoreError::Conflict(_))));
@@ -727,7 +826,6 @@ async fn worker_run_completes_full_lifecycle_in_parent_repository() {
             role: WorkerRole::Executor,
             task_summary: "Implement a fake endpoint".to_owned(),
             context_refs: json!([{ "kind": "message", "id": "message-1" }]),
-            audit_work_items: Vec::new(),
             addresses_audit_run_id: None,
             work_item_id: None,
         })
@@ -796,7 +894,6 @@ async fn completed_worker_run_rejects_reactivation() {
             role: WorkerRole::Butler,
             task_summary: "Inspect a fake contract".to_owned(),
             context_refs: json!([]),
-            audit_work_items: Vec::new(),
             addresses_audit_run_id: None,
             work_item_id: None,
         })
@@ -834,7 +931,6 @@ async fn concurrent_finish_transitions_cannot_overwrite_each_other() {
             role: WorkerRole::Executor,
             task_summary: "Race two terminal transitions".to_owned(),
             context_refs: json!([]),
-            audit_work_items: Vec::new(),
             addresses_audit_run_id: None,
             work_item_id: None,
         })
@@ -877,7 +973,6 @@ async fn expired_worker_run_cannot_complete_or_fail() {
             role: WorkerRole::Butler,
             task_summary: "Expire before finishing".to_owned(),
             context_refs: json!([]),
-            audit_work_items: Vec::new(),
             addresses_audit_run_id: None,
             work_item_id: None,
         })
@@ -1134,7 +1229,6 @@ async fn active_worker_can_publish_without_creating_repository() {
             role: WorkerRole::Executor,
             task_summary: "Publish fake report".to_owned(),
             context_refs: json!([]),
-            audit_work_items: Vec::new(),
             addresses_audit_run_id: None,
             work_item_id: None,
         })
@@ -1297,7 +1391,6 @@ async fn expired_worker_cannot_renew_or_publish() {
             role: WorkerRole::Executor,
             task_summary: "Expire this worker".to_owned(),
             context_refs: json!([]),
-            audit_work_items: Vec::new(),
             addresses_audit_run_id: None,
             work_item_id: None,
         })
@@ -1466,6 +1559,9 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
             summary: "First".to_owned(),
             dependency_ids: Vec::new(),
             priority: 0,
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
             max_audit_iterations: 2,
         })
         .await
@@ -1481,6 +1577,9 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
             summary: "Second".to_owned(),
             dependency_ids: Vec::new(),
             priority: 0,
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
             max_audit_iterations: 2,
         })
         .await
@@ -1492,29 +1591,77 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
         .execute(&store.pool)
         .await
         .unwrap();
-    let audit_items = || {
-        vec![
-            AuditWorkItemInput {
-                work_item_id: first_item,
-            },
-            AuditWorkItemInput {
-                work_item_id: second_item,
-            },
-        ]
-    };
-
-    let first_audit = store
-        .create_worker_run(CreateWorkerRun {
+    let peer = store
+        .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
+        .await
+        .unwrap();
+    let peer_item = store
+        .create_work_item(CreateWorkItem {
             parent_instance_id: connected.instance.instance_id,
-            role: WorkerRole::Auditor,
-            task_summary: "Audit two completed work items".to_owned(),
-            context_refs: json!([]),
-            audit_work_items: audit_items(),
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: peer.repository.repository_id,
+            title: "Peer item".to_owned(),
+            summary: "Must be reviewed in the peer checkout".to_owned(),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
             addresses_audit_run_id: None,
-            work_item_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 2,
         })
         .await
         .unwrap();
+    sqlx::query("UPDATE work_items SET status = 'completed' WHERE work_item_id = ?")
+        .bind(peer_item.work_item_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .create_work_item(CreateWorkItem {
+                parent_instance_id: connected.instance.instance_id,
+                feature_id: feature.feature_id,
+                parent_work_item_id: None,
+                owner_repository_id: connected.repository.repository_id,
+                title: "Mixed-repository audit".to_owned(),
+                summary: "Must be split by owner".to_owned(),
+                kind: WorkItemKind::Audit,
+                audit_scope_work_item_ids: vec![first_item, peer_item.work_item_id],
+                addresses_audit_run_id: None,
+                dependency_ids: Vec::new(),
+                priority: 0,
+                max_audit_iterations: 1,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let first_audit_item = create_claimed_audit_item(
+        &store,
+        &connected,
+        feature.feature_id,
+        vec![first_item, second_item],
+        "two completed work items",
+    )
+    .await;
+    assert_eq!(first_audit_item.audit_scope_work_item_ids.len(), 2);
+    assert!(
+        first_audit_item
+            .audit_scope_work_item_ids
+            .contains(&first_item)
+    );
+    assert!(
+        first_audit_item
+            .audit_scope_work_item_ids
+            .contains(&second_item)
+    );
+    let first_audit = create_auditor_run(
+        &store,
+        &connected,
+        &first_audit_item,
+        "Audit two completed work items",
+    )
+    .await;
     assert_eq!(first_audit.audit_scope.len(), 2);
     assert!(
         first_audit
@@ -1522,20 +1669,23 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
             .iter()
             .all(|item| item.iteration == 1 && item.max_iterations == 2)
     );
-    assert!(matches!(
-        store
-            .create_worker_run(CreateWorkerRun {
-                parent_instance_id: connected.instance.instance_id,
-                role: WorkerRole::Auditor,
-                task_summary: "Cannot overlap audit iterations".to_owned(),
-                context_refs: json!([]),
-                audit_work_items: audit_items(),
-                addresses_audit_run_id: None,
-                work_item_id: None,
-            })
-            .await,
-        Err(StoreError::Conflict(_))
-    ));
+    let overlapping = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: "Overlapping audit".to_owned(),
+            summary: "Must wait for the first audit".to_owned(),
+            kind: WorkItemKind::Audit,
+            audit_scope_work_item_ids: vec![first_item, second_item],
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await;
+    assert!(matches!(overlapping, Err(StoreError::Conflict(_))));
     store
         .activate_worker_run(first_audit.worker_run_id)
         .await
@@ -1602,16 +1752,41 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
         .complete_worker_run(first_audit.worker_run_id, "Found one issue")
         .await
         .unwrap();
+    complete_audit_work_item(&store, &connected, first_audit_item.work_item_id).await;
 
+    let remediation_item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: "Address audit findings".to_owned(),
+            summary: "Address the complete audit report".to_owned(),
+            kind: WorkItemKind::Remediation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: Some(first_audit.worker_run_id),
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    let remediation_item = store
+        .claim_work_item(
+            connected.instance.instance_id,
+            remediation_item.work_item_id,
+            remediation_item.revision,
+        )
+        .await
+        .unwrap();
     let remediation = store
         .create_worker_run(CreateWorkerRun {
             parent_instance_id: connected.instance.instance_id,
             role: WorkerRole::Executor,
             task_summary: "Address the complete audit report".to_owned(),
             context_refs: json!([]),
-            audit_work_items: Vec::new(),
             addresses_audit_run_id: Some(first_audit.worker_run_id),
-            work_item_id: None,
+            work_item_id: Some(remediation_item.work_item_id),
         })
         .await
         .unwrap();
@@ -1621,14 +1796,19 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
     );
     assert!(matches!(
         store
-            .create_worker_run(CreateWorkerRun {
+            .create_work_item(CreateWorkItem {
                 parent_instance_id: connected.instance.instance_id,
-                role: WorkerRole::Executor,
-                task_summary: "Second remediation must be rejected".to_owned(),
-                context_refs: json!([]),
-                audit_work_items: Vec::new(),
+                feature_id: feature.feature_id,
+                parent_work_item_id: None,
+                owner_repository_id: connected.repository.repository_id,
+                title: "Duplicate remediation".to_owned(),
+                summary: "Must be rejected".to_owned(),
+                kind: WorkItemKind::Remediation,
+                audit_scope_work_item_ids: Vec::new(),
                 addresses_audit_run_id: Some(first_audit.worker_run_id),
-                work_item_id: None,
+                dependency_ids: Vec::new(),
+                priority: 0,
+                max_audit_iterations: 1,
             })
             .await,
         Err(StoreError::Conflict(_))
@@ -1636,14 +1816,19 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
 
     assert!(matches!(
         store
-            .create_worker_run(CreateWorkerRun {
+            .create_work_item(CreateWorkItem {
                 parent_instance_id: connected.instance.instance_id,
-                role: WorkerRole::Auditor,
-                task_summary: "Cannot audit before remediation finishes".to_owned(),
-                context_refs: json!([]),
-                audit_work_items: audit_items(),
+                feature_id: feature.feature_id,
+                parent_work_item_id: None,
+                owner_repository_id: connected.repository.repository_id,
+                title: "Premature re-audit".to_owned(),
+                summary: "Cannot audit before remediation finishes".to_owned(),
+                kind: WorkItemKind::Audit,
+                audit_scope_work_item_ids: vec![first_item, second_item],
                 addresses_audit_run_id: None,
-                work_item_id: None,
+                dependency_ids: Vec::new(),
+                priority: 0,
+                max_audit_iterations: 1,
             })
             .await,
         Err(StoreError::Conflict(_))
@@ -1652,23 +1837,62 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
         .activate_worker_run(remediation.worker_run_id)
         .await
         .unwrap();
+    let remediation_report = store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Worker(remediation.worker_run_id),
+            kind: MessageKind::Report,
+            target: MessageTarget::Broadcast,
+            summary: "Remediation report".to_owned(),
+            body: Some("Addressed audit findings".to_owned()),
+            artifact_kind: ArtifactKind::ImplementationReport,
+            artifact_title: None,
+            content_type: "text/markdown".to_owned(),
+            feature_id: Some(feature.feature_id),
+            work_item_id: Some(remediation_item.work_item_id),
+            request_id: None,
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
     store
         .complete_worker_run(remediation.worker_run_id, "Remediation complete")
         .await
         .unwrap();
-
-    let second_audit = store
-        .create_worker_run(CreateWorkerRun {
+    let current_remediation = store
+        .get_work_item(remediation_item.work_item_id)
+        .await
+        .unwrap();
+    store
+        .update_work_item(UpdateWorkItem {
             parent_instance_id: connected.instance.instance_id,
-            role: WorkerRole::Auditor,
-            task_summary: "Audit remediation".to_owned(),
-            context_refs: json!([]),
-            audit_work_items: audit_items(),
-            addresses_audit_run_id: None,
-            work_item_id: None,
+            work_item_id: remediation_item.work_item_id,
+            expected_revision: current_remediation.revision,
+            title: None,
+            summary: None,
+            owner_repository_id: None,
+            parent_work_item_id: None,
+            dependency_ids: None,
+            priority: None,
+            status: Some(WorkItemStatus::Completed),
+            implementation_artifact_id: Some(remediation_report.artifact_id),
         })
         .await
         .unwrap();
+
+    let second_audit_item = create_claimed_audit_item(
+        &store,
+        &connected,
+        feature.feature_id,
+        vec![first_item, second_item],
+        "remediation",
+    )
+    .await;
+    let second_audit =
+        create_auditor_run(&store, &connected, &second_audit_item, "Audit remediation").await;
     assert!(
         second_audit
             .audit_scope
@@ -1677,14 +1901,19 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
     );
     assert!(matches!(
         store
-            .create_worker_run(CreateWorkerRun {
+            .create_work_item(CreateWorkItem {
                 parent_instance_id: connected.instance.instance_id,
-                role: WorkerRole::Auditor,
-                task_summary: "Depth is exhausted".to_owned(),
-                context_refs: json!([]),
-                audit_work_items: audit_items(),
+                feature_id: feature.feature_id,
+                parent_work_item_id: None,
+                owner_repository_id: connected.repository.repository_id,
+                title: "Third audit".to_owned(),
+                summary: "Depth is exhausted".to_owned(),
+                kind: WorkItemKind::Audit,
+                audit_scope_work_item_ids: vec![first_item, second_item],
                 addresses_audit_run_id: None,
-                work_item_id: None,
+                dependency_ids: Vec::new(),
+                priority: 0,
+                max_audit_iterations: 1,
             })
             .await,
         Err(StoreError::Conflict(_))
@@ -1723,6 +1952,9 @@ async fn remediation_cannot_start_after_the_next_audit_iteration() {
             summary: "Auditable".to_owned(),
             dependency_ids: Vec::new(),
             priority: 0,
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
             max_audit_iterations: 2,
         })
         .await
@@ -1732,18 +1964,21 @@ async fn remediation_cannot_start_after_the_next_audit_iteration() {
         .execute(&store.pool)
         .await
         .unwrap();
-    let audit_command = || CreateWorkerRun {
-        parent_instance_id: connected.instance.instance_id,
-        role: WorkerRole::Auditor,
-        task_summary: "Audit completed item".to_owned(),
-        context_refs: json!([]),
-        audit_work_items: vec![AuditWorkItemInput {
-            work_item_id: item.work_item_id,
-        }],
-        addresses_audit_run_id: None,
-        work_item_id: None,
-    };
-    let first = store.create_worker_run(audit_command()).await.unwrap();
+    let first_audit_item = create_claimed_audit_item(
+        &store,
+        &connected,
+        feature.feature_id,
+        vec![item.work_item_id],
+        "completed item",
+    )
+    .await;
+    let first = create_auditor_run(
+        &store,
+        &connected,
+        &first_audit_item,
+        "Audit completed item",
+    )
+    .await;
     store
         .activate_worker_run(first.worker_run_id)
         .await
@@ -1771,18 +2006,40 @@ async fn remediation_cannot_start_after_the_next_audit_iteration() {
         .complete_worker_run(first.worker_run_id, "Audited")
         .await
         .unwrap();
-    store.create_worker_run(audit_command()).await.unwrap();
+    complete_audit_work_item(&store, &connected, first_audit_item.work_item_id).await;
+    store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: "Second audit".to_owned(),
+            summary: "Later iteration".to_owned(),
+            kind: WorkItemKind::Audit,
+            audit_scope_work_item_ids: vec![item.work_item_id],
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
 
     assert!(matches!(
         store
-            .create_worker_run(CreateWorkerRun {
+            .create_work_item(CreateWorkItem {
                 parent_instance_id: connected.instance.instance_id,
-                role: WorkerRole::Executor,
-                task_summary: "Late remediation".to_owned(),
-                context_refs: json!([]),
-                audit_work_items: Vec::new(),
+                feature_id: feature.feature_id,
+                parent_work_item_id: None,
+                owner_repository_id: connected.repository.repository_id,
+                title: "Late remediation".to_owned(),
+                summary: "Must be rejected".to_owned(),
+                kind: WorkItemKind::Remediation,
+                audit_scope_work_item_ids: Vec::new(),
                 addresses_audit_run_id: Some(first.worker_run_id),
-                work_item_id: None,
+                dependency_ids: Vec::new(),
+                priority: 0,
+                max_audit_iterations: 1,
             })
             .await,
         Err(StoreError::Conflict(_))
@@ -1821,6 +2078,9 @@ async fn auditor_cannot_scope_work_items_from_another_project() {
             summary: "Must not be audited by the first project".to_owned(),
             dependency_ids: Vec::new(),
             priority: 0,
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
             max_audit_iterations: 1,
         })
         .await
@@ -1833,16 +2093,19 @@ async fn auditor_cannot_scope_work_items_from_another_project() {
 
     assert!(matches!(
         store
-            .create_worker_run(CreateWorkerRun {
+            .create_work_item(CreateWorkItem {
                 parent_instance_id: first.instance.instance_id,
-                role: WorkerRole::Auditor,
-                task_summary: "Cross-project audit".to_owned(),
-                context_refs: json!([]),
-                audit_work_items: vec![AuditWorkItemInput {
-                    work_item_id: foreign_item.work_item_id,
-                }],
+                feature_id: foreign_feature.feature_id,
+                parent_work_item_id: None,
+                owner_repository_id: first.repository.repository_id,
+                title: "Cross-project audit".to_owned(),
+                summary: "Must be rejected".to_owned(),
+                kind: WorkItemKind::Audit,
+                audit_scope_work_item_ids: vec![foreign_item.work_item_id],
                 addresses_audit_run_id: None,
-                work_item_id: None,
+                dependency_ids: Vec::new(),
+                priority: 0,
+                max_audit_iterations: 1,
             })
             .await,
         Err(StoreError::NotFound(_)) | Err(StoreError::Conflict(_))
@@ -1861,26 +2124,60 @@ async fn auditor_cannot_scope_work_items_from_another_project() {
 }
 
 #[tokio::test]
-async fn audit_scope_is_only_valid_for_auditor_role() {
+async fn worker_role_must_match_the_claimed_work_item_kind() {
     let (store, path) = test_store(90).await;
     let connected = store
         .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
         .await
         .unwrap();
-    let item = AuditWorkItemInput {
-        work_item_id: WorkItemId::new(),
-    };
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: connected.instance.instance_id,
+            title: "Role boundary".to_owned(),
+            summary: "Audit cards require auditors".to_owned(),
+        })
+        .await
+        .unwrap();
+    let implementation = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: "Completed implementation".to_owned(),
+            summary: "Audit target".to_owned(),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE work_items SET status = 'completed' WHERE work_item_id = ?")
+        .bind(implementation.work_item_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let audit_item = create_claimed_audit_item(
+        &store,
+        &connected,
+        feature.feature_id,
+        vec![implementation.work_item_id],
+        "role boundary",
+    )
+    .await;
 
     assert!(matches!(
         store
             .create_worker_run(CreateWorkerRun {
                 parent_instance_id: connected.instance.instance_id,
                 role: WorkerRole::Executor,
-                task_summary: "Executor cannot declare audit scope".to_owned(),
+                task_summary: "Executor cannot claim audit work".to_owned(),
                 context_refs: json!([]),
-                audit_work_items: vec![item],
                 addresses_audit_run_id: None,
-                work_item_id: None,
+                work_item_id: Some(audit_item.work_item_id),
             })
             .await,
         Err(StoreError::Conflict(_))
@@ -1892,7 +2189,6 @@ async fn audit_scope_is_only_valid_for_auditor_role() {
                 role: WorkerRole::Auditor,
                 task_summary: "Auditor requires at least one item".to_owned(),
                 context_refs: json!([]),
-                audit_work_items: Vec::new(),
                 addresses_audit_run_id: None,
                 work_item_id: None,
             })
@@ -2667,6 +2963,9 @@ async fn creation_idempotency_replays_result_and_rejects_changed_payload() {
         summary: "Created once".to_owned(),
         dependency_ids: Vec::new(),
         priority: 0,
+        kind: WorkItemKind::Implementation,
+        audit_scope_work_item_ids: Vec::new(),
+        addresses_audit_run_id: None,
         max_audit_iterations: 1,
     };
     let first_work_item = store
@@ -2687,7 +2986,6 @@ async fn creation_idempotency_replays_result_and_rejects_changed_payload() {
         role: WorkerRole::Executor,
         task_summary: "Idempotent worker".to_owned(),
         context_refs: json!([]),
-        audit_work_items: Vec::new(),
         addresses_audit_run_id: None,
         work_item_id: None,
     };
@@ -2867,7 +3165,6 @@ async fn three_worker_runs_claim_and_answer_independent_requests() {
                 role: WorkerRole::Butler,
                 task_summary: format!("Answer question {index}"),
                 context_refs: json!([]),
-                audit_work_items: Vec::new(),
                 addresses_audit_run_id: None,
                 work_item_id: None,
             })
@@ -2976,6 +3273,9 @@ async fn work_graph_unlocks_dependency_and_links_worker_report() {
             summary: "Backend contract".to_owned(),
             dependency_ids: Vec::new(),
             priority: 10,
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
             max_audit_iterations: 2,
         })
         .await
@@ -2990,6 +3290,9 @@ async fn work_graph_unlocks_dependency_and_links_worker_report() {
             summary: "Consume backend contract".to_owned(),
             dependency_ids: vec![api.work_item_id],
             priority: 5,
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
             max_audit_iterations: 1,
         })
         .await
@@ -3012,7 +3315,6 @@ async fn work_graph_unlocks_dependency_and_links_worker_report() {
             role: WorkerRole::Executor,
             task_summary: "Implement API".to_owned(),
             context_refs: json!([]),
-            audit_work_items: Vec::new(),
             addresses_audit_run_id: None,
             work_item_id: Some(api.work_item_id),
         })
@@ -3165,6 +3467,9 @@ async fn work_item_claim_and_dependency_cycle_are_conflict_safe() {
             summary: "Root item".to_owned(),
             dependency_ids: Vec::new(),
             priority: 0,
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
             max_audit_iterations: 1,
         })
         .await
@@ -3179,6 +3484,9 @@ async fn work_item_claim_and_dependency_cycle_are_conflict_safe() {
             summary: "Depends on root".to_owned(),
             dependency_ids: vec![root.work_item_id],
             priority: 0,
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
             max_audit_iterations: 1,
         })
         .await
@@ -3316,6 +3624,9 @@ async fn work_item_pages_are_bounded_and_reads_keep_revision_with_dependencies()
                     summary: "Paged item".to_owned(),
                     dependency_ids: Vec::new(),
                     priority,
+                    kind: WorkItemKind::Implementation,
+                    audit_scope_work_item_ids: Vec::new(),
+                    addresses_audit_run_id: None,
                     max_audit_iterations: 1,
                 })
                 .await

@@ -291,6 +291,9 @@ impl SqliteStore {
             "owner_repository_id": command.owner_repository_id,
             "title": command.title,
             "summary": command.summary,
+            "kind": command.kind,
+            "audit_scope_work_item_ids": command.audit_scope_work_item_ids,
+            "addresses_audit_run_id": command.addresses_audit_run_id,
             "dependency_ids": command.dependency_ids,
             "priority": command.priority,
             "max_audit_iterations": command.max_audit_iterations,
@@ -324,6 +327,7 @@ impl SqliteStore {
             actor.project_id,
         )
         .await?;
+        validate_work_item_kind_command(&command)?;
         validate_work_item_relations(
             &mut transaction,
             command.feature_id,
@@ -332,6 +336,30 @@ impl SqliteStore {
             &command.dependency_ids,
         )
         .await?;
+        let audit_scope = match command.kind {
+            WorkItemKind::Implementation => Vec::new(),
+            WorkItemKind::Audit => {
+                prepare_audit_work_item_scope(
+                    &mut transaction,
+                    command.feature_id,
+                    command.owner_repository_id,
+                    &command.audit_scope_work_item_ids,
+                )
+                .await?
+            }
+            WorkItemKind::Remediation => {
+                validate_remediation_audit(
+                    &mut transaction,
+                    command.owner_repository_id,
+                    command.feature_id,
+                    command
+                        .addresses_audit_run_id
+                        .expect("validated remediation link"),
+                )
+                .await?;
+                Vec::new()
+            }
+        };
         let status = if dependencies_completed(&mut transaction, &command.dependency_ids).await? {
             WorkItemStatus::Ready
         } else {
@@ -340,10 +368,11 @@ impl SqliteStore {
         sqlx::query(
             "INSERT INTO work_items(
                  work_item_id, feature_id, parent_work_item_id, owner_repository_id,
-                 assignee_instance_id, title, summary, priority, status, revision,
+                 assignee_instance_id, title, summary, kind, addresses_audit_run_id,
+                 priority, status, revision,
                  max_audit_iterations, claim_expires_at, implementation_artifact_id,
                  latest_audit_artifact_id, created_at, updated_at, finished_at
-             ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, 1, ?, NULL, NULL, NULL, ?, ?, NULL)",
+             ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL, NULL, ?, ?, NULL)",
         )
         .bind(work_item_id.to_string())
         .bind(command.feature_id.to_string())
@@ -351,6 +380,8 @@ impl SqliteStore {
         .bind(command.owner_repository_id.to_string())
         .bind(command.title)
         .bind(command.summary)
+        .bind(command.kind.as_str())
+        .bind(command.addresses_audit_run_id.map(|id| id.to_string()))
         .bind(i64::from(command.priority))
         .bind(status.as_str())
         .bind(i64::from(command.max_audit_iterations))
@@ -359,6 +390,19 @@ impl SqliteStore {
         .execute(&mut *transaction)
         .await?;
         replace_dependencies(&mut transaction, work_item_id, &command.dependency_ids).await?;
+        for scope_item in audit_scope {
+            sqlx::query(
+                "INSERT INTO work_item_audit_scope(
+                     audit_work_item_id, scoped_work_item_id, audit_iteration, max_iterations
+                 ) VALUES (?, ?, ?, ?)",
+            )
+            .bind(work_item_id.to_string())
+            .bind(scope_item.work_item_id.to_string())
+            .bind(i64::from(scope_item.iteration))
+            .bind(i64::from(scope_item.max_iterations))
+            .execute(&mut *transaction)
+            .await?;
+        }
         let recipients = append_project_event(
             &mut transaction,
             actor.project_id,
@@ -449,6 +493,7 @@ impl SqliteStore {
         let has_more = rows.len() > usize::from(limit);
         let page_rows = rows.iter().take(usize::from(limit)).collect::<Vec<_>>();
         let mut dependencies = HashMap::<String, Vec<WorkItemId>>::new();
+        let mut audit_scopes = HashMap::<String, Vec<WorkItemId>>::new();
         if !page_rows.is_empty() {
             let mut dependency_query = QueryBuilder::<Sqlite>::new(
                 "SELECT work_item_id, dependency_work_item_id FROM work_item_dependencies WHERE work_item_id IN (",
@@ -470,12 +515,32 @@ impl SqliteStore {
                         dependency_row.try_get("dependency_work_item_id")?,
                     )?);
             }
+            let mut scope_query = QueryBuilder::<Sqlite>::new(
+                "SELECT audit_work_item_id, scoped_work_item_id FROM work_item_audit_scope WHERE audit_work_item_id IN (",
+            );
+            let mut separated = scope_query.separated(", ");
+            for row in &page_rows {
+                separated.push_bind(row.try_get::<String, _>("work_item_id")?);
+            }
+            separated.push_unseparated(") ORDER BY audit_work_item_id, scoped_work_item_id");
+            for scope_row in scope_query.build().fetch_all(&mut *transaction).await? {
+                audit_scopes
+                    .entry(scope_row.try_get("audit_work_item_id")?)
+                    .or_default()
+                    .push(WorkItemId::parse(
+                        scope_row.try_get("scoped_work_item_id")?,
+                    )?);
+            }
         }
         let items = page_rows
             .into_iter()
             .map(|row| {
                 let work_item_id: String = row.try_get("work_item_id")?;
-                work_item_from_row(row, dependencies.remove(&work_item_id).unwrap_or_default())
+                work_item_from_row(
+                    row,
+                    dependencies.remove(&work_item_id).unwrap_or_default(),
+                    audit_scopes.remove(&work_item_id).unwrap_or_default(),
+                )
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
         transaction.commit().await?;
@@ -564,20 +629,40 @@ impl SqliteStore {
             .implementation_artifact_id
             .or(current.implementation_artifact_id);
         if next_status == WorkItemStatus::Completed {
-            let artifact_id = implementation_artifact_id.ok_or_else(|| {
-                StoreError::Conflict(
-                    "completing a work item requires implementation_artifact_id".to_owned(),
-                )
-            })?;
-            validate_implementation_artifact(
-                &mut transaction,
-                artifact_id,
-                current.work_item_id,
-                actor.project_id,
-                current.owner_repository_id,
-                current.assignee_instance_id,
-            )
-            .await?;
+            match current.kind {
+                WorkItemKind::Implementation | WorkItemKind::Remediation => {
+                    let artifact_id = implementation_artifact_id.ok_or_else(|| {
+                        StoreError::Conflict(
+                            "completing implementation or remediation work requires implementation_artifact_id"
+                                .to_owned(),
+                        )
+                    })?;
+                    validate_implementation_artifact(
+                        &mut transaction,
+                        artifact_id,
+                        current.work_item_id,
+                        actor.project_id,
+                        current.owner_repository_id,
+                        current.assignee_instance_id,
+                    )
+                    .await?;
+                }
+                WorkItemKind::Audit => {
+                    if command.implementation_artifact_id.is_some() {
+                        return Err(StoreError::Conflict(
+                            "audit work items are completed from their linked audit_report"
+                                .to_owned(),
+                        ));
+                    }
+                    validate_audit_work_item_completion(
+                        &mut transaction,
+                        current.work_item_id,
+                        current.owner_repository_id,
+                        current.assignee_instance_id,
+                    )
+                    .await?;
+                }
+            }
         } else if command.implementation_artifact_id.is_some() {
             return Err(StoreError::Conflict(
                 "implementation_artifact_id is only accepted when completing a work item"
@@ -821,14 +906,27 @@ async fn get_work_item_tx(
         .iter()
         .map(|row| Ok(WorkItemId::parse(row.try_get("dependency_work_item_id")?)?))
         .collect::<Result<Vec<_>, StoreError>>()?;
-    work_item_from_row(&row, dependency_ids)
+    let audit_scope_rows = sqlx::query(
+        "SELECT scoped_work_item_id FROM work_item_audit_scope
+         WHERE audit_work_item_id = ? ORDER BY scoped_work_item_id",
+    )
+    .bind(work_item_id.to_string())
+    .fetch_all(&mut **transaction)
+    .await?;
+    let audit_scope_work_item_ids = audit_scope_rows
+        .iter()
+        .map(|row| Ok(WorkItemId::parse(row.try_get("scoped_work_item_id")?)?))
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    work_item_from_row(&row, dependency_ids, audit_scope_work_item_ids)
 }
 
 fn work_item_from_row(
     row: &SqliteRow,
     dependency_ids: Vec<WorkItemId>,
+    audit_scope_work_item_ids: Vec<WorkItemId>,
 ) -> Result<WorkItem, StoreError> {
     let status: String = row.try_get("status")?;
+    let kind: String = row.try_get("kind")?;
     Ok(WorkItem {
         work_item_id: WorkItemId::parse(row.try_get("work_item_id")?)?,
         feature_id: FeatureId::parse(row.try_get("feature_id")?)?,
@@ -843,6 +941,12 @@ fn work_item_from_row(
         )?,
         title: row.try_get("title")?,
         summary: row.try_get("summary")?,
+        kind: kind.parse().map_err(StoreError::Conflict)?,
+        audit_scope_work_item_ids,
+        addresses_audit_run_id: parse_optional_id(
+            row.try_get("addresses_audit_run_id")?,
+            WorkerRunId::parse,
+        )?,
         dependency_ids,
         priority: row.try_get::<i64, _>("priority")? as i16,
         status: status.parse().map_err(StoreError::Conflict)?,
@@ -1016,6 +1120,152 @@ fn validate_audit_depth(value: u8) -> Result<(), StoreError> {
         ));
     }
     Ok(())
+}
+
+fn validate_work_item_kind_command(command: &CreateWorkItem) -> Result<(), StoreError> {
+    match command.kind {
+        WorkItemKind::Implementation => {
+            if !command.audit_scope_work_item_ids.is_empty()
+                || command.addresses_audit_run_id.is_some()
+            {
+                return Err(StoreError::Conflict(
+                    "implementation work items cannot declare audit scope or remediation lineage"
+                        .to_owned(),
+                ));
+            }
+        }
+        WorkItemKind::Audit => {
+            if command.audit_scope_work_item_ids.is_empty() {
+                return Err(StoreError::Conflict(
+                    "audit work items require at least one audit_scope_work_item_id".to_owned(),
+                ));
+            }
+            if command.audit_scope_work_item_ids.len() > MAX_AUDIT_WORK_ITEMS {
+                return Err(StoreError::Conflict(format!(
+                    "audit scope must contain at most {MAX_AUDIT_WORK_ITEMS} work items"
+                )));
+            }
+            if command.addresses_audit_run_id.is_some() {
+                return Err(StoreError::Conflict(
+                    "audit work items cannot address another audit run".to_owned(),
+                ));
+            }
+        }
+        WorkItemKind::Remediation => {
+            if !command.audit_scope_work_item_ids.is_empty() {
+                return Err(StoreError::Conflict(
+                    "remediation work items derive scope from their audit run".to_owned(),
+                ));
+            }
+            if command.addresses_audit_run_id.is_none() {
+                return Err(StoreError::Conflict(
+                    "remediation work items require addresses_audit_run_id".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_audit_work_item_scope(
+    transaction: &mut Transaction<'_, Sqlite>,
+    feature_id: FeatureId,
+    owner_repository_id: RepositoryId,
+    work_item_ids: &[WorkItemId],
+) -> Result<Vec<AuditScopeItem>, StoreError> {
+    let mut unique = BTreeSet::new();
+    let mut scope = Vec::with_capacity(work_item_ids.len());
+    for work_item_id in work_item_ids {
+        if !unique.insert(work_item_id.to_string()) {
+            return Err(StoreError::Conflict(format!(
+                "work item {work_item_id} appears more than once in audit scope"
+            )));
+        }
+        let item = sqlx::query(
+            "SELECT kind, status, feature_id, owner_repository_id, max_audit_iterations
+             FROM work_items WHERE work_item_id = ?",
+        )
+        .bind(work_item_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("work item {work_item_id}")))?;
+        let item_feature_id = FeatureId::parse(item.try_get("feature_id")?)?;
+        let item_owner_id = RepositoryId::parse(item.try_get("owner_repository_id")?)?;
+        let kind: String = item.try_get("kind")?;
+        let status: String = item.try_get("status")?;
+        if item_feature_id != feature_id
+            || item_owner_id != owner_repository_id
+            || kind != WorkItemKind::Implementation.as_str()
+            || status != WorkItemStatus::Completed.as_str()
+        {
+            return Err(StoreError::Conflict(format!(
+                "audit scope item {work_item_id} must be a completed implementation item in the same feature and owner repository"
+            )));
+        }
+        let max_iterations = item.try_get::<i64, _>("max_audit_iterations")? as u8;
+        let previous = sqlx::query(
+            "SELECT scope.audit_iteration, scope.max_iterations,
+                    audit_item.status AS audit_item_status,
+                    audit_run.status AS audit_run_status,
+                    (SELECT COUNT(*) FROM artifacts
+                     WHERE producer_worker_run_id = audit_run.worker_run_id
+                       AND kind = 'audit_report') AS report_count,
+                    remediation.status AS remediation_status
+             FROM work_item_audit_scope scope
+             JOIN work_items audit_item
+               ON audit_item.work_item_id = scope.audit_work_item_id
+             LEFT JOIN worker_runs audit_run
+               ON audit_run.work_item_id = audit_item.work_item_id
+              AND audit_run.role = 'auditor'
+             LEFT JOIN work_items remediation
+               ON remediation.addresses_audit_run_id = audit_run.worker_run_id
+              AND remediation.kind = 'remediation'
+             WHERE scope.scoped_work_item_id = ?
+             ORDER BY scope.audit_iteration DESC
+             LIMIT 1",
+        )
+        .bind(work_item_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let previous_iteration = if let Some(previous) = previous {
+            let stored_max = previous.try_get::<i64, _>("max_iterations")?;
+            let audit_item_status: String = previous.try_get("audit_item_status")?;
+            let audit_run_status: Option<String> = previous.try_get("audit_run_status")?;
+            let report_count: i64 = previous.try_get("report_count")?;
+            let remediation_status: Option<String> = previous.try_get("remediation_status")?;
+            if stored_max != i64::from(max_iterations) {
+                return Err(StoreError::Conflict(format!(
+                    "work item {work_item_id} audit depth is already fixed at {stored_max}"
+                )));
+            }
+            if audit_item_status != WorkItemStatus::Completed.as_str()
+                || audit_run_status.as_deref() != Some(WorkerRunStatus::Completed.as_str())
+                || report_count != 1
+                || remediation_status
+                    .as_deref()
+                    .is_some_and(|value| value != WorkItemStatus::Completed.as_str())
+            {
+                return Err(StoreError::Conflict(format!(
+                    "work item {work_item_id} cannot start its next audit until the previous audit work item and any remediation work item are completed"
+                )));
+            }
+            previous.try_get::<i64, _>("audit_iteration")?
+        } else {
+            0
+        };
+        let iteration = previous_iteration + 1;
+        if iteration > i64::from(max_iterations) {
+            return Err(StoreError::Conflict(format!(
+                "work item {work_item_id} exhausted audit depth {max_iterations}"
+            )));
+        }
+        scope.push(AuditScopeItem {
+            work_item_id: *work_item_id,
+            iteration: iteration as u8,
+            max_iterations,
+        });
+    }
+    Ok(scope)
 }
 
 fn ensure_editable_shape(item: &WorkItem) -> Result<(), StoreError> {
@@ -1357,6 +1607,45 @@ async fn validate_implementation_artifact(
     Ok(())
 }
 
+async fn validate_audit_work_item_completion(
+    transaction: &mut Transaction<'_, Sqlite>,
+    work_item_id: WorkItemId,
+    owner_repository_id: RepositoryId,
+    assignee_instance_id: Option<InstanceId>,
+) -> Result<(), StoreError> {
+    let assignee_instance_id = assignee_instance_id.ok_or_else(|| {
+        StoreError::Conflict(
+            "completed audit work item must still be owned by its claimed orchestrator".to_owned(),
+        )
+    })?;
+    let valid: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM worker_runs worker
+             JOIN artifacts report
+               ON report.producer_worker_run_id = worker.worker_run_id
+              AND report.kind = 'audit_report'
+             WHERE worker.work_item_id = ?
+               AND worker.repository_id = ?
+               AND worker.parent_instance_id = ?
+               AND worker.role = 'auditor'
+               AND worker.status = 'completed'
+         )",
+    )
+    .bind(work_item_id.to_string())
+    .bind(owner_repository_id.to_string())
+    .bind(assignee_instance_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if valid == 0 {
+        return Err(StoreError::Conflict(
+            "completing an audit work item requires its completed repository-local auditor and audit_report"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 async fn unlock_dependents(
     transaction: &mut Transaction<'_, Sqlite>,
     completed_id: WorkItemId,
@@ -1455,17 +1744,50 @@ pub(super) async fn attach_worker_to_work_item(
     repository_id: RepositoryId,
     project_id: ProjectId,
     now: &str,
-) -> Result<Vec<RepositoryId>, StoreError> {
+) -> Result<(Vec<RepositoryId>, Vec<AuditScopeItem>), StoreError> {
     let Some(work_item_id) = command.work_item_id else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
-    if command.role != WorkerRole::Executor {
-        return Err(StoreError::Conflict(
-            "only executor runs can link a single work_item_id".to_owned(),
-        ));
-    }
     let item = get_work_item_tx(transaction, work_item_id).await?;
     ensure_work_item_project(transaction, &item, project_id).await?;
+    match (command.role, item.kind) {
+        (WorkerRole::Executor, WorkItemKind::Implementation) => {
+            if command.addresses_audit_run_id.is_some() {
+                return Err(StoreError::Conflict(
+                    "implementation executor cannot address an audit run".to_owned(),
+                ));
+            }
+        }
+        (WorkerRole::Executor, WorkItemKind::Remediation) => {
+            if command.addresses_audit_run_id != item.addresses_audit_run_id {
+                return Err(StoreError::Conflict(
+                    "remediation executor must use the audit run linked by its work item"
+                        .to_owned(),
+                ));
+            }
+        }
+        (WorkerRole::Auditor, WorkItemKind::Audit) => {
+            let run_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM worker_runs
+                 WHERE work_item_id = ? AND role = 'auditor'",
+            )
+            .bind(work_item_id.to_string())
+            .fetch_one(&mut **transaction)
+            .await?;
+            if run_count != 1 {
+                return Err(StoreError::Conflict(
+                    "an audit work item can link exactly one auditor run".to_owned(),
+                ));
+            }
+        }
+        _ => {
+            return Err(StoreError::Conflict(format!(
+                "{} workers cannot attach to {} work items",
+                command.role,
+                item.kind.as_str()
+            )));
+        }
+    }
     if item.owner_repository_id != repository_id
         || item.assignee_instance_id != Some(command.parent_instance_id)
         || !matches!(
@@ -1493,10 +1815,42 @@ pub(super) async fn attach_worker_to_work_item(
         .bind(item.revision as i64)
         .execute(&mut **transaction)
         .await?;
-        append_work_item_events(transaction, project_id, &[work_item_id], now).await
+        let recipients =
+            append_work_item_events(transaction, project_id, &[work_item_id], now).await?;
+        Ok((
+            recipients,
+            load_audit_scope(transaction, work_item_id).await?,
+        ))
     } else {
-        Ok(Vec::new())
+        Ok((
+            Vec::new(),
+            load_audit_scope(transaction, work_item_id).await?,
+        ))
     }
+}
+
+async fn load_audit_scope(
+    transaction: &mut Transaction<'_, Sqlite>,
+    work_item_id: WorkItemId,
+) -> Result<Vec<AuditScopeItem>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT scoped_work_item_id, audit_iteration, max_iterations
+         FROM work_item_audit_scope
+         WHERE audit_work_item_id = ?
+         ORDER BY scoped_work_item_id",
+    )
+    .bind(work_item_id.to_string())
+    .fetch_all(&mut **transaction)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(AuditScopeItem {
+                work_item_id: WorkItemId::parse(row.try_get("scoped_work_item_id")?)?,
+                iteration: row.try_get::<i64, _>("audit_iteration")? as u8,
+                max_iterations: row.try_get::<i64, _>("max_iterations")? as u8,
+            })
+        })
+        .collect()
 }
 
 pub(super) async fn link_audit_report(
@@ -1546,6 +1900,22 @@ pub(super) async fn link_audit_report(
         .await?;
         work_item_ids.push(work_item_id);
     }
+    let audit_work_item_id: String =
+        sqlx::query_scalar("SELECT work_item_id FROM worker_runs WHERE worker_run_id = ?")
+            .bind(worker_run_id.to_string())
+            .fetch_one(&mut **transaction)
+            .await?;
+    sqlx::query(
+        "UPDATE work_items
+         SET latest_audit_artifact_id = ?, revision = revision + 1, updated_at = ?
+         WHERE work_item_id = ? AND kind = 'audit'",
+    )
+    .bind(artifact.artifact_id.to_string())
+    .bind(now)
+    .bind(&audit_work_item_id)
+    .execute(&mut **transaction)
+    .await?;
+    work_item_ids.push(WorkItemId::parse(&audit_work_item_id)?);
     append_work_item_events(transaction, actor.project_id, &work_item_ids, now).await
 }
 

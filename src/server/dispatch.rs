@@ -35,7 +35,7 @@ pub(super) async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use bounded list_work_items pages, expected_revision for updates, and claim an owner-repository item before creating its executor worker run. The current linked executor must publish an implementation_report and complete before its orchestrator completes the item. Roles are executor, butler and auditor. Auditor scope contains completed work_item_ids and publishes exactly one audit_report; a later iteration waits for the previous audit and any created remediation executor to complete. Workers never register as repositories. Use ask_repository for durable questions and actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for finite repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. JSON-RPC batches are not supported.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use bounded list_work_items pages and expected_revision, and claim an owner-repository item before creating its matching worker run. Implementation and remediation cards use executors; audit cards use fresh auditors and carry their own repository-local scope. Linked workers publish the required report before their orchestrator completes the card. Workers never register as repositories. Use ask_repository for durable questions and actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for finite repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. JSON-RPC batches are not supported.",
             }))
         }
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
@@ -168,7 +168,6 @@ pub(super) async fn call_tool(
                         role,
                         task_summary,
                         context_refs,
-                        audit_work_items: optional_audit_work_items(&arguments)?,
                         addresses_audit_run_id: optional_string(
                             &arguments,
                             "addresses_audit_run_id",
@@ -298,6 +297,18 @@ pub(super) async fn call_tool(
                         owner_repository_id,
                         title: validated_summary(&arguments, "title", max_summary_bytes)?,
                         summary: validated_summary(&arguments, "summary", max_summary_bytes)?,
+                        kind: optional_string(&arguments, "kind")?
+                            .map(|value| value.parse::<WorkItemKind>().map_err(invalid_argument))
+                            .transpose()?
+                            .unwrap_or(WorkItemKind::Implementation),
+                        audit_scope_work_item_ids: optional_audit_scope_work_item_ids(&arguments)?
+                            .unwrap_or_default(),
+                        addresses_audit_run_id: optional_string(
+                            &arguments,
+                            "addresses_audit_run_id",
+                        )?
+                        .map(|value| WorkerRunId::parse(&value).map_err(invalid_uuid))
+                        .transpose()?,
                         dependency_ids: optional_work_item_ids(&arguments, "dependency_ids")?
                             .unwrap_or_default(),
                         priority: optional_i16(&arguments, "priority")?.unwrap_or(0),
@@ -307,7 +318,7 @@ pub(super) async fn call_tool(
                             1,
                             10,
                         )?
-                        .unwrap_or(1),
+                        .unwrap_or(2),
                     },
                     idempotency_key.as_deref(),
                 )
@@ -680,7 +691,7 @@ pub(super) async fn read_resource(
                 "max_wait_seconds": max_wait_seconds,
                 "collection_limits": {
                     "context_refs": MAX_CONTEXT_REFS,
-                    "audit_work_items": MAX_AUDIT_WORK_ITEMS,
+                    "audit_scope_work_items": MAX_AUDIT_WORK_ITEMS,
                     "work_item_dependencies": MAX_WORK_ITEM_DEPENDENCIES,
                     "message_recipients": MAX_MESSAGE_RECIPIENTS,
                     "event_page": 50,
@@ -706,7 +717,7 @@ pub(super) async fn read_resource(
                     "A worker never calls connect_orchestrator and never creates a repository identity."
                 ],
                 "work_flow": [
-                    "Create a project feature and repository-owned work items; dependencies remain planned until all prerequisites complete.",
+                    "Create a project feature and repository-owned implementation, audit and remediation work items; dependencies remain planned until all prerequisites complete.",
                     "Higher numeric priority values are listed and claimed before lower values when other eligibility rules are equal.",
                     "Claim a ready item with expected_revision, then create an executor worker run linked by work_item_id.",
                     "The latest executor linked to the item publishes an implementation_report and completes its worker run.",
@@ -716,10 +727,11 @@ pub(super) async fn read_resource(
                     "Peer repositories stop waiting on feature_completed or feature_cancelled for the current feature and call disconnect_orchestrator before exit. MCP session DELETE is transport cleanup, not the durable completion signal."
                 ],
                 "audit_flow": [
-                    "Create one auditor run for one or more work_item_ids; max_iterations defaults to one and is fixed per item.",
-                    "The auditor publishes one audit_report artifact covering its complete scope.",
-                    "If remediation is needed, create at most one executor run with addresses_audit_run_id; that executor addresses the whole report.",
-                    "A later audit waits for the previous auditor and any created remediation executor to complete, increments each item's iteration independently, and is rejected after depth is exhausted."
+                    "Create one kind=audit work item in the repository that owns every completed implementation in audit_scope_work_item_ids; split cross-repository batches.",
+                    "The owner repository claims the audit card and creates a fresh auditor linked by work_item_id. Its scope and iteration are derived from the card.",
+                    "The auditor publishes exactly one audit_report and completes; the owner orchestrator then completes the audit card without implementation_artifact_id.",
+                    "If remediation is needed, create one kind=remediation work item with addresses_audit_run_id, claim it in the same repository and create its executor with both matching links.",
+                    "A later audit card waits for the previous audit card and any remediation card to complete, increments each implementation item's iteration independently, and is rejected after max_audit_iterations is exhausted."
                 ],
                 "request_flow": [
                     "Create a durable directed question with ask_repository and include feature_id/work_item_id when it affects tracked work; a work-item link infers its feature. The target receives request_available.",

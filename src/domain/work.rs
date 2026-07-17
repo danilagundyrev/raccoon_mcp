@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ArtifactId, FeatureId, InstanceId, ProjectId, RepositoryId, WorkItemId};
+use super::{ArtifactId, FeatureId, InstanceId, ProjectId, RepositoryId, WorkItemId, WorkerRunId};
 
 #[derive(Clone, Debug)]
 pub struct CreateFeature {
@@ -118,6 +118,37 @@ impl FromStr for WorkItemStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkItemKind {
+    Implementation,
+    Audit,
+    Remediation,
+}
+
+impl WorkItemKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Implementation => "implementation",
+            Self::Audit => "audit",
+            Self::Remediation => "remediation",
+        }
+    }
+}
+
+impl FromStr for WorkItemKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "implementation" => Ok(Self::Implementation),
+            "audit" => Ok(Self::Audit),
+            "remediation" => Ok(Self::Remediation),
+            _ => Err(format!("unknown work-item kind '{value}'")),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CreateWorkItem {
     pub parent_instance_id: InstanceId,
@@ -126,6 +157,9 @@ pub struct CreateWorkItem {
     pub owner_repository_id: RepositoryId,
     pub title: String,
     pub summary: String,
+    pub kind: WorkItemKind,
+    pub audit_scope_work_item_ids: Vec<WorkItemId>,
+    pub addresses_audit_run_id: Option<WorkerRunId>,
     pub dependency_ids: Vec<WorkItemId>,
     pub priority: i16,
     pub max_audit_iterations: u8,
@@ -155,6 +189,9 @@ pub struct WorkItem {
     pub assignee_instance_id: Option<InstanceId>,
     pub title: String,
     pub summary: String,
+    pub kind: WorkItemKind,
+    pub audit_scope_work_item_ids: Vec<WorkItemId>,
+    pub addresses_audit_run_id: Option<WorkerRunId>,
     pub dependency_ids: Vec<WorkItemId>,
     pub priority: i16,
     pub status: WorkItemStatus,
@@ -183,6 +220,14 @@ mod tests {
     fn parses_work_item_statuses() {
         assert_eq!("in_progress".parse(), Ok(WorkItemStatus::InProgress));
         assert!("open".parse::<WorkItemStatus>().is_err());
+    }
+
+    #[test]
+    fn parses_work_item_kinds() {
+        assert_eq!("implementation".parse(), Ok(WorkItemKind::Implementation));
+        assert_eq!("audit".parse(), Ok(WorkItemKind::Audit));
+        assert_eq!("remediation".parse(), Ok(WorkItemKind::Remediation));
+        assert!("review".parse::<WorkItemKind>().is_err());
     }
 
     #[test]

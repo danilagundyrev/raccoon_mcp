@@ -87,14 +87,8 @@ pub struct CreateWorkerRun {
     pub role: WorkerRole,
     pub task_summary: String,
     pub context_refs: Value,
-    pub audit_work_items: Vec<AuditWorkItemInput>,
     pub addresses_audit_run_id: Option<WorkerRunId>,
     pub work_item_id: Option<WorkItemId>,
-}
-
-#[derive(Clone, Debug)]
-pub struct AuditWorkItemInput {
-    pub work_item_id: WorkItemId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

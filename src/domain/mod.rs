@@ -33,11 +33,9 @@ pub use requests::{
 };
 pub use work::{
     CancelFeature, CompleteFeature, CreateFeature, CreateWorkItem, Feature, FeatureStatus,
-    UpdateWorkItem, WorkItem, WorkItemPage, WorkItemStatus,
+    UpdateWorkItem, WorkItem, WorkItemKind, WorkItemPage, WorkItemStatus,
 };
-pub use worker::{
-    AuditScopeItem, AuditWorkItemInput, CreateWorkerRun, WorkerRole, WorkerRun, WorkerRunStatus,
-};
+pub use worker::{AuditScopeItem, CreateWorkerRun, WorkerRole, WorkerRun, WorkerRunStatus};
 
 pub(crate) fn validate_key(field_name: &str, value: &str) -> Result<String, String> {
     let value = value.trim();

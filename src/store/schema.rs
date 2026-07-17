@@ -101,6 +101,8 @@ CREATE TABLE IF NOT EXISTS work_items (
     assignee_instance_id TEXT REFERENCES agent_instances(instance_id) ON DELETE SET NULL,
     title TEXT NOT NULL,
     summary TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('implementation', 'audit', 'remediation')),
+    addresses_audit_run_id TEXT REFERENCES worker_runs(worker_run_id) ON DELETE RESTRICT,
     priority INTEGER NOT NULL,
     status TEXT NOT NULL CHECK(status IN (
         'planned', 'ready', 'claimed', 'in_progress',
@@ -113,7 +115,12 @@ CREATE TABLE IF NOT EXISTS work_items (
     latest_audit_artifact_id TEXT REFERENCES artifacts(artifact_id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    finished_at TEXT
+    finished_at TEXT,
+    CHECK(
+        (kind = 'implementation' AND addresses_audit_run_id IS NULL)
+        OR (kind = 'audit' AND addresses_audit_run_id IS NULL)
+        OR (kind = 'remediation' AND addresses_audit_run_id IS NOT NULL)
+    )
 );
 
 CREATE INDEX IF NOT EXISTS work_items_feature_status_idx
@@ -121,6 +128,10 @@ CREATE INDEX IF NOT EXISTS work_items_feature_status_idx
 
 CREATE INDEX IF NOT EXISTS work_items_owner_status_idx
     ON work_items(owner_repository_id, status, priority, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS work_items_one_remediation_per_audit_idx
+    ON work_items(addresses_audit_run_id)
+    WHERE kind = 'remediation' AND addresses_audit_run_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS work_items_active_claim_metrics_idx
     ON work_items(status, claim_expires_at)
@@ -177,6 +188,39 @@ CREATE INDEX IF NOT EXISTS worker_runs_active_metrics_idx
 CREATE UNIQUE INDEX IF NOT EXISTS worker_runs_one_remediation_per_audit_idx
     ON worker_runs(addresses_audit_run_id)
     WHERE addresses_audit_run_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS work_item_audit_scope (
+    audit_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE CASCADE,
+    scoped_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+    audit_iteration INTEGER NOT NULL CHECK(audit_iteration BETWEEN 1 AND 10),
+    max_iterations INTEGER NOT NULL CHECK(max_iterations BETWEEN 1 AND 10),
+    PRIMARY KEY(audit_work_item_id, scoped_work_item_id),
+    UNIQUE(scoped_work_item_id, audit_iteration),
+    CHECK(audit_work_item_id <> scoped_work_item_id)
+);
+
+CREATE INDEX IF NOT EXISTS work_item_audit_scope_scoped_idx
+    ON work_item_audit_scope(scoped_work_item_id, audit_iteration);
+
+CREATE TRIGGER IF NOT EXISTS work_item_audit_scope_valid
+BEFORE INSERT ON work_item_audit_scope
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM work_items audit_item
+    JOIN work_items scoped_item
+      ON scoped_item.work_item_id = NEW.scoped_work_item_id
+    JOIN features ON features.feature_id = audit_item.feature_id
+    WHERE audit_item.work_item_id = NEW.audit_work_item_id
+      AND audit_item.kind = 'audit'
+      AND scoped_item.kind = 'implementation'
+      AND scoped_item.status = 'completed'
+      AND scoped_item.feature_id = audit_item.feature_id
+      AND scoped_item.owner_repository_id = audit_item.owner_repository_id
+      AND features.status = 'active'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'audit scope requires completed work in the same active feature and owner repository');
+END;
 
 CREATE TABLE IF NOT EXISTS worker_run_audit_items (
     worker_run_id TEXT NOT NULL REFERENCES worker_runs(worker_run_id) ON DELETE CASCADE,

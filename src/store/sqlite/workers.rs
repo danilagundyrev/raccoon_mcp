@@ -85,11 +85,6 @@ impl SqliteStore {
                 .await?
                 .try_get("project_id")?,
         )?;
-        let audit_scope = prepare_audit_scope(&mut transaction, &command, project_id).await?;
-        if let Some(audit_run_id) = command.addresses_audit_run_id {
-            validate_remediation_audit(&mut transaction, repository_id, audit_run_id).await?;
-        }
-
         sqlx::query(
             "INSERT INTO worker_runs(
                  worker_run_id, repository_id, parent_instance_id, role, status,
@@ -112,7 +107,7 @@ impl SqliteStore {
         .execute(&mut *transaction)
         .await?;
 
-        let work_item_recipients = super::work::attach_worker_to_work_item(
+        let (work_item_recipients, audit_scope) = super::work::attach_worker_to_work_item(
             &mut transaction,
             &command,
             repository_id,

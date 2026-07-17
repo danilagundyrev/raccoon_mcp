@@ -478,25 +478,37 @@ Acknowledgement closes a delivery for one repository. It does not delete the mes
 
 ## Audits and remediation
 
-Set `max_audit_iterations` on a work item to a value from 1 to 10. The default is 1.
+Set `max_audit_iterations` on an implementation work item to a value from 1 to 10. The default is 2: one initial audit and room for one post-remediation audit.
 
-An auditor can only be created for completed work items. One auditor run can cover up to 50 items:
+Audit work is part of the shared work graph. Create an `audit` work item owned by the repository that contains the code. Every scoped implementation must already be completed, belong to the same Feature, and have the same owner repository. Split cross-repository review into separate audit cards.
 
 ```json
 {
   "instance_id": "<orchestrator-instance-id>",
-  "role": "auditor",
-  "task_summary": "Audit completed checkout implementation",
-  "audit_work_items": [
-    { "work_item_id": "<backend-work-item-id>" },
-    { "work_item_id": "<frontend-work-item-id>" }
-  ],
-  "context_refs": [],
-  "idempotency_key": "checkout-audit-1"
+  "feature_id": "<feature-id>",
+  "owner_repository_id": "<repository-containing-the-code>",
+  "kind": "audit",
+  "title": "Audit checkout implementation",
+  "summary": "Independent review against the acceptance criteria",
+  "audit_scope_work_item_ids": ["<completed-work-item-id>"],
+  "idempotency_key": "checkout-audit-card-1"
 }
 ```
 
-The auditor activates, examines the code, and publishes exactly one `audit_report`:
+The owner repository claims this card normally. It then creates a fresh auditor whose `work_item_id` is the claimed audit card. The server derives the scope and iteration from that card:
+
+```json
+{
+  "instance_id": "<owner-orchestrator-instance-id>",
+  "role": "auditor",
+  "work_item_id": "<claimed-audit-work-item-id>",
+  "task_summary": "Audit checkout implementation",
+  "context_refs": [],
+  "idempotency_key": "checkout-auditor-1"
+}
+```
+
+The auditor activates, examines its local checkout, and publishes exactly one `audit_report`:
 
 ```json
 {
@@ -511,29 +523,28 @@ The auditor activates, examines the code, and publishes exactly one `audit_repor
 }
 ```
 
-Without its own `audit_report`, the auditor cannot complete. A second audit report from the same run is rejected.
+Without its own `audit_report`, the auditor cannot complete. A second report from the same run is rejected. After the worker completes, its parent orchestrator completes the audit work item through `update_work_item` without an `implementation_artifact_id`.
 
-If the report contains findings, the orchestrator may create exactly one remediation executor for that audit:
+If the report contains findings, create exactly one `remediation` work item in the same repository:
 
 ```json
 {
   "instance_id": "<orchestrator-instance-id>",
-  "role": "executor",
-  "task_summary": "Address findings from checkout audit",
+  "feature_id": "<feature-id>",
+  "owner_repository_id": "<repository-containing-the-code>",
+  "kind": "remediation",
+  "title": "Address checkout audit findings",
+  "summary": "Implement the actionable audit findings",
   "addresses_audit_run_id": "<completed-auditor-run-id>",
-  "context_refs": [
-    {
-      "type": "artifact",
-      "artifact_id": "<audit-artifact-id>"
-    }
-  ],
-  "idempotency_key": "checkout-audit-1-remediation"
+  "idempotency_key": "checkout-remediation-card-1"
 }
 ```
 
-The next audit iteration is allowed only after the prior auditor completed with exactly one report and any remediation executor also completed. Every scoped item must still have remaining audit depth. Remediation cannot be created retroactively after a later audit iteration starts.
+Claim that card, then create its executor with both `work_item_id` and the same `addresses_audit_run_id`. The executor publishes an `implementation_report`; its orchestrator completes the remediation card with that artifact.
 
-The server does not automatically start audit iterations. The orchestrator decides whether another iteration is useful.
+The next audit card is allowed only after the prior audit card and any remediation card complete. Every scoped implementation must still have remaining audit depth. Remediation cannot be created retroactively after a later audit iteration starts.
+
+This stage records repository ownership and bounded lineage. Structured per-item verdicts and the mandatory Feature verification gate are described in the update plan and are implemented in the next stage.
 
 ## Complete or cancel a feature
 
@@ -645,7 +656,7 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 | `list_features` | List project features. |
 | `complete_feature` | Complete a coordinator-owned feature after linked state is terminal. |
 | `cancel_feature` | Cancel a coordinator-owned feature and remaining unclaimed work. |
-| `create_work_item` | Create an item with dependencies and audit policy. |
+| `create_work_item` | Create an implementation, audit, or remediation card with repository ownership and lineage. |
 | `get_work_item` | Read a consistent item snapshot with dependencies. |
 | `list_work_items` | Read a bounded page of feature items. |
 | `update_work_item` | Update an item using `expected_revision`. |
@@ -657,7 +668,7 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 
 | Tool | Purpose |
 | --- | --- |
-| `create_worker_run` | Create an executor, butler, or auditor run before spawning a child agent. |
+| `create_worker_run` | Create a role-matched worker for a claimed card, or a request-scoped butler. |
 | `activate_worker_run` | Move a created run to active. The child agent's first call. |
 | `heartbeat_worker_run` | Extend an active worker lease. |
 | `get_worker_run` | Read worker status, scope, and result data. |
@@ -926,14 +937,17 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
      expects later continuation.
 
 8. Apply bounded audit/remediation when the task requires review.
-   - Audit only completed work items. One auditor run may cover one item or a coherent
-     batch of items.
-   - Create role `auditor`, pass `audit_work_items`, spawn the child, and require exactly
-     one `audit_report` artifact before `complete_worker_run`.
-   - If the report contains actionable findings, create at most the one remediation
-     executor linked by `addresses_audit_run_id` that the server permits.
-   - Start a later audit iteration only after the prior auditor and any remediation run
-     are completed, and never exceed each item's `max_audit_iterations`.
+   - Create a repository-owned `audit` work item whose `audit_scope_work_item_ids`
+     contains only completed implementation cards from that same repository. Split a
+     cross-repository review into one card per owner.
+   - The owner repository claims the audit card, creates a fresh role `auditor` worker
+     linked by `work_item_id`, and requires exactly one `audit_report` before completing
+     both the worker and audit card.
+   - If the report contains actionable findings, create at most one `remediation` card
+     linked by `addresses_audit_run_id`; claim it and create a matching executor with
+     both the card and audit-run links.
+   - Start a later audit card only after the prior audit card and any remediation card
+     are completed, and never exceed each implementation's `max_audit_iterations`.
    - Do not create an endless review loop for minor preferences. Stop when the configured
      depth is exhausted or remaining findings do not justify another implementation run.
 

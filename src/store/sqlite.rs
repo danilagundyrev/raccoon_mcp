@@ -30,8 +30,8 @@ use crate::domain::{
     Message, MessageId, MessageKind, MessageTarget, OperationalMetrics, PresenceStatus, Project,
     ProjectId, ProjectOverview, PublishMessage, PublishResult, Repository, RepositoryId,
     RepositoryPresence, RepositoryPresenceFilter, RequestId, RequestStatus, RetentionReport,
-    ThreadId, UpdateWorkItem, WaitOutcome, WorkItem, WorkItemId, WorkItemPage, WorkItemStatus,
-    WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
+    ThreadId, UpdateWorkItem, WaitOutcome, WorkItem, WorkItemId, WorkItemKind, WorkItemPage,
+    WorkItemStatus, WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
 };
 
 use super::schema::{CREATE_SCHEMA, SCHEMA_VERSION};
@@ -486,20 +486,10 @@ fn validate_idempotency_key(value: &str) -> Result<(), StoreError> {
 }
 
 fn worker_run_fingerprint(command: &CreateWorkerRun) -> Result<String, StoreError> {
-    let audit_items = command
-        .audit_work_items
-        .iter()
-        .map(|item| {
-            serde_json::json!({
-                "work_item_id": item.work_item_id,
-            })
-        })
-        .collect::<Vec<_>>();
     payload_digest(&serde_json::json!({
         "role": command.role.as_str(),
         "task_summary": command.task_summary,
         "context_refs": command.context_refs,
-        "audit_work_items": audit_items,
         "addresses_audit_run_id": command.addresses_audit_run_id,
         "work_item_id": command.work_item_id,
     }))
@@ -691,17 +681,11 @@ fn claim_conflict(
 
 fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreError> {
     validate_context_refs_value(&command.context_refs)?;
-    if command.audit_work_items.len() > MAX_AUDIT_WORK_ITEMS {
-        return Err(StoreError::Conflict(format!(
-            "audit scope must contain at most {MAX_AUDIT_WORK_ITEMS} work items"
-        )));
-    }
-    let has_audit_scope = !command.audit_work_items.is_empty();
     match command.role {
         WorkerRole::Auditor => {
-            if !has_audit_scope {
+            if command.work_item_id.is_none() {
                 return Err(StoreError::Conflict(
-                    "auditor run requires at least one audit_work_item".to_owned(),
+                    "auditor run requires a claimed audit work_item_id".to_owned(),
                 ));
             }
             if command.addresses_audit_run_id.is_some() {
@@ -709,157 +693,62 @@ fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreErr
                     "auditor run cannot address another audit run".to_owned(),
                 ));
             }
-            if command.work_item_id.is_some() {
-                return Err(StoreError::Conflict(
-                    "auditor run uses audit_work_items, not work_item_id".to_owned(),
-                ));
-            }
         }
         WorkerRole::Executor => {
-            if has_audit_scope {
+            if command.addresses_audit_run_id.is_some() && command.work_item_id.is_none() {
                 return Err(StoreError::Conflict(
-                    "executor run cannot declare audit_work_items".to_owned(),
+                    "remediation executor requires a claimed remediation work_item_id".to_owned(),
                 ));
             }
         }
         WorkerRole::Butler => {
-            if has_audit_scope
-                || command.addresses_audit_run_id.is_some()
-                || command.work_item_id.is_some()
-            {
+            if command.addresses_audit_run_id.is_some() || command.work_item_id.is_some() {
                 return Err(StoreError::Conflict(
                     "butler run cannot declare audit scope or remediation link".to_owned(),
                 ));
             }
         }
     }
-
-    let mut unique_work_items = BTreeSet::new();
-    for item in &command.audit_work_items {
-        if !unique_work_items.insert(item.work_item_id.to_string()) {
-            return Err(StoreError::Conflict(format!(
-                "work item {} appears more than once in audit scope",
-                item.work_item_id
-            )));
-        }
-    }
     Ok(())
-}
-
-async fn prepare_audit_scope(
-    transaction: &mut Transaction<'_, Sqlite>,
-    command: &CreateWorkerRun,
-    project_id: ProjectId,
-) -> Result<Vec<AuditScopeItem>, StoreError> {
-    if command.role != WorkerRole::Auditor {
-        return Ok(Vec::new());
-    }
-
-    let mut scope = Vec::with_capacity(command.audit_work_items.len());
-    for item in &command.audit_work_items {
-        let work_item = sqlx::query(
-            "SELECT work_items.status, work_items.max_audit_iterations,
-                    features.status AS feature_status
-             FROM work_items
-             JOIN features ON features.feature_id = work_items.feature_id
-             WHERE work_items.work_item_id = ? AND features.project_id = ?",
-        )
-        .bind(item.work_item_id.to_string())
-        .bind(project_id.to_string())
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or_else(|| StoreError::NotFound(format!("work item {}", item.work_item_id)))?;
-        let feature_status: String = work_item.try_get("feature_status")?;
-        if feature_status != FeatureStatus::Active.as_str() {
-            return Err(StoreError::Conflict(format!(
-                "work item {} belongs to a terminal feature",
-                item.work_item_id
-            )));
-        }
-        let status: String = work_item.try_get("status")?;
-        if status != "completed" {
-            return Err(StoreError::Conflict(format!(
-                "work item {} must be completed before audit",
-                item.work_item_id
-            )));
-        }
-        let max_iterations = work_item.try_get::<i64, _>("max_audit_iterations")? as u8;
-        let previous = sqlx::query(
-            "SELECT audit.audit_iteration, audit.max_iterations, run.status,
-                    (SELECT COUNT(*) FROM artifacts
-                     WHERE producer_worker_run_id = run.worker_run_id
-                       AND kind = 'audit_report') AS report_count,
-                    remediation.status AS remediation_status
-             FROM worker_run_audit_items audit
-             JOIN worker_runs run ON run.worker_run_id = audit.worker_run_id
-             LEFT JOIN worker_runs remediation
-               ON remediation.addresses_audit_run_id = run.worker_run_id
-             WHERE audit.work_item_id = ?
-             ORDER BY audit.audit_iteration DESC
-             LIMIT 1",
-        )
-        .bind(item.work_item_id.to_string())
-        .fetch_optional(&mut **transaction)
-        .await?;
-        let current_iteration = if let Some(previous) = previous {
-            let stored_max = previous.try_get::<i64, _>("max_iterations")?;
-            if stored_max != i64::from(max_iterations) {
-                return Err(StoreError::Conflict(format!(
-                    "work item {} audit depth is already fixed at {stored_max}",
-                    item.work_item_id
-                )));
-            }
-            let status: String = previous.try_get("status")?;
-            let report_count: i64 = previous.try_get("report_count")?;
-            let remediation_status: Option<String> = previous.try_get("remediation_status")?;
-            if status != "completed"
-                || report_count != 1
-                || remediation_status
-                    .as_deref()
-                    .is_some_and(|value| value != "completed")
-            {
-                return Err(StoreError::Conflict(format!(
-                    "work item {} cannot start its next audit until the previous audit has exactly one report and any remediation is completed",
-                    item.work_item_id
-                )));
-            }
-            previous.try_get::<i64, _>("audit_iteration")?
-        } else {
-            0
-        };
-        let iteration = current_iteration + 1;
-        if iteration > i64::from(max_iterations) {
-            return Err(StoreError::Conflict(format!(
-                "work item {} exhausted audit depth {}",
-                item.work_item_id, max_iterations
-            )));
-        }
-        scope.push(AuditScopeItem {
-            work_item_id: item.work_item_id,
-            iteration: iteration as u8,
-            max_iterations,
-        });
-    }
-    Ok(scope)
 }
 
 async fn validate_remediation_audit(
     transaction: &mut Transaction<'_, Sqlite>,
     repository_id: RepositoryId,
+    feature_id: FeatureId,
     audit_run_id: WorkerRunId,
 ) -> Result<(), StoreError> {
-    let audit =
-        sqlx::query("SELECT repository_id, role, status FROM worker_runs WHERE worker_run_id = ?")
-            .bind(audit_run_id.to_string())
-            .fetch_optional(&mut **transaction)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(format!("audit worker run {audit_run_id}")))?;
+    let audit = sqlx::query(
+        "SELECT run.repository_id, run.role, run.status, item.feature_id,
+                item.kind AS work_item_kind, item.status AS work_item_status,
+                (SELECT COUNT(*) FROM artifacts
+                 WHERE producer_worker_run_id = run.worker_run_id
+                   AND kind = 'audit_report') AS report_count
+         FROM worker_runs run
+         JOIN work_items item ON item.work_item_id = run.work_item_id
+         WHERE run.worker_run_id = ?",
+    )
+    .bind(audit_run_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("audit worker run {audit_run_id}")))?;
     let audit_repository_id = RepositoryId::parse(audit.try_get("repository_id")?)?;
     let role: String = audit.try_get("role")?;
     let status: String = audit.try_get("status")?;
-    if audit_repository_id != repository_id || role != "auditor" || status != "completed" {
+    let audit_feature_id = FeatureId::parse(audit.try_get("feature_id")?)?;
+    let work_item_kind: String = audit.try_get("work_item_kind")?;
+    let work_item_status: String = audit.try_get("work_item_status")?;
+    let report_count: i64 = audit.try_get("report_count")?;
+    if audit_repository_id != repository_id
+        || audit_feature_id != feature_id
+        || role != "auditor"
+        || status != "completed"
+        || work_item_kind != WorkItemKind::Audit.as_str()
+        || work_item_status != WorkItemStatus::Completed.as_str()
+        || report_count != 1
+    {
         return Err(StoreError::Conflict(format!(
-            "worker run {audit_run_id} must be a completed auditor run in the same repository"
+            "worker run {audit_run_id} must be a completed repository-local audit work item with exactly one report"
         )));
     }
     let inactive_features: i64 = sqlx::query_scalar(
@@ -889,14 +778,28 @@ async fn validate_remediation_audit(
             "audit worker run {audit_run_id} already has a remediation executor run"
         )));
     }
+    let existing_work_item = sqlx::query(
+        "SELECT work_item_id FROM work_items
+         WHERE kind = 'remediation' AND addresses_audit_run_id = ?",
+    )
+    .bind(audit_run_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if existing_work_item.is_some() {
+        return Err(StoreError::Conflict(format!(
+            "audit worker run {audit_run_id} already has a remediation work item"
+        )));
+    }
     let later_iteration_exists: i64 = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
-             FROM worker_run_audit_items current_scope
-             JOIN worker_run_audit_items later
-               ON later.work_item_id = current_scope.work_item_id
+             FROM worker_runs current_run
+             JOIN work_item_audit_scope current_scope
+               ON current_scope.audit_work_item_id = current_run.work_item_id
+             JOIN work_item_audit_scope later
+               ON later.scoped_work_item_id = current_scope.scoped_work_item_id
               AND later.audit_iteration > current_scope.audit_iteration
-             WHERE current_scope.worker_run_id = ?
+             WHERE current_run.worker_run_id = ?
          )",
     )
     .bind(audit_run_id.to_string())

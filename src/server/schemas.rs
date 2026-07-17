@@ -54,7 +54,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "create_worker_run",
-            "description": "Create a repository-scoped executor, butler or auditor run before spawning a child agent. Auditor runs accept one or more work items; remediation executors link to exactly one completed audit.",
+            "description": "Create a worker for a claimed repository-owned work item, or a request-scoped butler. Audit scope and remediation lineage come from the work item.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -77,20 +77,6 @@ pub(super) fn tool_definitions(
                         "maxLength": 128,
                         "description": "Optional actor-scoped retry key. Reuse requires an identical payload."
                     },
-                    "audit_work_items": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": MAX_AUDIT_WORK_ITEMS,
-                        "uniqueItems": true,
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "properties": {
-                                "work_item_id": { "type": "string", "format": "uuid" }
-                            },
-                            "required": ["work_item_id"]
-                        }
-                    },
                     "addresses_audit_run_id": {
                         "type": "string",
                         "format": "uuid",
@@ -99,7 +85,7 @@ pub(super) fn tool_definitions(
                     "work_item_id": {
                         "type": "string",
                         "format": "uuid",
-                        "description": "Optional claimed work item for a normal executor run."
+                        "description": "Claimed implementation, audit or remediation work item. Its kind must match the worker role."
                     }
                 },
                 "required": ["instance_id", "role", "task_summary"]
@@ -420,6 +406,24 @@ pub(super) fn create_work_item_schema(max_summary_bytes: u16) -> Value {
             "owner_repository_id": { "type": "string", "format": "uuid" },
             "title": { "type": "string", "maxLength": max_summary_bytes },
             "summary": { "type": "string", "maxLength": max_summary_bytes },
+            "kind": {
+                "type": "string",
+                "enum": ["implementation", "audit", "remediation"],
+                "default": "implementation"
+            },
+            "audit_scope_work_item_ids": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_AUDIT_WORK_ITEMS,
+                "uniqueItems": true,
+                "items": { "type": "string", "format": "uuid" },
+                "description": "Required only for audit work; every item must be a completed implementation owned by owner_repository_id."
+            },
+            "addresses_audit_run_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Required only for remediation work and identifies the completed audit being addressed."
+            },
             "dependency_ids": {
                 "type": "array",
                 "maxItems": MAX_WORK_ITEM_DEPENDENCIES,
@@ -433,7 +437,7 @@ pub(super) fn create_work_item_schema(max_summary_bytes: u16) -> Value {
                 "default": 0,
                 "description": "Higher numeric values are processed before lower values when other eligibility rules are equal."
             },
-            "max_audit_iterations": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
+            "max_audit_iterations": { "type": "integer", "minimum": 1, "maximum": 10, "default": 2 },
             "idempotency_key": idempotency_key_schema()
         },
         "required": ["instance_id", "feature_id", "owner_repository_id", "title", "summary"]
