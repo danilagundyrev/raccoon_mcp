@@ -19,6 +19,7 @@ use axum::{
 };
 use serde_json::{Map as JsonMap, Value, json};
 use tokio::{net::TcpListener, sync::watch, time::MissedTickBehavior};
+use tracing::Instrument;
 
 use crate::{
     domain::{
@@ -29,9 +30,9 @@ use crate::{
         InstanceId, MAX_AUDIT_WORK_ITEMS, MAX_CONTEXT_REFS, MAX_MESSAGE_RECIPIENTS,
         MAX_WORK_ITEM_DEPENDENCIES, MessageId, MessageKind, MessageListFilter, MessageTarget,
         ProjectId, PublishMessage, RepositoryId, RepositoryPresenceFilter, RequestId,
-        RequestListFilter, RequestStatus, ThreadId, UpdateWorkItem, WorkItemId, WorkItemKind,
-        WorkItemStatus, WorkerRole, WorkerRunId, WorkerRunListFilter, WorkerRunStatus,
-        validate_key,
+        RequestListFilter, RequestStatus, ThreadId, UpdateWorkItem, WaitOutcome, WorkItemId,
+        WorkItemKind, WorkItemStatus, WorkerRole, WorkerRunId, WorkerRunListFilter,
+        WorkerRunStatus, validate_key,
     },
     store::{EventWaitOptions, SqliteStore, StoreError},
 };
@@ -81,6 +82,135 @@ struct RpcError {
     message: String,
     http_status: StatusCode,
     data: Option<Value>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RpcTraceFields {
+    session_id: String,
+    rpc_request_id: String,
+    method: String,
+    tool_name: String,
+    raw_project_id: String,
+    raw_repository_id: String,
+    instance_id: String,
+    worker_run_id: String,
+    coordination_request_id: String,
+    feature_id: String,
+    work_item_id: String,
+    message_id: String,
+    artifact_id: String,
+    is_notification: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RpcResponseTrace {
+    error_code: Option<String>,
+    tool_error: bool,
+}
+
+impl RpcResponseTrace {
+    fn from_body(body: &Value) -> Self {
+        if let Some(error_code) = body.pointer("/error/data/code").and_then(Value::as_str) {
+            return Self {
+                error_code: Some(error_code.to_owned()),
+                tool_error: false,
+            };
+        }
+        Self {
+            error_code: body
+                .pointer("/result/structuredContent/error/code")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            tool_error: true,
+        }
+    }
+}
+
+impl RpcTraceFields {
+    fn from_payload(session_id: Option<&str>, payload: &Value) -> Self {
+        let request = payload.as_object();
+        let params = request
+            .and_then(|request| request.get("params"))
+            .and_then(Value::as_object);
+        let arguments = params
+            .and_then(|params| params.get("arguments"))
+            .and_then(Value::as_object);
+        let field = |name: &str| {
+            arguments
+                .and_then(|arguments| arguments.get(name))
+                .or_else(|| params.and_then(|params| params.get(name)))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let rpc_request_id = request
+            .and_then(|request| request.get("id"))
+            .map(json_rpc_id_text)
+            .unwrap_or_default();
+        Self {
+            session_id: session_id.unwrap_or_default().to_owned(),
+            rpc_request_id,
+            method: request
+                .and_then(|request| request.get("method"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            tool_name: params
+                .and_then(|params| params.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            raw_project_id: field("project_id"),
+            raw_repository_id: field("repository_id"),
+            instance_id: field("instance_id"),
+            worker_run_id: field("worker_run_id"),
+            coordination_request_id: field("request_id"),
+            feature_id: field("feature_id"),
+            work_item_id: field("work_item_id"),
+            message_id: field("message_id"),
+            artifact_id: field("artifact_id"),
+            is_notification: request.is_some_and(|request| !request.contains_key("id")),
+        }
+    }
+
+    fn span(&self) -> tracing::Span {
+        tracing::info_span!(
+            "mcp_request",
+            session_id = %self.session_id,
+            rpc_request_id = %self.rpc_request_id,
+            method = %self.method,
+            tool_name = %self.tool_name,
+            raw_project_id = %self.raw_project_id,
+            raw_repository_id = %self.raw_repository_id,
+            instance_id = %self.instance_id,
+            worker_run_id = %self.worker_run_id,
+            coordination_request_id = %self.coordination_request_id,
+            feature_id = %self.feature_id,
+            work_item_id = %self.work_item_id,
+            message_id = %self.message_id,
+            artifact_id = %self.artifact_id,
+            project_id = tracing::field::Empty,
+            repository_id = tracing::field::Empty,
+            duration_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            error_code = tracing::field::Empty,
+            wait_requested_timeout_seconds = tracing::field::Empty,
+            wait_effective_timeout_seconds = tracing::field::Empty,
+            wait_start_cursor = tracing::field::Empty,
+            wait_end_cursor = tracing::field::Empty,
+            wait_event_count = tracing::field::Empty,
+            wait_elapsed_ms = tracing::field::Empty,
+            wait_exit_reason = tracing::field::Empty,
+        )
+    }
+}
+
+fn json_rpc_id_text(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Number(value) => value.to_string(),
+        _ => String::new(),
+    }
 }
 
 impl RpcError {
@@ -225,12 +355,25 @@ async fn maintenance_loop(
             _ = lease_ticker.tick() => {
                 let reaped_sessions = sessions.reap_idle();
                 match store.run_lease_maintenance().await {
-                    Ok(report) => tracing::info!(
+                    Ok(report) if reaped_sessions != 0
+                        || report.disconnected_orchestrators != 0
+                        || report.abandoned_workers != 0
+                        || report.requeued_requests != 0 =>
+                    {
+                        tracing::info!(
+                            reaped_sessions,
+                            disconnected_orchestrators = report.disconnected_orchestrators,
+                            abandoned_workers = report.abandoned_workers,
+                            requeued_requests = report.requeued_requests,
+                            "lease maintenance reaped expired state"
+                        )
+                    }
+                    Ok(report) => tracing::debug!(
                         reaped_sessions,
                         disconnected_orchestrators = report.disconnected_orchestrators,
                         abandoned_workers = report.abandoned_workers,
                         requeued_requests = report.requeued_requests,
-                        "lease maintenance pass completed"
+                        "lease maintenance pass completed without changes"
                     ),
                     Err(error) => tracing::error!(error = %error, "lease maintenance pass failed"),
                 }
@@ -379,129 +522,156 @@ async fn mcp_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         }
     };
 
-    let is_initialize = payload
-        .as_object()
-        .is_some_and(|request| request.get("method").and_then(Value::as_str) == Some("initialize"));
-    let response_id = payload.get("id").cloned().unwrap_or(Value::Null);
-    let session_header = headers.get("mcp-session-id");
-    let (_session_id, in_flight) = if is_initialize {
-        if session_header.is_some() {
-            return transport_error_response(
-                StatusCode::BAD_REQUEST,
-                payload.get("id").cloned().unwrap_or(Value::Null),
-                "session_not_allowed",
-                "initialize must not include Mcp-Session-Id",
-            );
-        }
-        (None, None)
-    } else {
-        let session_id = match session_header {
-            None => {
-                return transport_error_response(
-                    StatusCode::BAD_REQUEST,
-                    payload.get("id").cloned().unwrap_or(Value::Null),
-                    "session_required",
-                    "Mcp-Session-Id is required after initialize",
-                );
-            }
-            Some(value) if value.to_str().is_err() => {
-                return transport_error_response(
-                    StatusCode::BAD_REQUEST,
-                    payload.get("id").cloned().unwrap_or(Value::Null),
-                    "invalid_session",
-                    "Mcp-Session-Id must contain visible ASCII characters",
-                );
-            }
-            Some(value) => value.to_str().expect("checked above").to_owned(),
-        };
-        let Some(supplied_version) = headers
-            .get("mcp-protocol-version")
-            .and_then(|value| value.to_str().ok())
-        else {
-            return transport_error_response(
-                StatusCode::BAD_REQUEST,
-                payload.get("id").cloned().unwrap_or(Value::Null),
-                "unsupported_protocol_version",
-                "MCP-Protocol-Version is required after initialize",
-            );
-        };
-        let is_cancellation = payload.as_object().is_some_and(|request| {
-            request.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
-                && !request.contains_key("id")
+    let trace = RpcTraceFields::from_payload(
+        headers
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok()),
+        &payload,
+    );
+    let span = trace.span();
+    let started_at = tokio::time::Instant::now();
+    let response = async {
+        let is_initialize = payload.as_object().is_some_and(|request| {
+            request.get("method").and_then(Value::as_str) == Some("initialize")
         });
-        let request_id = payload.get("id");
-        let access = if is_cancellation {
-            let cancelled_request_id = payload
-                .get("params")
-                .and_then(Value::as_object)
-                .and_then(|params| params.get("requestId"));
-            match cancelled_request_id {
-                Some(request_id) if is_valid_request_id(request_id) => state
+        let response_id = payload.get("id").cloned().unwrap_or(Value::Null);
+        let session_header = headers.get("mcp-session-id");
+        let (_, in_flight) = if is_initialize {
+            if session_header.is_some() {
+                return transport_error_response(
+                    StatusCode::BAD_REQUEST,
+                    payload.get("id").cloned().unwrap_or(Value::Null),
+                    "session_not_allowed",
+                    "initialize must not include Mcp-Session-Id",
+                );
+            }
+            (None, None)
+        } else {
+            let session_id = match session_header {
+                None => {
+                    return transport_error_response(
+                        StatusCode::BAD_REQUEST,
+                        payload.get("id").cloned().unwrap_or(Value::Null),
+                        "session_required",
+                        "Mcp-Session-Id is required after initialize",
+                    );
+                }
+                Some(value) if value.to_str().is_err() => {
+                    return transport_error_response(
+                        StatusCode::BAD_REQUEST,
+                        payload.get("id").cloned().unwrap_or(Value::Null),
+                        "invalid_session",
+                        "Mcp-Session-Id must contain visible ASCII characters",
+                    );
+                }
+                Some(value) => value.to_str().expect("checked above").to_owned(),
+            };
+            let Some(supplied_version) = headers
+                .get("mcp-protocol-version")
+                .and_then(|value| value.to_str().ok())
+            else {
+                return transport_error_response(
+                    StatusCode::BAD_REQUEST,
+                    payload.get("id").cloned().unwrap_or(Value::Null),
+                    "unsupported_protocol_version",
+                    "MCP-Protocol-Version is required after initialize",
+                );
+            };
+            let is_cancellation = payload.as_object().is_some_and(|request| {
+                request.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+                    && !request.contains_key("id")
+            });
+            let request_id = payload.get("id");
+            let access = if is_cancellation {
+                let cancelled_request_id = payload
+                    .get("params")
+                    .and_then(Value::as_object)
+                    .and_then(|params| params.get("requestId"));
+                match cancelled_request_id {
+                    Some(request_id) if is_valid_request_id(request_id) => state
+                        .sessions
+                        .cancel(&session_id, supplied_version, request_id)
+                        .map(|()| None),
+                    _ => state
+                        .sessions
+                        .validate(&session_id, supplied_version)
+                        .map(|()| None),
+                }
+            } else if request_id.is_some_and(is_valid_request_id) {
+                state
                     .sessions
-                    .cancel(&session_id, supplied_version, request_id)
-                    .map(|()| None),
-                _ => state
+                    .begin_request(
+                        &session_id,
+                        supplied_version,
+                        request_id.expect("checked above"),
+                    )
+                    .map(Some)
+            } else {
+                state
                     .sessions
                     .validate(&session_id, supplied_version)
-                    .map(|()| None),
-            }
-        } else if request_id.is_some_and(is_valid_request_id) {
-            state
-                .sessions
-                .begin_request(
-                    &session_id,
-                    supplied_version,
-                    request_id.expect("checked above"),
-                )
-                .map(Some)
-        } else {
-            state
-                .sessions
-                .validate(&session_id, supplied_version)
-                .map(|()| None)
+                    .map(|()| None)
+            };
+            let in_flight = match access {
+                Ok(in_flight) => in_flight,
+                Err(error) => {
+                    return session_access_error_response(
+                        error,
+                        payload.get("id").cloned().unwrap_or(Value::Null),
+                    );
+                }
+            };
+            (Some(session_id), in_flight)
         };
-        let in_flight = match access {
-            Ok(in_flight) => in_flight,
-            Err(error) => {
-                return session_access_error_response(
-                    error,
-                    payload.get("id").cloned().unwrap_or(Value::Null),
-                );
-            }
-        };
-        (Some(session_id), in_flight)
-    };
 
-    let (status, response_body) = handle_rpc_payload(
-        &state.store,
-        state.max_summary_bytes,
-        state.max_artifact_bytes,
-        state.max_wait_seconds,
-        payload,
-        in_flight.as_ref().map(|request| request.cancellation()),
-    )
-    .await;
-    let mut response = match response_body {
-        Some(body) => json_response(status, body),
-        None => no_content_response(status),
-    };
-    if is_initialize && status == StatusCode::OK {
-        let session_id = match state.sessions.create(PROTOCOL_VERSION) {
-            Ok(session_id) => session_id,
-            Err(SessionCreateError::CapacityExceeded) => {
-                return transport_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    response_id,
-                    "session_capacity_exceeded",
-                    "MCP session capacity is exhausted; retry after an idle session expires",
-                );
-            }
+        let (status, response_body) = handle_rpc_payload(
+            &state.store,
+            state.max_summary_bytes,
+            state.max_artifact_bytes,
+            state.max_wait_seconds,
+            payload,
+            in_flight.as_ref().map(|request| request.cancellation()),
+        )
+        .await;
+        let mut response = match response_body {
+            Some(body) => json_response(status, body),
+            None => no_content_response(status),
         };
-        response.headers_mut().insert(
-            "mcp-session-id",
-            session_id.parse().expect("UUID is a valid header value"),
-        );
+        if is_initialize && status == StatusCode::OK {
+            let session_id = match state.sessions.create(PROTOCOL_VERSION) {
+                Ok(session_id) => session_id,
+                Err(SessionCreateError::CapacityExceeded) => {
+                    return transport_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        response_id,
+                        "session_capacity_exceeded",
+                        "MCP session capacity is exhausted; retry after an idle session expires",
+                    );
+                }
+            };
+            response.headers_mut().insert(
+                "mcp-session-id",
+                session_id.parse().expect("UUID is a valid header value"),
+            );
+        }
+        response
     }
+    .instrument(span.clone())
+    .await;
+    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let response_trace = response.extensions().get::<RpcResponseTrace>();
+    let (outcome, error_code) =
+        rpc_trace_outcome(response.status(), response_trace, trace.is_notification);
+    span.record("duration_ms", duration_ms);
+    span.record("outcome", outcome);
+    if let Some(error_code) = error_code {
+        span.record("error_code", error_code);
+    }
+    if outcome == "cancelled" && trace.tool_name == "wait_for_events" {
+        span.record("wait_elapsed_ms", duration_ms);
+        span.record("wait_exit_reason", "cancelled");
+    }
+    tracing::info!(parent: &span, "MCP request completed");
     response
 }
 
@@ -656,29 +826,6 @@ async fn handle_single_request(
             );
         }
     };
-    let arguments = params.get("arguments").and_then(Value::as_object);
-    let trace_field = |name: &str| {
-        arguments
-            .and_then(|arguments| arguments.get(name))
-            .or_else(|| params.get(name))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-    };
-    tracing::info!(
-        method,
-        tool_name = params
-            .get("name")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default(),
-        project_id = trace_field("project_id"),
-        repository_id = trace_field("repository_id"),
-        instance_id = trace_field("instance_id"),
-        worker_run_id = trace_field("worker_run_id"),
-        request_id = trace_field("request_id"),
-        work_item_id = trace_field("work_item_id"),
-        "MCP request"
-    );
-
     let dispatched = dispatch(
         store,
         max_summary_bytes,
@@ -705,6 +852,35 @@ async fn handle_single_request(
             Some(json!({ "jsonrpc": "2.0", "id": request_id, "result": result })),
         ),
         Err(error) => rpc_request_error(request_id, is_notification, error),
+    }
+}
+
+fn rpc_trace_outcome(
+    status: StatusCode,
+    response_trace: Option<&RpcResponseTrace>,
+    is_notification: bool,
+) -> (&'static str, Option<&str>) {
+    if let Some(trace) = response_trace.filter(|trace| trace.error_code.is_some()) {
+        return (
+            if trace.tool_error {
+                "tool_error"
+            } else {
+                "error"
+            },
+            trace.error_code.as_deref(),
+        );
+    }
+    if !status.is_success() {
+        return ("error", Some("http_error"));
+    }
+    if status == StatusCode::ACCEPTED {
+        if is_notification {
+            ("notification", None)
+        } else {
+            ("cancelled", Some("cancelled"))
+        }
+    } else {
+        ("success", None)
     }
 }
 
@@ -794,12 +970,14 @@ fn json_rpc_error_response(
 }
 
 fn json_response(status: StatusCode, body: Value) -> Response {
+    let trace = RpcResponseTrace::from_body(&body);
     let payload = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "application/json; charset=utf-8")
         .header(CACHE_CONTROL, "no-store")
         .header(CONTENT_LENGTH, payload.len().to_string())
+        .extension(trace)
         .body(Body::from(payload))
         .unwrap()
 }

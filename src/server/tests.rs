@@ -170,6 +170,73 @@ fn tool_results_do_not_duplicate_structured_payload_in_text() {
 }
 
 #[test]
+fn rpc_trace_fields_separate_transport_and_coordination_request_ids() {
+    let instance_id = InstanceId::new();
+    let coordination_request_id = RequestId::new();
+    let work_item_id = WorkItemId::new();
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "tools/call",
+        "params": {
+            "name": "answer_request",
+            "arguments": {
+                "instance_id": instance_id,
+                "request_id": coordination_request_id,
+                "work_item_id": work_item_id
+            }
+        }
+    });
+
+    let fields = RpcTraceFields::from_payload(Some("session-123"), &payload);
+    assert_eq!(fields.session_id, "session-123");
+    assert_eq!(fields.rpc_request_id, "42");
+    assert_eq!(fields.method, "tools/call");
+    assert_eq!(fields.tool_name, "answer_request");
+    assert_eq!(fields.instance_id, instance_id.to_string());
+    assert_eq!(
+        fields.coordination_request_id,
+        coordination_request_id.to_string()
+    );
+    assert_eq!(fields.work_item_id, work_item_id.to_string());
+    assert!(!fields.is_notification);
+}
+
+#[test]
+fn rpc_trace_outcome_uses_stable_protocol_and_tool_error_codes() {
+    let protocol_error = json!({
+        "error": { "data": { "code": "invalid_params" } }
+    });
+    let protocol_trace = RpcResponseTrace::from_body(&protocol_error);
+    assert_eq!(
+        rpc_trace_outcome(StatusCode::BAD_REQUEST, Some(&protocol_trace), false),
+        ("error", Some("invalid_params"))
+    );
+
+    let tool_error = json!({
+        "result": {
+            "isError": true,
+            "structuredContent": {
+                "error": { "code": "claim_conflict" }
+            }
+        }
+    });
+    let tool_trace = RpcResponseTrace::from_body(&tool_error);
+    assert_eq!(
+        rpc_trace_outcome(StatusCode::OK, Some(&tool_trace), false),
+        ("tool_error", Some("claim_conflict"))
+    );
+    assert_eq!(
+        rpc_trace_outcome(StatusCode::ACCEPTED, None, true),
+        ("notification", None)
+    );
+    assert_eq!(
+        rpc_trace_outcome(StatusCode::ACCEPTED, None, false),
+        ("cancelled", Some("cancelled"))
+    );
+}
+
+#[test]
 fn event_wait_schema_has_explicit_finite_timeout_contract() {
     let schema = wait_for_events_schema(60);
     assert_eq!(schema["properties"]["limit"]["maximum"], 50);
@@ -619,6 +686,16 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
     assert_eq!(
         guide_payload["event_headers"]["recipient_policy"]["work_item_and_linked_worker"],
         "owner repository plus Feature coordinator"
+    );
+    assert_eq!(
+        guide_payload["observability"]["completion_fields"],
+        json!(["duration_ms", "outcome", "error_code"])
+    );
+    assert!(
+        guide_payload["observability"]["wait_fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("wait_exit_reason"))
     );
     assert!(
         guide_payload["work_flow"]

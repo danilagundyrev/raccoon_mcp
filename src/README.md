@@ -834,6 +834,20 @@ cargo run --release -- `
   --log-level INFO
 ```
 
+## Request tracing
+
+Every parsed JSON-RPC call produces one `MCP request completed` event inside an `mcp_request` tracing span. At the default `INFO` level, that single searchable story includes:
+
+- `session_id`, JSON-RPC `rpc_request_id`, method, and tool name;
+- raw actor and linked-entity IDs supplied by the client;
+- `coordination_request_id`, kept separate from the JSON-RPC request ID;
+- resolved `project_id` and `repository_id` after actor authorization;
+- total `duration_ms`, outcome, and a stable error code when the call failed.
+
+`wait_for_events` additionally records requested/effective timeout, resolved starting and ending cursor, event count, elapsed time, and `events`, `deadline`, `cancelled`, or `error` as its exit reason. Actor-resolution details remain available at `DEBUG` without producing a second misleading INFO request line.
+
+Zero-change lease-maintenance passes are also logged only at `DEBUG`. `INFO` maintenance entries mean that a session or actor was actually reaped, a worker was abandoned, or a request was requeued.
+
 ## Limits and security
 
 | Value | Limit |

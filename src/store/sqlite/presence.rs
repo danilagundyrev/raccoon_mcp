@@ -58,6 +58,7 @@ impl SqliteStore {
         .fetch_one(&mut *transaction)
         .await?;
         transaction.commit().await?;
+        trace_resolved_scope(project.project_id, repository.repository_id);
 
         Ok(ConnectResult {
             project,
@@ -153,12 +154,23 @@ impl SqliteStore {
     }
 
     pub async fn get_instance(&self, instance_id: InstanceId) -> Result<AgentInstance, StoreError> {
-        let row = sqlx::query("SELECT * FROM agent_instances WHERE instance_id = ?")
-            .bind(instance_id.to_string())
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(format!("instance {instance_id}")))?;
-        instance_from_row(&row, &utc_now())
+        let row = sqlx::query(
+            "SELECT instance.*, repository.project_id AS trace_project_id
+             FROM agent_instances instance
+             JOIN repositories repository
+               ON repository.repository_id = instance.repository_id
+             WHERE instance.instance_id = ?",
+        )
+        .bind(instance_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("instance {instance_id}")))?;
+        let instance = instance_from_row(&row, &utc_now())?;
+        trace_resolved_scope(
+            ProjectId::parse(row.try_get("trace_project_id")?)?,
+            instance.repository_id,
+        );
+        Ok(instance)
     }
 
     pub async fn list_repositories(

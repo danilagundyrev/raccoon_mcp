@@ -73,6 +73,10 @@ impl SqliteStore {
             .transpose()
             .map_err(StoreError::Conflict)?;
         let fallback_cursor = options.cursor.unwrap_or(0);
+        let span = tracing::Span::current();
+        span.record("wait_start_cursor", fallback_cursor);
+        span.record("wait_end_cursor", fallback_cursor);
+        span.record("wait_event_count", 0);
 
         if options.timeout.is_zero() {
             let (actor, resolved_cursor) = self
@@ -256,6 +260,9 @@ impl SqliteStore {
             .unwrap_or(0),
             (None, None) => 0,
         };
+        let span = tracing::Span::current();
+        span.record("wait_start_cursor", resolved_cursor);
+        span.record("wait_end_cursor", resolved_cursor);
         transaction.commit().await?;
         Ok((actor, resolved_cursor))
     }

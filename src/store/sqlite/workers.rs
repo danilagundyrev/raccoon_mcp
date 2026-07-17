@@ -285,12 +285,22 @@ impl SqliteStore {
         &self,
         worker_run_id: WorkerRunId,
     ) -> Result<WorkerRun, StoreError> {
-        let row = sqlx::query("SELECT * FROM worker_runs WHERE worker_run_id = ?")
-            .bind(worker_run_id.to_string())
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(format!("worker run {worker_run_id}")))?;
+        let row = sqlx::query(
+            "SELECT worker.*, repository.project_id AS trace_project_id
+             FROM worker_runs worker
+             JOIN repositories repository
+               ON repository.repository_id = worker.repository_id
+             WHERE worker.worker_run_id = ?",
+        )
+        .bind(worker_run_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("worker run {worker_run_id}")))?;
         let mut worker = worker_run_from_row(&row)?;
+        trace_resolved_scope(
+            ProjectId::parse(row.try_get("trace_project_id")?)?,
+            worker.repository_id,
+        );
         let audit_rows = sqlx::query(
             "SELECT work_item_id, audit_iteration, max_iterations
              FROM worker_run_audit_items

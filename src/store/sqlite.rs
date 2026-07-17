@@ -391,13 +391,20 @@ impl SqliteStore {
 }
 
 fn trace_resolved_actor(actor: &ResolvedActor) {
-    tracing::info!(
+    trace_resolved_scope(actor.project_id, actor.repository_id);
+    tracing::debug!(
         project_id = %actor.project_id,
         repository_id = %actor.repository_id,
         instance_id = actor.instance_id.map(|id| id.to_string()).unwrap_or_default(),
         worker_run_id = actor.worker_run_id.map(|id| id.to_string()).unwrap_or_default(),
-        "actor resolved"
+        "actor scope resolved"
     );
+}
+
+fn trace_resolved_scope(project_id: ProjectId, repository_id: RepositoryId) {
+    let span = tracing::Span::current();
+    span.record("project_id", tracing::field::display(project_id));
+    span.record("repository_id", tracing::field::display(repository_id));
 }
 
 fn validate_history_limit(limit: u8) -> Result<(), StoreError> {

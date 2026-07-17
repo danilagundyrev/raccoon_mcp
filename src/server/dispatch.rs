@@ -521,31 +521,53 @@ pub(super) async fn call_tool(
                 effective_wait_seconds(requested_timeout_seconds, max_wait_seconds);
             let limit = optional_event_limit(&arguments)?.unwrap_or(20);
             let started_at = tokio::time::Instant::now();
-            store.wait_for_events_filtered(
-                actor,
-                EventWaitOptions {
-                    cursor,
-                    consumer_key: consumer_key.as_deref(),
-                    kinds: &kinds,
-                    feature_id,
-                    owner_repository_id,
-                    timeout: Duration::from_secs(effective_timeout_seconds),
-                    limit,
-                },
-            )
-            .await
-            .map(|value| {
-                json!({
-                    "outcome": value.outcome,
-                    "events": value.events,
-                    "next_cursor": value.next_cursor,
-                    "has_more": value.has_more,
-                    "consumer_key": consumer_key,
-                    "requested_timeout_seconds": requested_timeout_seconds,
-                    "effective_timeout_seconds": effective_timeout_seconds,
-                    "elapsed_ms": u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-                })
-            })
+            let span = tracing::Span::current();
+            span.record(
+                "wait_requested_timeout_seconds",
+                requested_timeout_seconds.unwrap_or(effective_timeout_seconds),
+            );
+            span.record("wait_effective_timeout_seconds", effective_timeout_seconds);
+            let wait_result = store
+                .wait_for_events_filtered(
+                    actor,
+                    EventWaitOptions {
+                        cursor,
+                        consumer_key: consumer_key.as_deref(),
+                        kinds: &kinds,
+                        feature_id,
+                        owner_repository_id,
+                        timeout: Duration::from_secs(effective_timeout_seconds),
+                        limit,
+                    },
+                )
+                .await;
+            let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            span.record("wait_elapsed_ms", elapsed_ms);
+            match wait_result {
+                Ok(value) => {
+                    let exit_reason = match value.outcome {
+                        WaitOutcome::Events => "events",
+                        WaitOutcome::Deadline => "deadline",
+                    };
+                    span.record("wait_end_cursor", value.next_cursor);
+                    span.record("wait_event_count", value.events.len());
+                    span.record("wait_exit_reason", exit_reason);
+                    Ok(json!({
+                        "outcome": value.outcome,
+                        "events": value.events,
+                        "next_cursor": value.next_cursor,
+                        "has_more": value.has_more,
+                        "consumer_key": consumer_key,
+                        "requested_timeout_seconds": requested_timeout_seconds,
+                        "effective_timeout_seconds": effective_timeout_seconds,
+                        "elapsed_ms": elapsed_ms,
+                    }))
+                }
+                Err(error) => {
+                    span.record("wait_exit_reason", "error");
+                    Err(error)
+                }
+            }
         }
         "get_event_checkpoint" => {
             let actor = parse_actor(&arguments)?;
@@ -985,7 +1007,13 @@ pub(super) async fn read_resource(
                     "maintenance": "A frequent indexed lease/session sweep disconnects expired actors and requeues expired request claims. Retention is disabled by default; when configured, each pass deletes at most 1000 old events and 1000 idempotency records.",
                     "shutdown": "Graceful shutdown stops accepting calls, cancels session waiters and expires local actor and claim leases."
                 },
-                "current_scope": "Project/repository presence, feature/work graph with optimistic revisions and claims, linked worker/audit runs, bounded recovery/history discovery, immutable messaging/artifacts, reliable delivery, compact filterable event headers and claimed repository requests.",
+                "observability": {
+                    "request_span": "Every parsed JSON-RPC call emits one INFO completion event inside an mcp_request span. The span separates rpc_request_id from coordination_request_id and adds resolved project_id/repository_id after authorization.",
+                    "completion_fields": ["duration_ms", "outcome", "error_code"],
+                    "wait_fields": ["wait_requested_timeout_seconds", "wait_effective_timeout_seconds", "wait_start_cursor", "wait_end_cursor", "wait_event_count", "wait_elapsed_ms", "wait_exit_reason"],
+                    "maintenance": "Zero-change lease passes are DEBUG; INFO is emitted only when state is reaped or requeued."
+                },
+                "current_scope": "Project/repository presence, feature/work graph with optimistic revisions and claims, linked worker/audit runs, bounded recovery/history discovery, immutable messaging/artifacts, reliable delivery, compact routed event headers, correlated request tracing and claimed repository requests.",
                 "resource_scope": "Feature and work-item cards are addressable resources. Actor-sensitive inbox, message and artifact reads remain tools so producer, delivery, request-participant and project-shared-link authorization receive explicit actor identity.",
             }),
         ));
