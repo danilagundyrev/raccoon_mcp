@@ -329,29 +329,23 @@ impl SqliteStore {
         let now = utc_now();
         let actor = self.resolve_actor_readonly(actor_ref, &now).await?;
 
-        let row = sqlx::query(
-            "SELECT a.* FROM artifacts a
-             WHERE a.artifact_id = ?
-                AND (a.producer_repository_id = ? OR EXISTS (
-                    SELECT 1
-                    FROM messages m
-                    JOIN deliveries d ON d.message_id = m.message_id
-                    WHERE m.artifact_id = a.artifact_id
-                      AND d.recipient_repository_id = ?
-                ) OR EXISTS (
-                    SELECT 1 FROM requests q
-                    WHERE q.question_artifact_id = a.artifact_id
-                      AND (q.requester_repository_id = ? OR q.target_repository_id = ?)
-                ))",
-        )
-        .bind(artifact_id.to_string())
-        .bind(actor.repository_id.to_string())
-        .bind(actor.repository_id.to_string())
-        .bind(actor.repository_id.to_string())
-        .bind(actor.repository_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound(format!("accessible artifact {artifact_id}")))?;
+        let mut query =
+            QueryBuilder::<Sqlite>::new("SELECT a.* FROM artifacts a WHERE a.artifact_id = ");
+        query
+            .push_bind(artifact_id.to_string())
+            .push(" AND a.project_id = ")
+            .push_bind(actor.project_id.to_string())
+            .push(" AND ");
+        push_artifact_access_predicate(
+            &mut query,
+            actor.repository_id,
+            actor.instance_id.is_some(),
+        );
+        let row = query
+            .build()
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("accessible artifact {artifact_id}")))?;
         artifact_from_row(&row)
     }
 

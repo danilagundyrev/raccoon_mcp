@@ -2,7 +2,10 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ArtifactId, FeatureId, InstanceId, ProjectId, RepositoryId, WorkItemId, WorkerRunId};
+use super::{
+    ArtifactId, FeatureId, InstanceId, ProjectId, RepositoryId, WorkItemId,
+    WorkItemWorkerProjection, WorkerRunId,
+};
 
 #[derive(Clone, Debug)]
 pub struct CreateFeature {
@@ -253,6 +256,7 @@ pub struct WorkItem {
     pub implementation_artifact_id: Option<ArtifactId>,
     pub latest_audit_artifact_id: Option<ArtifactId>,
     pub verification_status: Option<VerificationStatus>,
+    pub worker_projection: Option<WorkItemWorkerProjection>,
     pub created_at: String,
     pub updated_at: String,
     pub finished_at: Option<String>,

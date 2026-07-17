@@ -22,22 +22,27 @@ use tokio::{
 
 use crate::domain::{
     ActorRef, AgentInstance, AnswerRequest, AnswerRequestResult, AnswerRequirement, Artifact,
-    ArtifactId, ArtifactKind, AskRepository, AuditOutcomeInput, AuditScopeItem, AuditVerdict,
-    CancelFeature, CompleteFeature, ConnectOrchestrator, ConnectResult, CoordinationRequest,
-    CreateFeature, CreateWorkItem, CreateWorkerRun, DeliveryAck, EventBatch, EventEntityType,
-    EventKind, FailRequest, Feature, FeatureId, FeatureStatus, HandlerRequirement, HubEvent,
-    InboxItem, InboxPage, IncreaseAuditDepth, InstanceId, LeaseMaintenanceReport,
-    MAX_AUDIT_WORK_ITEMS, MAX_CONTEXT_REFS, MAX_MESSAGE_RECIPIENTS, MAX_WORK_ITEM_DEPENDENCIES,
-    Message, MessageId, MessageKind, MessageTarget, OperationalMetrics, PresenceStatus, Project,
+    ArtifactId, ArtifactKind, ArtifactListFilter, ArtifactMetadata, ArtifactPage, AskRepository,
+    AuditOutcomeInput, AuditScopeItem, AuditVerdict, CancelFeature, CompleteFeature,
+    ConnectOrchestrator, ConnectResult, CoordinationRequest, CreateFeature, CreateWorkItem,
+    CreateWorkerRun, DeliveryAck, DeliveryHistoryItem, DeliveryListStatus, DeliveryPage,
+    EventBatch, EventCheckpoint, EventEntityType, EventKind, FailRequest, Feature, FeatureId,
+    FeaturePage, FeatureStatus, HandlerRequirement, HubEvent, InboxItem, InboxPage,
+    IncreaseAuditDepth, InstanceId, LeaseMaintenanceReport, MAX_AUDIT_WORK_ITEMS, MAX_CONTEXT_REFS,
+    MAX_MESSAGE_RECIPIENTS, MAX_WORK_ITEM_DEPENDENCIES, Message, MessageId, MessageKind,
+    MessageListFilter, MessagePage, MessageTarget, OperationalMetrics, PresenceStatus, Project,
     ProjectId, ProjectOverview, PublishMessage, PublishResult, Repository, RepositoryId,
-    RepositoryPresence, RepositoryPresenceFilter, RequestId, RequestStatus, RetentionReport,
-    ThreadId, UpdateWorkItem, VerificationStatus, WaitOutcome, WorkItem, WorkItemId, WorkItemKind,
-    WorkItemPage, WorkItemStatus, WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
+    RepositoryPresence, RepositoryPresenceFilter, RequestId, RequestListFilter, RequestPage,
+    RequestStatus, RequestSummary, RetentionReport, ThreadId, UpdateWorkItem, VerificationStatus,
+    WaitOutcome, WorkItem, WorkItemId, WorkItemKind, WorkItemPage, WorkItemStatus,
+    WorkItemWorkerProjection, WorkerRole, WorkerRun, WorkerRunId, WorkerRunListFilter,
+    WorkerRunPage, WorkerRunStatus, WorkerRunSummary,
 };
 
 use super::schema::{CREATE_SCHEMA, SCHEMA_VERSION};
 
 mod events;
+mod history;
 mod messages;
 mod operations;
 mod presence;
@@ -364,6 +369,64 @@ fn trace_resolved_actor(actor: &ResolvedActor) {
         worker_run_id = actor.worker_run_id.map(|id| id.to_string()).unwrap_or_default(),
         "actor resolved"
     );
+}
+
+fn validate_history_limit(limit: u8) -> Result<(), StoreError> {
+    if (1..=50).contains(&limit) {
+        Ok(())
+    } else {
+        Err(StoreError::Conflict(
+            "history page limit must be between 1 and 50".to_owned(),
+        ))
+    }
+}
+
+fn push_artifact_access_predicate<'a>(
+    query: &mut QueryBuilder<'a, Sqlite>,
+    repository_id: RepositoryId,
+    allow_project_shared: bool,
+) {
+    query
+        .push("(a.producer_repository_id = ")
+        .push_bind(repository_id.to_string())
+        .push(
+            " OR EXISTS (
+                SELECT 1 FROM messages access_message JOIN deliveries access_delivery
+                  ON access_delivery.message_id = access_message.message_id
+                WHERE access_message.artifact_id = a.artifact_id
+                  AND access_message.project_id = a.project_id
+                  AND access_delivery.recipient_repository_id = ",
+        )
+        .push_bind(repository_id.to_string())
+        .push(
+            ") OR EXISTS (SELECT 1 FROM requests access_request
+                WHERE access_request.question_artifact_id = a.artifact_id
+                  AND access_request.project_id = a.project_id
+                  AND (access_request.requester_repository_id = ",
+        )
+        .push_bind(repository_id.to_string())
+        .push(" OR access_request.target_repository_id = ")
+        .push_bind(repository_id.to_string())
+        .push("))");
+    if allow_project_shared {
+        query.push(
+            " OR EXISTS (
+                SELECT 1 FROM work_items shared_item
+                JOIN features shared_feature ON shared_feature.feature_id = shared_item.feature_id
+                WHERE (shared_item.implementation_artifact_id = a.artifact_id
+                       OR shared_item.latest_audit_artifact_id = a.artifact_id)
+                  AND shared_feature.project_id = a.project_id
+            ) OR EXISTS (
+                SELECT 1 FROM messages shared_message
+                WHERE shared_message.artifact_id = a.artifact_id
+                  AND shared_message.project_id = a.project_id
+                  AND shared_message.request_id IS NULL
+                  AND (shared_message.feature_id IS NOT NULL
+                       OR shared_message.work_item_id IS NOT NULL)
+            )",
+        );
+    }
+    query.push(")");
 }
 
 async fn wait_until(deadline: Instant) {

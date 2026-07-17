@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 
 use super::{ProjectId, RepositoryId};
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventCheckpoint {
+    pub repository_id: RepositoryId,
+    pub consumer_key: String,
+    pub cursor: i64,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {

@@ -128,6 +128,22 @@ pub(super) fn optional_idempotency_key(
     Ok(value)
 }
 
+pub(super) fn optional_consumer_key(
+    arguments: &JsonMap<String, Value>,
+) -> Result<Option<String>, RpcError> {
+    optional_string(arguments, "consumer_key")?
+        .map(|value| validate_key("consumer_key", &value).map_err(invalid_argument))
+        .transpose()
+}
+
+pub(super) fn required_consumer_key(
+    arguments: &JsonMap<String, Value>,
+) -> Result<String, RpcError> {
+    optional_consumer_key(arguments)?.ok_or_else(|| {
+        invalid_argument("'consumer_key' is required and must be a valid key".to_owned())
+    })
+}
+
 pub(super) fn optional_nonnegative_i64(
     arguments: &JsonMap<String, Value>,
     field_name: &str,
@@ -207,6 +223,51 @@ pub(super) fn optional_feature_id(
 ) -> Result<Option<FeatureId>, RpcError> {
     optional_string(arguments, field_name)?
         .map(|value| FeatureId::parse(&value).map_err(invalid_uuid))
+        .transpose()
+}
+
+pub(super) fn optional_repository_id(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<RepositoryId>, RpcError> {
+    optional_string(arguments, field_name)?
+        .map(|value| RepositoryId::parse(&value).map_err(invalid_uuid))
+        .transpose()
+}
+
+pub(super) fn optional_worker_run_id(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<WorkerRunId>, RpcError> {
+    optional_string(arguments, field_name)?
+        .map(|value| WorkerRunId::parse(&value).map_err(invalid_uuid))
+        .transpose()
+}
+
+pub(super) fn optional_message_id(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<MessageId>, RpcError> {
+    optional_string(arguments, field_name)?
+        .map(|value| MessageId::parse(&value).map_err(invalid_uuid))
+        .transpose()
+}
+
+pub(super) fn optional_artifact_id(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<ArtifactId>, RpcError> {
+    optional_string(arguments, field_name)?
+        .map(|value| ArtifactId::parse(&value).map_err(invalid_uuid))
+        .transpose()
+}
+
+pub(super) fn optional_thread_id(
+    arguments: &JsonMap<String, Value>,
+    field_name: &str,
+) -> Result<Option<ThreadId>, RpcError> {
+    optional_string(arguments, field_name)?
+        .map(|value| ThreadId::parse(&value).map_err(invalid_uuid))
         .transpose()
 }
 
@@ -327,6 +388,18 @@ pub(super) fn optional_limit(arguments: &JsonMap<String, Value>) -> Result<Optio
     }
 }
 
+pub(super) fn optional_history_limit(
+    arguments: &JsonMap<String, Value>,
+) -> Result<Option<u8>, RpcError> {
+    match optional_nonnegative_i64(arguments, "limit")? {
+        None => Ok(None),
+        Some(value @ 1..=50) => Ok(Some(value as u8)),
+        Some(_) => Err(invalid_argument(
+            "'limit' must be between 1 and 50 for discovery lists".to_owned(),
+        )),
+    }
+}
+
 pub(super) fn optional_event_limit(
     arguments: &JsonMap<String, Value>,
 ) -> Result<Option<u8>, RpcError> {
@@ -357,7 +430,7 @@ pub(super) fn optional_event_kinds(
     match arguments.get("kinds") {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(values)) => {
-            ensure_array_limit("kinds", values.len(), 15)?;
+            ensure_array_limit("kinds", values.len(), 16)?;
             let kinds = values
                 .iter()
                 .map(|value| {

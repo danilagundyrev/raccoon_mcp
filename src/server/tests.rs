@@ -174,6 +174,8 @@ fn event_wait_schema_has_explicit_finite_timeout_contract() {
     let schema = wait_for_events_schema(60);
     assert_eq!(schema["properties"]["limit"]["maximum"], 50);
     assert_eq!(schema["properties"]["timeout_seconds"]["maximum"], 60);
+    assert_eq!(schema["properties"]["consumer_key"]["maxLength"], 64);
+    assert!(schema["properties"]["cursor"].get("default").is_none());
     assert!(
         schema["properties"]["timeout_seconds"]
             .get("default")
@@ -184,6 +186,19 @@ fn event_wait_schema_has_explicit_finite_timeout_contract() {
     assert_eq!(dispatch::effective_wait_seconds(Some(0), 60), 0);
 
     let tools = tool_definitions(1024, 524_288, 60);
+    for expected in ["get_event_checkpoint", "commit_event_cursor"] {
+        assert!(
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == expected)
+        );
+    }
+    assert_eq!(
+        event_checkpoint_schema(true)["required"],
+        json!(["consumer_key", "cursor"])
+    );
     assert!(tools.as_array().unwrap().iter().any(|tool| {
         tool["name"] == "wait_for_events"
             && tool["annotations"]["readOnlyHint"] == Value::Bool(false)
@@ -591,7 +606,7 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
         "accepted without a response body"
     );
     assert_eq!(guide_payload["collection_limits"]["event_page"], 50);
-    assert_eq!(guide_payload["collection_limits"]["event_kind_filters"], 15);
+    assert_eq!(guide_payload["collection_limits"]["event_kind_filters"], 16);
     assert!(
         guide_payload["work_flow"]
             .as_array()
@@ -1226,6 +1241,11 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
         "claim_work_item",
         "renew_work_item_claim",
         "release_work_item_claim",
+        "list_worker_runs",
+        "list_requests",
+        "list_deliveries",
+        "list_messages",
+        "list_artifacts",
     ] {
         assert!(names.contains(expected));
     }
@@ -1247,6 +1267,30 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
             .as_str()
             .unwrap()
             .contains("audit_report")
+    );
+    let list_artifacts_tool = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "list_artifacts")
+        .unwrap();
+    assert!(
+        list_artifacts_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("project-shared")
+    );
+    let read_artifact_tool = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "read_artifact")
+        .unwrap();
+    assert!(
+        read_artifact_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("workers retain narrower")
     );
     assert!(
         update["properties"]["implementation_artifact_id"]["description"]
@@ -1287,6 +1331,21 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
     let list = list_work_items_schema();
     assert_eq!(list["properties"]["limit"]["maximum"], 100);
     assert_eq!(list["properties"]["after_work_item_id"]["format"], "uuid");
+    for schema in [
+        list_features_schema(),
+        list_worker_runs_schema(),
+        list_requests_schema(),
+        list_deliveries_schema(),
+        list_messages_schema(),
+        list_artifacts_schema(),
+    ] {
+        assert_eq!(schema["properties"]["limit"]["default"], 20);
+        assert_eq!(schema["properties"]["limit"]["maximum"], 50);
+    }
+    assert_eq!(
+        list_deliveries_schema()["properties"]["status"]["enum"],
+        json!(["pending", "acknowledged", "all"])
+    );
     assert_eq!(
         list_repositories_schema()["properties"]["presence_filter"]["enum"],
         json!(["all", "online", "offline"])

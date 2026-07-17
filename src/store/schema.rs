@@ -549,6 +549,15 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS event_consumers (
+    repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+    consumer_key TEXT NOT NULL,
+    cursor INTEGER NOT NULL CHECK(cursor >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(repository_id, consumer_key)
+);
+
 CREATE INDEX IF NOT EXISTS events_repository_cursor_idx
     ON events(recipient_repository_id, event_id);
 

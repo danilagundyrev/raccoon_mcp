@@ -35,7 +35,7 @@ pub(super) async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use bounded list_work_items pages and expected_revision, and claim an owner-repository item before creating its matching worker run. Spawn a fresh executor child for each independent implementation WorkItem; same-lineage remediation may reuse that child context but always gets a new worker_run_id. Audit cards use fresh auditor children with no executor/remediation conversation history and carry repository-local scope. Every audit_report includes exact structured audit_outcomes; remediation requires a later fresh passing audit, and Feature completion requires verified coverage for every accepted implementation report. Workers never register as repositories. Use ask_repository for durable questions: orchestrator_allowed permits an answer from coordination state already in hand, while butler_required can be claimed and answered only by a fresh request-scoped butler linked through request_id. Use actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for finite repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. JSON-RPC batches are not supported.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, retain snapshot_event_cursor, then read hub://guide for the complete machine-readable workflow. Recover durable state through bounded list_features, list_work_items, list_worker_runs, list_requests, list_deliveries, list_messages and metadata-only list_artifacts pages; then wait strictly after the snapshot watermark. Same-project orchestrators may recover accepted WorkItem reports and non-request artifacts explicitly linked to a Feature/WorkItem; unlinked and request artifacts retain their narrower authorization. Events are wake-up hints, not the source of truth. Named repository event consumers use get_event_checkpoint and explicit monotonic commit_event_cursor; returned pages never auto-commit. Model shared work with create_feature/create_work_item and expected_revision, and claim an owner-repository item before creating its matching worker run. Spawn a fresh executor child for each independent implementation WorkItem; same-lineage remediation may reuse that child context but always gets a new worker_run_id. Audit cards use fresh auditor children with no executor/remediation conversation history and carry repository-local scope. Every audit_report includes exact structured audit_outcomes; remediation requires a later fresh passing audit, and Feature completion requires verified coverage for every accepted implementation report. Workers never register as repositories. Use ask_repository for durable questions: orchestrator_allowed permits an answer from coordination state already in hand, while butler_required can be claimed and answered only by a fresh request-scoped butler linked through request_id. Use actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for finite repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. JSON-RPC batches are not supported.",
             }))
         }
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
@@ -250,8 +250,13 @@ pub(super) async fn call_tool(
         }
         "list_features" => {
             let project_id = parse_project_id(&arguments)?;
+            let status = optional_string(&arguments, "status")?
+                .map(|value| value.parse::<FeatureStatus>().map_err(invalid_argument))
+                .transpose()?;
+            let after_feature_id = optional_feature_id(&arguments, "after_feature_id")?;
+            let limit = optional_history_limit(&arguments)?.unwrap_or(20);
             store
-                .list_features(project_id)
+                .list_features(project_id, status, after_feature_id, limit)
                 .await
                 .map(|features| json!({ "project_id": project_id, "features": features }))
         }
@@ -506,16 +511,18 @@ pub(super) async fn call_tool(
         }
         "wait_for_events" => {
             let actor = parse_actor(&arguments)?;
-            let cursor = optional_nonnegative_i64(&arguments, "cursor")?.unwrap_or(0);
+            let cursor = optional_nonnegative_i64(&arguments, "cursor")?;
+            let consumer_key = optional_consumer_key(&arguments)?;
             let kinds = optional_event_kinds(&arguments)?;
             let requested_timeout_seconds = optional_timeout_seconds(&arguments)?;
             let effective_timeout_seconds =
                 effective_wait_seconds(requested_timeout_seconds, max_wait_seconds);
             let limit = optional_event_limit(&arguments)?.unwrap_or(20);
             let started_at = tokio::time::Instant::now();
-            store.wait_for_events(
+            store.wait_for_events_from(
                 actor,
                 cursor,
+                consumer_key.as_deref(),
                 &kinds,
                 Duration::from_secs(effective_timeout_seconds),
                 limit,
@@ -527,11 +534,33 @@ pub(super) async fn call_tool(
                     "events": value.events,
                     "next_cursor": value.next_cursor,
                     "has_more": value.has_more,
+                    "consumer_key": consumer_key,
                     "requested_timeout_seconds": requested_timeout_seconds,
                     "effective_timeout_seconds": effective_timeout_seconds,
                     "elapsed_ms": u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
                 })
             })
+        }
+        "get_event_checkpoint" => {
+            let actor = parse_actor(&arguments)?;
+            let consumer_key = required_consumer_key(&arguments)?;
+            store
+                .get_event_checkpoint(actor, &consumer_key)
+                .await
+                .map(|value| json!(value))
+        }
+        "commit_event_cursor" => {
+            let actor = parse_actor(&arguments)?;
+            let consumer_key = required_consumer_key(&arguments)?;
+            let cursor = optional_nonnegative_i64(&arguments, "cursor")?.ok_or_else(|| {
+                invalid_argument(
+                    "'cursor' is required and must be a non-negative integer".to_owned(),
+                )
+            })?;
+            store
+                .commit_event_cursor(actor, &consumer_key, cursor)
+                .await
+                .map(|value| json!(value))
         }
         "ask_repository" => {
             let actor = parse_actor(&arguments)?;
@@ -651,6 +680,121 @@ pub(super) async fn call_tool(
                 .await
                 .map(|value| json!(value))
         }
+        "list_worker_runs" => {
+            let actor = parse_actor(&arguments)?;
+            let filter = WorkerRunListFilter {
+                repository_id: optional_repository_id(&arguments, "repository_id")?,
+                feature_id: optional_feature_id(&arguments, "feature_id")?,
+                work_item_id: optional_work_item_id(&arguments, "work_item_id")?,
+                role: optional_string(&arguments, "role")?
+                    .map(|value| value.parse::<WorkerRole>().map_err(invalid_argument))
+                    .transpose()?,
+                status: optional_string(&arguments, "status")?
+                    .map(|value| value.parse::<WorkerRunStatus>().map_err(invalid_argument))
+                    .transpose()?,
+                addresses_audit_run_id: optional_worker_run_id(
+                    &arguments,
+                    "addresses_audit_run_id",
+                )?,
+            };
+            let cursor = optional_worker_run_id(&arguments, "after_worker_run_id")?;
+            let limit = optional_history_limit(&arguments)?.unwrap_or(20);
+            store
+                .list_worker_runs(actor, filter, cursor, limit)
+                .await
+                .map(|value| json!(value))
+        }
+        "list_requests" => {
+            let actor = parse_actor(&arguments)?;
+            let filter = RequestListFilter {
+                requester_repository_id: optional_repository_id(
+                    &arguments,
+                    "requester_repository_id",
+                )?,
+                target_repository_id: optional_repository_id(&arguments, "target_repository_id")?,
+                feature_id: optional_feature_id(&arguments, "feature_id")?,
+                work_item_id: optional_work_item_id(&arguments, "work_item_id")?,
+                status: optional_string(&arguments, "status")?
+                    .map(|value| value.parse::<RequestStatus>().map_err(invalid_argument))
+                    .transpose()?,
+            };
+            let cursor = optional_request_id(&arguments, "after_request_id")?;
+            let limit = optional_history_limit(&arguments)?.unwrap_or(20);
+            store
+                .list_requests(actor, filter, cursor, limit)
+                .await
+                .map(|value| json!(value))
+        }
+        "list_deliveries" => {
+            let actor = parse_actor(&arguments)?;
+            let status = match optional_string(&arguments, "status")?.as_deref() {
+                None | Some("all") => DeliveryListStatus::All,
+                Some("pending") => DeliveryListStatus::Pending,
+                Some("acknowledged") => DeliveryListStatus::Acknowledged,
+                Some(value) => {
+                    return Err(invalid_argument(format!(
+                        "unknown delivery status '{value}'"
+                    )));
+                }
+            };
+            let cursor = optional_nonnegative_i64(&arguments, "after_delivery_id")?;
+            let limit = optional_history_limit(&arguments)?.unwrap_or(20);
+            store
+                .list_deliveries(actor, status, cursor, limit)
+                .await
+                .map(|value| json!(value))
+        }
+        "list_messages" => {
+            let actor = parse_actor(&arguments)?;
+            let filter = MessageListFilter {
+                feature_id: optional_feature_id(&arguments, "feature_id")?,
+                work_item_id: optional_work_item_id(&arguments, "work_item_id")?,
+                request_id: optional_request_id(&arguments, "request_id")?,
+                thread_id: optional_thread_id(&arguments, "thread_id")?,
+                kind: optional_string(&arguments, "kind")?
+                    .map(|value| value.parse::<MessageKind>().map_err(invalid_argument))
+                    .transpose()?,
+                producer_repository_id: optional_repository_id(
+                    &arguments,
+                    "producer_repository_id",
+                )?,
+                recipient_repository_id: optional_repository_id(
+                    &arguments,
+                    "recipient_repository_id",
+                )?,
+            };
+            let cursor = optional_message_id(&arguments, "after_message_id")?;
+            let limit = optional_history_limit(&arguments)?.unwrap_or(20);
+            store
+                .list_messages(actor, filter, cursor, limit)
+                .await
+                .map(|value| json!(value))
+        }
+        "list_artifacts" => {
+            let actor = parse_actor(&arguments)?;
+            let filter = ArtifactListFilter {
+                kind: optional_string(&arguments, "kind")?
+                    .map(|value| value.parse::<ArtifactKind>().map_err(invalid_argument))
+                    .transpose()?,
+                feature_id: optional_feature_id(&arguments, "feature_id")?,
+                work_item_id: optional_work_item_id(&arguments, "work_item_id")?,
+                request_id: optional_request_id(&arguments, "request_id")?,
+                producer_repository_id: optional_repository_id(
+                    &arguments,
+                    "producer_repository_id",
+                )?,
+                producer_worker_run_id: optional_worker_run_id(
+                    &arguments,
+                    "producer_worker_run_id",
+                )?,
+            };
+            let cursor = optional_artifact_id(&arguments, "after_artifact_id")?;
+            let limit = optional_history_limit(&arguments)?.unwrap_or(20);
+            store
+                .list_artifacts(actor, filter, cursor, limit)
+                .await
+                .map(|value| json!(value))
+        }
         "read_message" => {
             let actor = parse_actor(&arguments)?;
             let message_id = parse_message_id(&arguments)?;
@@ -738,7 +882,7 @@ pub(super) async fn read_resource(
                     "work_item_dependencies": MAX_WORK_ITEM_DEPENDENCIES,
                     "message_recipients": MAX_MESSAGE_RECIPIENTS,
                     "event_page": 50,
-                    "event_kind_filters": 15,
+                    "event_kind_filters": 16,
                     "inbox_page": 100,
                     "inbox_kind_filters": 3,
                     "work_item_page": 100
@@ -773,6 +917,15 @@ pub(super) async fn read_resource(
                     "The feature coordinator repository calls complete_feature with its current revision only after durable linked work, requests and every linked worker are terminal, including a butler whose request is already answered; cancel_feature closes abandoned work under its stricter safety checks.",
                     "Peer repositories stop waiting on feature_completed or feature_cancelled for the current feature and call disconnect_orchestrator before exit. MCP session DELETE is transport cleanup, not the durable completion signal."
                 ],
+                "recovery_flow": [
+                    "Retain connect_orchestrator.snapshot_event_cursor before reading recovery pages. It is captured in the same transaction as bootstrap counters and repository presence.",
+                    "Treat durable list APIs as the source of truth and events only as wake-up hints. Use list_features(status, after_feature_id, limit) and list_work_items to recover the work graph without remembered entity IDs.",
+                    "Use actor-scoped list_worker_runs, list_requests, list_deliveries, list_messages and list_artifacts pages to recover execution and communication history. Their default page size is 20 and maximum is 50.",
+                    "list_artifacts returns metadata only; load selected bodies with read_artifact after actor-scoped authorization. Same-project orchestrators can recover accepted WorkItem reports and explicitly linked non-request coordination artifacts.",
+                    "get_work_item includes the active or latest worker projection so a replacement orchestrator can resume the correct run lineage.",
+                    "Continue each page with its next_cursor while has_more is true, retaining the same filters between pages. Then call wait_for_events with cursor=snapshot_event_cursor and reconcile newer events.",
+                    "For durable event progress, choose a repository-local consumer_key. get_event_checkpoint reads it, wait_for_events uses it only when cursor is omitted, and commit_event_cursor advances it monotonically after processing. The server never auto-commits."
+                ],
                 "audit_flow": [
                     "Create one kind=audit work item in the repository that owns every completed implementation in audit_scope_work_item_ids; split cross-repository batches.",
                     "The owner repository claims the audit card and spawns a fresh auditor child with no executor or remediation conversation history, linked by work_item_id. Pass only specification, acceptance criteria, IDs, artifact references and current repository state; scope and iteration are derived from the card.",
@@ -793,11 +946,19 @@ pub(super) async fn read_resource(
                 "messaging_flow": [
                     "Publish an immutable summary and optional artifact with publish_message.",
                     "Supply an actor-scoped idempotency_key to creation calls that may be retried; the same key requires an identical payload.",
-                    "Call wait_for_events with the last event cursor. Every call is finite: omitted or oversized timeout_seconds uses the configured maximum, while zero performs a non-blocking check. The server renews the waiting actor lease.",
-                    "Use list_inbox to read pending headers without artifact bodies.",
+                    "Call wait_for_events with an explicit last event cursor or a consumer_key whose checkpoint should be used. Explicit cursor wins. Every call is finite and never auto-commits; call commit_event_cursor only after processing.",
+                    "Use list_inbox for pending headers; use list_deliveries when acknowledged history is also needed.",
+                    "Use list_messages and metadata-only list_artifacts to recover accessible history without loading bodies.",
                     "Use the kinds filter to select report, announcement or command headers.",
                     "Use read_message/read_artifact only for selected items.",
                     "Call ack_message after processing; broadcast recipients acknowledge independently."
+                ],
+                "artifact_access": [
+                    "An artifact accepted as a WorkItem implementation report or latest audit report is project-shared for orchestrators in that project.",
+                    "Attaching feature_id or work_item_id to a non-request message explicitly declares its artifact project-shared for same-project orchestrators.",
+                    "An unlinked message artifact remains limited to its producer repository and message recipients.",
+                    "Request question and answer artifacts remain limited to requester, target and producer even when the request also links a Feature or WorkItem.",
+                    "Worker actors do not inherit project-wide shared-artifact access; they retain repository/run-scoped authorization."
                 ],
                 "operations": {
                     "health": "GET /healthz checks the HTTP process without depending on SQLite.",
@@ -806,8 +967,8 @@ pub(super) async fn read_resource(
                     "maintenance": "A frequent indexed lease/session sweep disconnects expired actors and requeues expired request claims. Retention is disabled by default; when configured, each pass deletes at most 1000 old events and 1000 idempotency records.",
                     "shutdown": "Graceful shutdown stops accepting calls, cancels session waiters and expires local actor and claim leases."
                 },
-                "current_scope": "Project/repository presence, feature/work graph with optimistic revisions and claims, linked worker/audit runs, immutable messaging/artifacts, reliable delivery, event waiting and claimed repository requests.",
-                "resource_scope": "Feature and work-item cards are addressable resources. Actor-sensitive inbox, message and artifact reads remain tools so repository access checks receive explicit actor identity.",
+                "current_scope": "Project/repository presence, feature/work graph with optimistic revisions and claims, linked worker/audit runs, bounded recovery/history discovery, immutable messaging/artifacts, reliable delivery, event waiting and claimed repository requests.",
+                "resource_scope": "Feature and work-item cards are addressable resources. Actor-sensitive inbox, message and artifact reads remain tools so producer, delivery, request-participant and project-shared-link authorization receive explicit actor identity.",
             }),
         ));
     }

@@ -159,6 +159,7 @@ Keep the returned IDs in the agent's working context:
 - `instance.instance_id`;
 - IDs of the peer repositories;
 - `active_feature_count`, `pending_inbox_count`, and `open_request_count`.
+- `snapshot_event_cursor`, the event watermark captured with those bootstrap values.
 
 For a normal fresh process, omit `instance_id`. To reconnect a known instance, pass its previously returned ID. Never invent IDs or reuse an ID of another entity.
 
@@ -505,6 +506,18 @@ Example filtered inbox:
 
 Acknowledgement closes a delivery for one repository. It does not delete the message or artifact.
 
+### Artifact access
+
+Artifact bodies always require an actor-scoped `read_artifact` call. Authorization depends on how the artifact participates in coordination:
+
+- an artifact accepted as a WorkItem's `implementation_artifact_id` or `latest_audit_artifact_id` is readable by orchestrators in the same project;
+- adding `feature_id` or `work_item_id` to a non-request message explicitly makes its artifact project-shared for same-project orchestrators;
+- an unlinked message artifact remains readable only by its producer repository and message recipients;
+- request question and answer artifacts remain limited to the requester, target, and producer even when the request links a Feature or WorkItem;
+- worker actors keep repository/run-scoped access and do not inherit orchestrator-wide project visibility.
+
+`list_artifacts` applies the same rules and returns metadata only. Linking a normal message to a Feature or WorkItem is therefore an authorization decision, not just a tracing label. Use no typed link for repository-private content, and use `request_id` for participant-private question/answer content.
+
 ## Audits and remediation
 
 Set `max_audit_iterations` on an implementation work item to a value from 1 to 10. The default is 2: one initial audit and room for one post-remediation audit.
@@ -602,6 +615,22 @@ The repository that created a feature is its coordinator. After durable work sta
 
 Peer repositories stop their wait loop when they receive `feature_completed` or `feature_cancelled` for the current feature. A repository that joins later reads the durable terminal status through `get_feature` or `list_features`; events are wake-up hints, not the source of truth. Every orchestrator calls `disconnect_orchestrator` before it exits. MCP session DELETE is transport cleanup, not the shared completion signal.
 
+## Recovering durable state
+
+A new or replacement orchestrator does not need remembered entity IDs. After connecting:
+
+1. retain the returned `snapshot_event_cursor`;
+2. page through `list_features`, optionally filtering by `active`;
+3. page through `list_work_items` for relevant features;
+4. use `list_worker_runs` and `list_requests` to recover execution and question state;
+5. use `list_deliveries` for mailbox history and `list_messages` for linked headers;
+6. use `list_artifacts` to find metadata, then selectively call `read_artifact`;
+7. call `wait_for_events` with `cursor: snapshot_event_cursor` and reconcile newer events.
+
+The new history lists default to 20 rows and allow at most 50. Continue with the returned `next_cursor` while `has_more` is true and retain the same filters between pages. `get_work_item.worker_projection` identifies the active or latest linked run with role, status, heartbeat, and lease timestamps.
+
+Durable queries are the source of truth. Events only tell an orchestrator that it should reconcile state.
+
 ## Events and cursors
 
 `wait_for_events` is the primary waiting mechanism. It returns only events addressed to the actor's repository.
@@ -618,14 +647,19 @@ Peer repositories stop their wait loop when they receive `feature_completed` or 
 
 Rules:
 
-- `cursor` is the last processed event ID; use `0` initially;
-- persist `next_cursor` after every response;
+- an explicit `cursor` is the last processed event ID;
+- when `cursor` is omitted and `consumer_key` is supplied, the named checkpoint is used;
+- when both are omitted, the wait starts at `0`; when both are supplied, explicit `cursor` wins;
+- a returned page never changes a named checkpoint automatically;
+- call `commit_event_cursor` with `next_cursor` only after processing the page;
 - `timeout_seconds: 0` performs a non-blocking check;
 - omitting `timeout_seconds` uses the configured `--max-wait-seconds` ceiling;
 - a value above that ceiling is clamped and reported in `effective_timeout_seconds`;
 - `outcome: "deadline"` is a normal empty result, not completion or an error;
 - each response reports `requested_timeout_seconds`, `effective_timeout_seconds`, and `elapsed_ms`;
 - when `has_more` is true, fetch the next page immediately using the new cursor.
+
+Named consumers are scoped by `(repository_id, consumer_key)`. Two orchestrators in one repository should use different keys unless they intentionally share progress. `get_event_checkpoint` returns cursor `0` for a new key without creating it. Commits are monotonic and cannot point beyond the current event high-water mark.
 
 An event is a pointer, not the full object. Use `entity_type` and `entity_id` to call `read_message`, `read_request`, `get_worker_run`, `get_feature`, or `get_work_item`.
 
@@ -648,7 +682,7 @@ A lease is not the maximum execution time of a task and not an MCP tool-call tim
 
 Leases are extended to a new deadline; they are not a one-time process lifetime.
 
-Use `heartbeat` for an orchestrator and `heartbeat_worker_run` at useful checkpoints for an active worker. Actor-scoped mutations and an active `wait_for_events` also renew relevant actor and claim leases. Simple reads such as `list_inbox`, `read_message`, and `read_artifact` are not heartbeats.
+Use `heartbeat` for an orchestrator and `heartbeat_worker_run` at useful checkpoints for an active worker. Actor-scoped mutations and an active `wait_for_events` also renew relevant actor and claim leases. Discovery lists and simple reads such as `list_inbox`, `read_message`, and `read_artifact` are not heartbeats.
 
 When a lease expires:
 
@@ -693,11 +727,11 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 | --- | --- |
 | `create_feature` | Create a feature. |
 | `get_feature` | Read one feature. |
-| `list_features` | List project features. |
+| `list_features` | List a bounded project-feature page with optional status filtering. |
 | `complete_feature` | Complete a coordinator-owned feature after linked state is terminal. |
 | `cancel_feature` | Cancel a coordinator-owned feature and remaining unclaimed work. |
 | `create_work_item` | Create an implementation, audit, or remediation card with repository ownership and lineage. |
-| `get_work_item` | Read a consistent item snapshot with dependencies. |
+| `get_work_item` | Read a consistent item snapshot with dependencies and active/latest worker projection. |
 | `list_work_items` | Read a bounded page of feature items. |
 | `update_work_item` | Update an item using `expected_revision`. |
 | `increase_audit_depth` | Explicitly reopen `verification_blocked` work with a larger depth, current revision, and reason. |
@@ -713,6 +747,7 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 | `activate_worker_run` | Move a created run to active. The child agent's first call. |
 | `heartbeat_worker_run` | Extend an active worker lease. |
 | `get_worker_run` | Read worker status, scope, and result data. |
+| `list_worker_runs` | Discover compact run history by repository, Feature, item, role, status, or audit link. |
 | `complete_worker_run` | Complete an active worker. |
 | `fail_worker_run` | Fail a created or active worker. |
 
@@ -727,6 +762,7 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 | `release_request_claim` | Return an owned request to pending. |
 | `answer_request` | Close an owned request, enforce its answer requirement, and record provenance. |
 | `fail_request` | Requeue a retryable request or terminally fail it. |
+| `list_requests` | Discover visible request history by participant, linked entity, or status. |
 
 ### Messages and events
 
@@ -734,10 +770,15 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 | --- | --- |
 | `publish_message` | Publish a message and optional artifact directly or as a broadcast. |
 | `list_inbox` | List pending headers with pagination and kind filtering. |
+| `list_deliveries` | List pending, acknowledged, or all deliveries for the actor repository. |
+| `list_messages` | Discover accessible message headers by linked entity, thread, kind, producer, or recipient. |
+| `list_artifacts` | Discover authorized artifact metadata, including project-shared linked reports, without loading content. |
 | `read_message` | Read an accessible message envelope. |
-| `read_artifact` | Read accessible full artifact content. |
+| `read_artifact` | Read authorized full content; orchestrators can recover explicitly project-shared linked artifacts. |
 | `ack_message` | Idempotently acknowledge a delivery. |
 | `wait_for_events` | Wait for repository events within the configured finite ceiling. |
+| `get_event_checkpoint` | Read a repository-scoped named consumer cursor. |
+| `commit_event_cursor` | Monotonically commit a cursor after processing its page. |
 
 ## Server configuration
 
@@ -789,10 +830,12 @@ cargo run --release -- `
 | `list_work_items` page | 100 |
 | `list_inbox` page | 100 |
 | `wait_for_events` page | 50 |
+| History/discovery list page | 50 |
 | Audit depth per item | 1–10 |
 | Explicit `wait_for_events.timeout_seconds` | 0–configured `--max-wait-seconds` in the published schema |
 | `idempotency_key` | 1–128 bytes |
 | `correlation_id` | up to 128 bytes |
+| `consumer_key` | 1–64 bytes; ASCII letters, digits, `.`, `_`, and `-` |
 
 `context_refs` is an array of arbitrary JSON objects. The server validates object shape and count but does not impose a custom schema. Keep references compact instead of copying large context into every call.
 
@@ -894,21 +937,29 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
      the current absolute repository path, and useful capability metadata.
    - For a fresh process, omit `instance_id`. Reuse a previously returned instance ID
      only when intentionally reconnecting that same orchestrator instance.
-   - Retain `project_id`, `repository_id`, `instance_id`, peer repository IDs, and the
-     bootstrap counters returned by the server.
+   - Retain `project_id`, `repository_id`, `instance_id`, peer repository IDs,
+     `snapshot_event_cursor`, and the bootstrap counters returned by the server.
    - Read `hub://guide` after connecting, especially when the server contract may have
      changed since this file was written.
 
 2. Recover durable state before creating new coordination objects.
    - Use `list_features` and bounded `list_work_items` pages to find existing work.
+   - Use `list_worker_runs`, `list_requests`, `list_deliveries`, `list_messages`, and
+     metadata-only `list_artifacts` pages to rebuild execution and communication state
+     without remembered entity IDs.
    - Do not duplicate an existing feature, work item, worker run, request, or report just
      because this is a new chat session.
    - Use stable actor-scoped `idempotency_key` values for retryable creation calls.
-   - Check pending inbox headers with `list_inbox`; use `read_message` and `read_artifact`
-     only when the content is needed, then acknowledge processed deliveries with
-     `ack_message`.
-   - Resume event consumption from the last retained `next_cursor` when it is available.
-     If no cursor was retained, start from `0` and filter for relevant event kinds.
+   - Check pending inbox headers with `list_inbox`; use `list_deliveries` when acknowledged
+     history matters. Call `read_message` and `read_artifact` only when content is needed,
+     then acknowledge processed deliveries with `ack_message`.
+   - Recover accepted implementation/audit reports and explicitly Feature/WorkItem-linked
+     non-request artifacts across the project when needed. Keep unlinked repository content
+     private, and treat request question/answer artifacts as participant-private.
+   - After reading the recovery pages, begin event consumption strictly after the
+     connection's `snapshot_event_cursor` so mutations committed during recovery are reconciled.
+   - For durable progress, choose an orchestrator-specific `consumer_key`, read it with
+     `get_event_checkpoint`, and advance it with `commit_event_cursor` only after processing.
 
 3. Treat server work cards as the shared execution backlog.
    - Represent the overall user-visible objective with `create_feature` and executable
@@ -990,8 +1041,8 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
      next owner repository.
 
 7. Consume repository events.
-   - Call `wait_for_events` with the actor ID, the last `next_cursor`, relevant event
-     filters, and a bounded page limit.
+   - Call `wait_for_events` with the actor ID, relevant filters, a bounded page limit, and
+     either an explicit last `next_cursor` or a `consumer_key`. Explicit cursor wins.
    - Omit `timeout_seconds` to use the server's configured finite ceiling. Values above
      that ceiling are clamped; zero performs a non-blocking check.
    - An `outcome: "deadline"` response is a non-event. While the shared task is still
@@ -999,8 +1050,8 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
      returned cursor.
    - Events are pointers, not payloads. Read the referenced message, request, worker run,
      feature, or work item through its dedicated tool.
-   - Persist or clearly report the newest processed cursor before ending a session that
-     expects later continuation.
+   - Returned pages never auto-commit. After processing, call `commit_event_cursor` when
+     using a named consumer; otherwise persist or clearly report the newest cursor.
 
 8. Apply bounded audit/remediation to every completed implementation.
    - Create a repository-owned `audit` work item whose `audit_scope_work_item_ids`

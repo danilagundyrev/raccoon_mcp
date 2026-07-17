@@ -91,12 +91,67 @@ impl SqliteStore {
         feature_from_row(&row)
     }
 
-    pub async fn list_features(&self, project_id: ProjectId) -> Result<Vec<Feature>, StoreError> {
-        let rows = sqlx::query("SELECT * FROM features WHERE project_id = ? ORDER BY created_at")
-            .bind(project_id.to_string())
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(feature_from_row).collect()
+    pub async fn list_features(
+        &self,
+        project_id: ProjectId,
+        status: Option<FeatureStatus>,
+        after_feature_id: Option<FeatureId>,
+        limit: u8,
+    ) -> Result<FeaturePage, StoreError> {
+        validate_history_limit(limit)?;
+        let mut transaction = self.pool.begin().await?;
+        let cursor = if let Some(after_feature_id) = after_feature_id {
+            Some(
+                sqlx::query(
+                    "SELECT created_at, feature_id FROM features
+                     WHERE project_id = ? AND feature_id = ?",
+                )
+                .bind(project_id.to_string())
+                .bind(after_feature_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!(
+                        "feature cursor {after_feature_id} in project {project_id}"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT * FROM features WHERE project_id = ");
+        query.push_bind(project_id.to_string());
+        if let Some(status) = status {
+            query.push(" AND status = ").push_bind(status.as_str());
+        }
+        if let Some(cursor) = cursor.as_ref() {
+            let created_at: String = cursor.try_get("created_at")?;
+            let feature_id: String = cursor.try_get("feature_id")?;
+            query
+                .push(" AND (created_at > ")
+                .push_bind(created_at.clone())
+                .push(" OR (created_at = ")
+                .push_bind(created_at)
+                .push(" AND feature_id > ")
+                .push_bind(feature_id)
+                .push("))");
+        }
+        query
+            .push(" ORDER BY created_at, feature_id LIMIT ")
+            .push_bind(i64::from(limit) + 1);
+        let rows = query.build().fetch_all(&mut *transaction).await?;
+        let has_more = rows.len() > usize::from(limit);
+        let items = rows
+            .iter()
+            .take(usize::from(limit))
+            .map(feature_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        transaction.commit().await?;
+        Ok(FeaturePage {
+            next_cursor: items.last().map(|feature| feature.feature_id),
+            items,
+            has_more,
+        })
     }
 
     pub async fn complete_feature(&self, command: CompleteFeature) -> Result<Feature, StoreError> {
@@ -533,17 +588,22 @@ impl SqliteStore {
                     )?);
             }
         }
-        let items = page_rows
-            .into_iter()
-            .map(|row| {
-                let work_item_id: String = row.try_get("work_item_id")?;
-                work_item_from_row(
-                    row,
-                    dependencies.remove(&work_item_id).unwrap_or_default(),
-                    audit_scopes.remove(&work_item_id).unwrap_or_default(),
-                )
-            })
-            .collect::<Result<Vec<_>, StoreError>>()?;
+        let page_work_item_ids = page_rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("work_item_id"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut worker_projections =
+            load_work_item_worker_projections(&mut transaction, &page_work_item_ids).await?;
+        let mut items = Vec::with_capacity(page_rows.len());
+        for row in page_rows {
+            let work_item_id: String = row.try_get("work_item_id")?;
+            items.push(work_item_from_row(
+                row,
+                dependencies.remove(&work_item_id).unwrap_or_default(),
+                audit_scopes.remove(&work_item_id).unwrap_or_default(),
+                worker_projections.remove(&work_item_id),
+            )?);
+        }
         transaction.commit().await?;
         Ok(WorkItemPage {
             next_cursor: items.last().map(|item| item.work_item_id),
@@ -1098,13 +1158,98 @@ async fn get_work_item_tx(
         .iter()
         .map(|row| Ok(WorkItemId::parse(row.try_get("scoped_work_item_id")?)?))
         .collect::<Result<Vec<_>, StoreError>>()?;
-    work_item_from_row(&row, dependency_ids, audit_scope_work_item_ids)
+    let worker_projection = load_work_item_worker_projection(transaction, work_item_id).await?;
+    work_item_from_row(
+        &row,
+        dependency_ids,
+        audit_scope_work_item_ids,
+        worker_projection,
+    )
+}
+
+async fn load_work_item_worker_projection(
+    transaction: &mut Transaction<'_, Sqlite>,
+    work_item_id: WorkItemId,
+) -> Result<Option<WorkItemWorkerProjection>, StoreError> {
+    let row = sqlx::query(
+        "SELECT worker_run_id, role, status, last_heartbeat_at, lease_expires_at
+         FROM worker_runs WHERE work_item_id = ?
+         ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'created' THEN 1 ELSE 2 END,
+                  created_at DESC, worker_run_id DESC
+         LIMIT 1",
+    )
+    .bind(work_item_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    row.map(|row| {
+        Ok(WorkItemWorkerProjection {
+            worker_run_id: WorkerRunId::parse(row.try_get("worker_run_id")?)?,
+            role: row
+                .try_get::<String, _>("role")?
+                .parse()
+                .map_err(StoreError::Conflict)?,
+            status: row
+                .try_get::<String, _>("status")?
+                .parse()
+                .map_err(StoreError::Conflict)?,
+            last_heartbeat_at: row.try_get("last_heartbeat_at")?,
+            lease_expires_at: row.try_get("lease_expires_at")?,
+        })
+    })
+    .transpose()
+}
+
+async fn load_work_item_worker_projections(
+    transaction: &mut Transaction<'_, Sqlite>,
+    work_item_ids: &[String],
+) -> Result<HashMap<String, WorkItemWorkerProjection>, StoreError> {
+    if work_item_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT work_item_id, worker_run_id, role, status, last_heartbeat_at, lease_expires_at
+         FROM (SELECT work_item_id, worker_run_id, role, status, last_heartbeat_at,
+                      lease_expires_at,
+                      ROW_NUMBER() OVER (
+                          PARTITION BY work_item_id
+                          ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'created' THEN 1 ELSE 2 END,
+                                   created_at DESC, worker_run_id DESC
+                      ) AS worker_rank
+               FROM worker_runs WHERE work_item_id IN (",
+    );
+    let mut separated = query.separated(", ");
+    for work_item_id in work_item_ids {
+        separated.push_bind(work_item_id);
+    }
+    separated.push_unseparated(") ) WHERE worker_rank = 1");
+    let rows = query.build().fetch_all(&mut **transaction).await?;
+    let mut projections = HashMap::with_capacity(rows.len());
+    for row in rows {
+        projections.insert(
+            row.try_get("work_item_id")?,
+            WorkItemWorkerProjection {
+                worker_run_id: WorkerRunId::parse(row.try_get("worker_run_id")?)?,
+                role: row
+                    .try_get::<String, _>("role")?
+                    .parse()
+                    .map_err(StoreError::Conflict)?,
+                status: row
+                    .try_get::<String, _>("status")?
+                    .parse()
+                    .map_err(StoreError::Conflict)?,
+                last_heartbeat_at: row.try_get("last_heartbeat_at")?,
+                lease_expires_at: row.try_get("lease_expires_at")?,
+            },
+        );
+    }
+    Ok(projections)
 }
 
 fn work_item_from_row(
     row: &SqliteRow,
     dependency_ids: Vec<WorkItemId>,
     audit_scope_work_item_ids: Vec<WorkItemId>,
+    worker_projection: Option<WorkItemWorkerProjection>,
 ) -> Result<WorkItem, StoreError> {
     let status: String = row.try_get("status")?;
     let kind: String = row.try_get("kind")?;
@@ -1146,6 +1291,7 @@ fn work_item_from_row(
             .try_get::<Option<String>, _>("verification_status")?
             .map(|value| value.parse().map_err(StoreError::Conflict))
             .transpose()?,
+        worker_projection,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         finished_at: row.try_get("finished_at")?,

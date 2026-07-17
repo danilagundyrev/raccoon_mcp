@@ -40,10 +40,7 @@ impl SqliteStore {
         )
         .await?;
 
-        transaction.commit().await?;
-        let repositories = self
-            .list_repositories(project.project_id, RepositoryPresenceFilter::All)
-            .await?;
+        let repositories = list_repositories_tx(&mut transaction, project.project_id, &now).await?;
         let bootstrap = sqlx::query(
             "SELECT
                 (SELECT COUNT(*) FROM features f
@@ -51,13 +48,16 @@ impl SqliteStore {
                 (SELECT COUNT(*) FROM deliveries
                  WHERE recipient_repository_id = ? AND status = 'pending') AS pending_inbox_count,
                 (SELECT COUNT(*) FROM requests
-                 WHERE target_repository_id = ? AND status IN ('pending', 'claimed')) AS open_request_count",
+                 WHERE target_repository_id = ? AND status IN ('pending', 'claimed')) AS open_request_count,
+                COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)
+                    AS snapshot_event_cursor",
         )
         .bind(project.project_id.to_string())
         .bind(repository.repository_id.to_string())
         .bind(repository.repository_id.to_string())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *transaction)
         .await?;
+        transaction.commit().await?;
 
         Ok(ConnectResult {
             project,
@@ -67,10 +67,13 @@ impl SqliteStore {
             active_feature_count: bootstrap.try_get::<i64, _>("active_feature_count")? as u64,
             pending_inbox_count: bootstrap.try_get::<i64, _>("pending_inbox_count")? as u64,
             open_request_count: bootstrap.try_get::<i64, _>("open_request_count")? as u64,
+            snapshot_event_cursor: bootstrap.try_get("snapshot_event_cursor")?,
             warnings: warning.into_iter().collect(),
             next_actions: vec![
                 "Call heartbeat before the returned lease expires.".to_owned(),
                 "Inspect the project overview to discover peer repositories.".to_owned(),
+                "Use snapshot_event_cursor as the recovery watermark before starting event waits."
+                    .to_owned(),
                 "Before spawning a child, call create_worker_run and pass its worker_run_id to the child."
                     .to_owned(),
                 "Use list_inbox for compact pending headers and read_artifact only when full content is needed."
@@ -212,4 +215,34 @@ impl SqliteStore {
             repositories,
         })
     }
+}
+
+async fn list_repositories_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    project_id: ProjectId,
+    now: &str,
+) -> Result<Vec<RepositoryPresence>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT r.*, COUNT(i.instance_id) AS online_instances
+         FROM repositories r
+         LEFT JOIN agent_instances i
+           ON i.repository_id = r.repository_id
+          AND i.status = 'online'
+          AND i.lease_expires_at > ?
+         WHERE r.project_id = ?
+         GROUP BY r.repository_id
+         ORDER BY r.repository_key",
+    )
+    .bind(now)
+    .bind(project_id.to_string())
+    .fetch_all(&mut **transaction)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(RepositoryPresence {
+                repository: repository_from_row(row)?,
+                online_instances: row.try_get::<i64, _>("online_instances")? as u64,
+            })
+        })
+        .collect()
 }

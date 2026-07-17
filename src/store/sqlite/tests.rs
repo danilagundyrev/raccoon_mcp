@@ -3078,6 +3078,206 @@ async fn queued_message_is_returned_as_repository_event() {
 }
 
 #[tokio::test]
+async fn snapshot_cursor_and_named_consumers_recover_without_shared_progress() {
+    let (store, path) = test_store(90).await;
+    let backend = store
+        .connect_orchestrator(connect_command(
+            "checkpoint-recovery",
+            "backend",
+            "C:/checkpoint/backend",
+        ))
+        .await
+        .unwrap();
+    let web = store
+        .connect_orchestrator(connect_command(
+            "checkpoint-recovery",
+            "web",
+            "C:/checkpoint/web",
+        ))
+        .await
+        .unwrap();
+    store
+        .publish_message(publish_command(
+            ActorRef::Orchestrator(backend.instance.instance_id),
+            MessageTarget::Repositories(vec![web.repository.repository_id]),
+            "First checkpoint event",
+            None,
+        ))
+        .await
+        .unwrap();
+    let first_batch = store
+        .wait_for_events(
+            ActorRef::Orchestrator(web.instance.instance_id),
+            0,
+            &[EventKind::MessageAvailable],
+            Duration::ZERO,
+            20,
+        )
+        .await
+        .unwrap();
+    let first_event_id = first_batch.events[0].event_id;
+
+    let replacement = store
+        .connect_orchestrator(connect_command(
+            "checkpoint-recovery",
+            "web",
+            "C:/checkpoint/web",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replacement.pending_inbox_count, 1);
+    assert!(replacement.snapshot_event_cursor >= first_event_id);
+
+    store
+        .publish_message(publish_command(
+            ActorRef::Orchestrator(backend.instance.instance_id),
+            MessageTarget::Repositories(vec![web.repository.repository_id]),
+            "Second checkpoint event",
+            None,
+        ))
+        .await
+        .unwrap();
+    let after_snapshot = store
+        .wait_for_events_from(
+            ActorRef::Orchestrator(replacement.instance.instance_id),
+            Some(replacement.snapshot_event_cursor),
+            None,
+            &[EventKind::MessageAvailable],
+            Duration::ZERO,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_snapshot.events.len(), 1);
+    let second_event_id = after_snapshot.events[0].event_id;
+    assert!(second_event_id > replacement.snapshot_event_cursor);
+
+    let alpha = store
+        .get_event_checkpoint(
+            ActorRef::Orchestrator(replacement.instance.instance_id),
+            "alpha",
+        )
+        .await
+        .unwrap();
+    assert_eq!(alpha.cursor, 0);
+    assert!(alpha.created_at.is_none());
+    store
+        .commit_event_cursor(
+            ActorRef::Orchestrator(replacement.instance.instance_id),
+            "alpha",
+            first_event_id,
+        )
+        .await
+        .unwrap();
+    let alpha_page = store
+        .wait_for_events_from(
+            ActorRef::Orchestrator(replacement.instance.instance_id),
+            None,
+            Some("alpha"),
+            &[EventKind::MessageAvailable],
+            Duration::ZERO,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(alpha_page.events.len(), 1);
+    assert_eq!(alpha_page.events[0].event_id, second_event_id);
+    assert_eq!(
+        store
+            .get_event_checkpoint(
+                ActorRef::Orchestrator(replacement.instance.instance_id),
+                "alpha",
+            )
+            .await
+            .unwrap()
+            .cursor,
+        first_event_id,
+        "returning a page must not auto-commit it"
+    );
+
+    let beta_page = store
+        .wait_for_events_from(
+            ActorRef::Orchestrator(replacement.instance.instance_id),
+            None,
+            Some("beta"),
+            &[EventKind::MessageAvailable],
+            Duration::ZERO,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(beta_page.events.len(), 2);
+    assert!(matches!(
+        store
+            .commit_event_cursor(
+                ActorRef::Orchestrator(replacement.instance.instance_id),
+                "alpha",
+                first_event_id - 1,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store
+            .commit_event_cursor(
+                ActorRef::Orchestrator(replacement.instance.instance_id),
+                "alpha",
+                second_event_id + 1,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    store
+        .commit_event_cursor(
+            ActorRef::Orchestrator(replacement.instance.instance_id),
+            "alpha",
+            second_event_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_event_checkpoint(
+                ActorRef::Orchestrator(backend.instance.instance_id),
+                "alpha",
+            )
+            .await
+            .unwrap()
+            .cursor,
+        0,
+        "the same consumer key in another repository has independent progress"
+    );
+
+    store.pool.close().await;
+    drop(store);
+    let reopened = SqliteStore::open(&path, 2, 90, 3600, 600, 3600)
+        .await
+        .unwrap();
+    let reconnected = reopened
+        .connect_orchestrator(connect_command(
+            "checkpoint-recovery",
+            "web",
+            "C:/checkpoint/web",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .get_event_checkpoint(
+                ActorRef::Orchestrator(reconnected.instance.instance_id),
+                "alpha",
+            )
+            .await
+            .unwrap()
+            .cursor,
+        second_event_id
+    );
+
+    reopened.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn waiter_is_notified_after_message_commit() {
     let (store, path) = test_store(90).await;
     let backend = store
@@ -4741,6 +4941,750 @@ async fn work_item_pages_are_bounded_and_reads_keep_revision_with_dependencies()
         }
     };
     tokio::join!(writer, reader);
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn discovery_lists_reconstruct_actor_visible_state_with_stable_pages() {
+    let (store, path) = test_store(90).await;
+    let backend = store
+        .connect_orchestrator(connect_command(
+            "discovery-recovery",
+            "backend",
+            "C:/discovery/backend",
+        ))
+        .await
+        .unwrap();
+    let android = store
+        .connect_orchestrator(connect_command(
+            "discovery-recovery",
+            "android",
+            "C:/discovery/android",
+        ))
+        .await
+        .unwrap();
+    let first_feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: backend.instance.instance_id,
+            title: "Discovery one".to_owned(),
+            summary: "First page".to_owned(),
+        })
+        .await
+        .unwrap();
+    let second_feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: backend.instance.instance_id,
+            title: "Discovery two".to_owned(),
+            summary: "Second page".to_owned(),
+        })
+        .await
+        .unwrap();
+    let first_page = store
+        .list_features(
+            backend.project.project_id,
+            Some(FeatureStatus::Active),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_page.items.len(), 1);
+    assert!(first_page.has_more);
+    let second_page = store
+        .list_features(
+            backend.project.project_id,
+            Some(FeatureStatus::Active),
+            first_page.next_cursor,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_page.items.len(), 1);
+    assert!(!second_page.has_more);
+    assert_ne!(
+        first_page.items[0].feature_id,
+        second_page.items[0].feature_id
+    );
+    assert!(
+        [first_feature.feature_id, second_feature.feature_id]
+            .contains(&second_page.items[0].feature_id)
+    );
+
+    let item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: first_feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: backend.repository.repository_id,
+            title: "Recover this work".to_owned(),
+            summary: "Expose the linked worker".to_owned(),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_work_item(
+            backend.instance.instance_id,
+            item.work_item_id,
+            item.revision,
+        )
+        .await
+        .unwrap();
+    let worker = store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: backend.instance.instance_id,
+            role: WorkerRole::Executor,
+            task_summary: "Implement recovery probe".to_owned(),
+            context_refs: json!([]),
+            addresses_audit_run_id: None,
+            work_item_id: Some(item.work_item_id),
+            request_id: None,
+        })
+        .await
+        .unwrap();
+    let projection = store
+        .get_work_item(claimed.work_item_id)
+        .await
+        .unwrap()
+        .worker_projection
+        .unwrap();
+    assert_eq!(projection.worker_run_id, worker.worker_run_id);
+    assert_eq!(projection.status, WorkerRunStatus::Created);
+    let listed_projection = store
+        .list_work_items(first_feature.feature_id, None, 20)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|listed| listed.work_item_id == item.work_item_id)
+        .unwrap()
+        .worker_projection
+        .unwrap();
+    assert_eq!(listed_projection.worker_run_id, worker.worker_run_id);
+
+    let request = store
+        .ask_repository(AskRepository {
+            actor: ActorRef::Orchestrator(backend.instance.instance_id),
+            target_repository_id: android.repository.repository_id,
+            feature_id: Some(first_feature.feature_id),
+            work_item_id: Some(item.work_item_id),
+            question_summary: "Which Android DTO is affected?".to_owned(),
+            body: None,
+            context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
+        })
+        .await
+        .unwrap();
+    let published = store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Orchestrator(backend.instance.instance_id),
+            kind: MessageKind::Report,
+            target: MessageTarget::Repositories(vec![android.repository.repository_id]),
+            summary: "Recovery marker".to_owned(),
+            body: Some("BODY_MUST_NOT_APPEAR_IN_METADATA".to_owned()),
+            artifact_kind: ArtifactKind::Note,
+            artifact_title: Some("Recovery note".to_owned()),
+            content_type: "text/markdown".to_owned(),
+            feature_id: Some(first_feature.feature_id),
+            work_item_id: Some(item.work_item_id),
+            request_id: None,
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap();
+    store
+        .ack_message(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            published.message.message_id,
+        )
+        .await
+        .unwrap();
+    let second_published = store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Orchestrator(backend.instance.instance_id),
+            kind: MessageKind::Report,
+            target: MessageTarget::Repositories(vec![android.repository.repository_id]),
+            summary: "Second recovery marker".to_owned(),
+            body: Some("SECOND_BODY".to_owned()),
+            artifact_kind: ArtifactKind::Note,
+            artifact_title: Some("Second recovery note".to_owned()),
+            content_type: "text/markdown".to_owned(),
+            feature_id: Some(first_feature.feature_id),
+            work_item_id: Some(item.work_item_id),
+            request_id: None,
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap();
+
+    let workers = store
+        .list_worker_runs(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            WorkerRunListFilter {
+                feature_id: Some(first_feature.feature_id),
+                ..Default::default()
+            },
+            None,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(workers.items[0].worker_run_id, worker.worker_run_id);
+    let requests = store
+        .list_requests(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            RequestListFilter {
+                target_repository_id: Some(android.repository.repository_id),
+                feature_id: Some(first_feature.feature_id),
+                ..Default::default()
+            },
+            None,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(requests.items[0].request_id, request.request_id);
+    let deliveries = store
+        .list_deliveries(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            DeliveryListStatus::Acknowledged,
+            None,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(deliveries.items.len(), 1);
+    assert_eq!(deliveries.items[0].status, "acknowledged");
+    let message_page_one = store
+        .list_messages(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            MessageListFilter {
+                work_item_id: Some(item.work_item_id),
+                ..Default::default()
+            },
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(message_page_one.has_more);
+    let message_page_two = store
+        .list_messages(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            MessageListFilter {
+                work_item_id: Some(item.work_item_id),
+                ..Default::default()
+            },
+            message_page_one.next_cursor,
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(!message_page_two.has_more);
+    assert_ne!(
+        message_page_one.items[0].message_id,
+        message_page_two.items[0].message_id
+    );
+    assert!(
+        [
+            published.message.message_id,
+            second_published.message.message_id
+        ]
+        .contains(&message_page_two.items[0].message_id)
+    );
+    let artifact_page_one = store
+        .list_artifacts(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            ArtifactListFilter {
+                feature_id: Some(first_feature.feature_id),
+                ..Default::default()
+            },
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(artifact_page_one.has_more);
+    let artifact_page_two = store
+        .list_artifacts(
+            ActorRef::Orchestrator(android.instance.instance_id),
+            ArtifactListFilter {
+                feature_id: Some(first_feature.feature_id),
+                ..Default::default()
+            },
+            artifact_page_one.next_cursor,
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(!artifact_page_two.has_more);
+    assert_ne!(
+        artifact_page_one.items[0].artifact_id,
+        artifact_page_two.items[0].artifact_id
+    );
+    assert_eq!(
+        artifact_page_one.items[0].work_item_id,
+        Some(item.work_item_id)
+    );
+    assert!(
+        serde_json::to_value(&artifact_page_one.items[0])
+            .unwrap()
+            .get("content")
+            .is_none()
+    );
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn orchestrators_share_linked_artifacts_without_exposing_private_or_request_content() {
+    let (store, path) = test_store(90).await;
+    let backend = store
+        .connect_orchestrator(connect_command(
+            "shared-artifacts",
+            "backend",
+            "C:/shared/backend",
+        ))
+        .await
+        .unwrap();
+    let android = store
+        .connect_orchestrator(connect_command(
+            "shared-artifacts",
+            "android",
+            "C:/shared/android",
+        ))
+        .await
+        .unwrap();
+    let web = store
+        .connect_orchestrator(connect_command("shared-artifacts", "web", "C:/shared/web"))
+        .await
+        .unwrap();
+    let unrelated = store
+        .connect_orchestrator(connect_command(
+            "other-artifacts",
+            "backend",
+            "C:/other/backend",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: backend.instance.instance_id,
+            title: "Shared reports".to_owned(),
+            summary: "Recover repository implementation artifacts".to_owned(),
+        })
+        .await
+        .unwrap();
+    let android_item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: android.repository.repository_id,
+            title: "Android implementation".to_owned(),
+            summary: "Produce a linked report".to_owned(),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_work_item(
+            android.instance.instance_id,
+            android_item.work_item_id,
+            android_item.revision,
+        )
+        .await
+        .unwrap();
+    let executor = store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: android.instance.instance_id,
+            role: WorkerRole::Executor,
+            task_summary: "Implement Android change".to_owned(),
+            context_refs: json!([]),
+            addresses_audit_run_id: None,
+            work_item_id: Some(android_item.work_item_id),
+            request_id: None,
+        })
+        .await
+        .unwrap();
+    store
+        .activate_worker_run(executor.worker_run_id)
+        .await
+        .unwrap();
+    let report = store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Worker(executor.worker_run_id),
+            kind: MessageKind::Report,
+            target: MessageTarget::Repositories(vec![android.repository.repository_id]),
+            summary: "Android implementation complete".to_owned(),
+            body: Some("ANDROID_IMPLEMENTATION_REPORT".to_owned()),
+            artifact_kind: ArtifactKind::ImplementationReport,
+            artifact_title: Some("Android report".to_owned()),
+            content_type: "text/markdown".to_owned(),
+            feature_id: None,
+            work_item_id: None,
+            request_id: None,
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
+    assert!(
+        store
+            .read_artifact(
+                ActorRef::Orchestrator(backend.instance.instance_id),
+                report.artifact_id,
+            )
+            .await
+            .is_err(),
+        "an unlinked report remains private before the WorkItem accepts it"
+    );
+    store
+        .complete_worker_run(executor.worker_run_id, "Android implementation complete")
+        .await
+        .unwrap();
+    let current = store
+        .get_work_item(android_item.work_item_id)
+        .await
+        .unwrap();
+    assert!(current.revision > claimed.revision);
+    store
+        .update_work_item(UpdateWorkItem {
+            parent_instance_id: android.instance.instance_id,
+            work_item_id: android_item.work_item_id,
+            expected_revision: current.revision,
+            title: None,
+            summary: None,
+            owner_repository_id: None,
+            parent_work_item_id: None,
+            dependency_ids: None,
+            priority: None,
+            status: Some(WorkItemStatus::Completed),
+            implementation_artifact_id: Some(report.artifact_id),
+        })
+        .await
+        .unwrap();
+
+    for instance_id in [backend.instance.instance_id, web.instance.instance_id] {
+        assert_eq!(
+            store
+                .read_artifact(ActorRef::Orchestrator(instance_id), report.artifact_id)
+                .await
+                .unwrap()
+                .content,
+            "ANDROID_IMPLEMENTATION_REPORT"
+        );
+    }
+    assert!(
+        store
+            .read_artifact(
+                ActorRef::Orchestrator(unrelated.instance.instance_id),
+                report.artifact_id,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .list_artifacts(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                ArtifactListFilter {
+                    work_item_id: Some(android_item.work_item_id),
+                    ..Default::default()
+                },
+                None,
+                20,
+            )
+            .await
+            .unwrap()
+            .items[0]
+            .artifact_id,
+        report.artifact_id
+    );
+
+    let audit_item = create_claimed_audit_item(
+        &store,
+        &android,
+        feature.feature_id,
+        vec![android_item.work_item_id],
+        "shared artifact access",
+    )
+    .await;
+    let auditor = create_auditor_run(&store, &android, &audit_item, "Audit shared report").await;
+    store
+        .activate_worker_run(auditor.worker_run_id)
+        .await
+        .unwrap();
+    let audit_report = store
+        .publish_message_with_audit_outcomes(
+            PublishMessage {
+                actor: ActorRef::Worker(auditor.worker_run_id),
+                kind: MessageKind::Report,
+                target: MessageTarget::Repositories(vec![android.repository.repository_id]),
+                summary: "Android audit passed".to_owned(),
+                body: Some("ANDROID_AUDIT_REPORT".to_owned()),
+                artifact_kind: ArtifactKind::AuditReport,
+                artifact_title: Some("Android audit".to_owned()),
+                content_type: "text/markdown".to_owned(),
+                feature_id: None,
+                work_item_id: None,
+                request_id: None,
+                thread_id: None,
+                correlation_id: None,
+                in_reply_to: None,
+            },
+            &[audit_outcome(
+                android_item.work_item_id,
+                AuditVerdict::Passed,
+            )],
+        )
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
+    assert_eq!(
+        store
+            .read_artifact(
+                ActorRef::Orchestrator(backend.instance.instance_id),
+                audit_report.artifact_id,
+            )
+            .await
+            .unwrap()
+            .content,
+        "ANDROID_AUDIT_REPORT"
+    );
+    store
+        .complete_worker_run(auditor.worker_run_id, "Audit passed")
+        .await
+        .unwrap();
+    complete_audit_work_item(&store, &android, audit_item.work_item_id).await;
+
+    let web_item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: web.repository.repository_id,
+            title: "Worker isolation".to_owned(),
+            summary: "Keep worker access repository-scoped".to_owned(),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    let web_claim = store
+        .claim_work_item(
+            web.instance.instance_id,
+            web_item.work_item_id,
+            web_item.revision,
+        )
+        .await
+        .unwrap();
+    let web_worker = store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: web.instance.instance_id,
+            role: WorkerRole::Executor,
+            task_summary: "Verify worker isolation".to_owned(),
+            context_refs: json!([]),
+            addresses_audit_run_id: None,
+            work_item_id: Some(web_claim.work_item_id),
+            request_id: None,
+        })
+        .await
+        .unwrap();
+    store
+        .activate_worker_run(web_worker.worker_run_id)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .read_artifact(
+                ActorRef::Worker(web_worker.worker_run_id),
+                report.artifact_id
+            )
+            .await
+            .is_err()
+    );
+
+    let private = store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Orchestrator(android.instance.instance_id),
+            kind: MessageKind::Report,
+            target: MessageTarget::Repositories(vec![android.repository.repository_id]),
+            summary: "Private repository note".to_owned(),
+            body: Some("PRIVATE_ANDROID_NOTE".to_owned()),
+            artifact_kind: ArtifactKind::Note,
+            artifact_title: None,
+            content_type: "text/plain".to_owned(),
+            feature_id: None,
+            work_item_id: None,
+            request_id: None,
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
+    assert!(
+        store
+            .read_artifact(
+                ActorRef::Orchestrator(backend.instance.instance_id),
+                private.artifact_id,
+            )
+            .await
+            .is_err()
+    );
+
+    let shared_note = store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Orchestrator(android.instance.instance_id),
+            kind: MessageKind::Report,
+            target: MessageTarget::Repositories(vec![android.repository.repository_id]),
+            summary: "Feature coordination note".to_owned(),
+            body: Some("FEATURE_SHARED_NOTE".to_owned()),
+            artifact_kind: ArtifactKind::Note,
+            artifact_title: None,
+            content_type: "text/plain".to_owned(),
+            feature_id: Some(feature.feature_id),
+            work_item_id: None,
+            request_id: None,
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
+    assert_eq!(
+        store
+            .read_artifact(
+                ActorRef::Orchestrator(backend.instance.instance_id),
+                shared_note.artifact_id,
+            )
+            .await
+            .unwrap()
+            .content,
+        "FEATURE_SHARED_NOTE"
+    );
+
+    let request = store
+        .ask_repository(AskRepository {
+            actor: ActorRef::Orchestrator(android.instance.instance_id),
+            target_repository_id: backend.repository.repository_id,
+            feature_id: Some(feature.feature_id),
+            work_item_id: Some(android_item.work_item_id),
+            question_summary: "Private linked request".to_owned(),
+            body: Some("PRIVATE_REQUEST_BODY".to_owned()),
+            context_refs: json!([]),
+            handler_requirement: HandlerRequirement::OrchestratorAllowed,
+            answer_requirement: AnswerRequirement::ArtifactRequired,
+        })
+        .await
+        .unwrap();
+    let question_artifact_id = request.question_artifact_id.unwrap();
+    assert!(
+        store
+            .read_artifact(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                question_artifact_id,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .read_artifact(
+                ActorRef::Orchestrator(backend.instance.instance_id),
+                question_artifact_id,
+            )
+            .await
+            .is_ok()
+    );
+    store
+        .claim_request(
+            ActorRef::Orchestrator(backend.instance.instance_id),
+            request.request_id,
+        )
+        .await
+        .unwrap();
+    let answer = store
+        .answer_request(AnswerRequest {
+            actor: ActorRef::Orchestrator(backend.instance.instance_id),
+            request_id: request.request_id,
+            answer_summary: "Private linked answer".to_owned(),
+            body: Some("PRIVATE_ANSWER_BODY".to_owned()),
+            content_type: "text/plain".to_owned(),
+        })
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
+    assert!(
+        store
+            .read_artifact(
+                ActorRef::Orchestrator(web.instance.instance_id),
+                answer.artifact_id,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .read_artifact(
+                ActorRef::Orchestrator(android.instance.instance_id),
+                answer.artifact_id,
+            )
+            .await
+            .is_ok()
+    );
+    let web_artifacts = store
+        .list_artifacts(
+            ActorRef::Orchestrator(web.instance.instance_id),
+            ArtifactListFilter::default(),
+            None,
+            20,
+        )
+        .await
+        .unwrap();
+    let web_artifact_ids = web_artifacts
+        .items
+        .iter()
+        .map(|artifact| artifact.artifact_id)
+        .collect::<std::collections::HashSet<_>>();
+    assert!(web_artifact_ids.contains(&report.artifact_id));
+    assert!(web_artifact_ids.contains(&audit_report.artifact_id));
+    assert!(web_artifact_ids.contains(&shared_note.artifact_id));
+    assert!(!web_artifact_ids.contains(&private.artifact_id));
+    assert!(!web_artifact_ids.contains(&question_artifact_id));
+    assert!(!web_artifact_ids.contains(&answer.artifact_id));
 
     store.pool.close().await;
     remove_database(&path);

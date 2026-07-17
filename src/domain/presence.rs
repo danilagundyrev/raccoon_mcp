@@ -76,6 +76,7 @@ pub struct ConnectResult {
     pub active_feature_count: u64,
     pub pending_inbox_count: u64,
     pub open_request_count: u64,
+    pub snapshot_event_cursor: i64,
     pub warnings: Vec<String>,
     pub next_actions: Vec<String>,
 }

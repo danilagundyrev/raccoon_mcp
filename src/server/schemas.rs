@@ -171,8 +171,8 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "list_features",
-            "description": "List compact feature cards in one project.",
-            "inputSchema": id_schema("project_id"),
+            "description": "List one stable bounded page of compact feature cards in a project.",
+            "inputSchema": list_features_schema(),
             "annotations": mutation_annotations(true)
         },
         {
@@ -248,12 +248,29 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "wait_for_events",
-            "description": "Wait for append-only events addressed to the actor's repository. Every call is bounded by the server maximum; omission uses that maximum and zero performs a non-blocking check. The active wait renews the actor lease.",
+            "description": "Wait for append-only events addressed to the actor's repository. An explicit cursor wins; otherwise consumer_key uses its durable checkpoint, or zero is used when both are absent. Returned pages never auto-commit a checkpoint.",
             "inputSchema": wait_for_events_schema(max_wait_seconds),
             "annotations": {
                 "readOnlyHint": false,
                 "destructiveHint": false,
                 "idempotentHint": false,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "get_event_checkpoint",
+            "description": "Read one repository-scoped named event checkpoint. An unknown consumer starts at cursor zero without creating state.",
+            "inputSchema": event_checkpoint_schema(false),
+            "annotations": mutation_annotations(true)
+        },
+        {
+            "name": "commit_event_cursor",
+            "description": "Monotonically commit a processed event cursor for one repository-scoped named consumer. The server never calls this automatically.",
+            "inputSchema": event_checkpoint_schema(true),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
                 "openWorldHint": false
             }
         },
@@ -311,6 +328,36 @@ pub(super) fn tool_definitions(
             }
         },
         {
+            "name": "list_worker_runs",
+            "description": "Discover compact worker-run history with stable cursor pagination. Orchestrators see their project; workers are limited to their repository.",
+            "inputSchema": list_worker_runs_schema(),
+            "annotations": mutation_annotations(true)
+        },
+        {
+            "name": "list_requests",
+            "description": "Discover compact durable requests visible to the actor repository.",
+            "inputSchema": list_requests_schema(),
+            "annotations": mutation_annotations(true)
+        },
+        {
+            "name": "list_deliveries",
+            "description": "List pending, acknowledged or all deliveries for the actor repository.",
+            "inputSchema": list_deliveries_schema(),
+            "annotations": mutation_annotations(true)
+        },
+        {
+            "name": "list_messages",
+            "description": "Discover accessible message headers by linked entity, thread, kind, producer or recipient.",
+            "inputSchema": list_messages_schema(),
+            "annotations": mutation_annotations(true)
+        },
+        {
+            "name": "list_artifacts",
+            "description": "Discover accessible artifact metadata without content. Orchestrators may recover explicitly project-shared WorkItem reports and linked coordination artifacts; request artifacts remain participant-private. Use read_artifact for the body.",
+            "inputSchema": list_artifacts_schema(),
+            "annotations": mutation_annotations(true)
+        },
+        {
             "name": "read_message",
             "description": "Read one accessible immutable message envelope. Read its artifact separately when needed.",
             "inputSchema": actor_entity_schema("message_id"),
@@ -323,7 +370,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "read_artifact",
-            "description": "Read full artifact content only when the actor's repository produced it or received its message.",
+            "description": "Read full artifact content after actor-scoped authorization. Orchestrators may also read same-project artifacts accepted as WorkItem implementation/audit reports or attached to a non-request message with a Feature/WorkItem link. Request artifacts stay limited to their participants; workers retain narrower repository/run access.",
             "inputSchema": actor_entity_schema("artifact_id"),
             "annotations": {
                 "readOnlyHint": true,
@@ -603,6 +650,140 @@ pub(super) fn inbox_schema() -> Value {
     })
 }
 
+fn history_properties(cursor_name: &str) -> JsonMap<String, Value> {
+    let mut properties = actor_properties();
+    properties.insert(
+        cursor_name.to_owned(),
+        json!({ "type": "string", "format": "uuid" }),
+    );
+    properties.insert(
+        "limit".to_owned(),
+        json!({ "type": "integer", "minimum": 1, "maximum": 50, "default": 20 }),
+    );
+    properties
+}
+
+pub(super) fn list_features_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "project_id": { "type": "string", "format": "uuid" },
+            "status": { "type": "string", "enum": ["active", "completed", "cancelled"] },
+            "after_feature_id": { "type": "string", "format": "uuid" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 }
+        },
+        "required": ["project_id"]
+    })
+}
+
+pub(super) fn list_worker_runs_schema() -> Value {
+    let mut properties = history_properties("after_worker_run_id");
+    for name in [
+        "repository_id",
+        "feature_id",
+        "work_item_id",
+        "addresses_audit_run_id",
+    ] {
+        properties.insert(
+            name.to_owned(),
+            json!({ "type": "string", "format": "uuid" }),
+        );
+    }
+    properties.insert(
+        "role".to_owned(),
+        json!({ "type": "string", "enum": ["executor", "butler", "auditor"] }),
+    );
+    properties.insert(
+        "status".to_owned(),
+        json!({ "type": "string", "enum": ["created", "active", "completed", "failed", "abandoned"] }),
+    );
+    json!({ "type": "object", "additionalProperties": false, "properties": properties })
+}
+
+pub(super) fn list_requests_schema() -> Value {
+    let mut properties = history_properties("after_request_id");
+    for name in [
+        "requester_repository_id",
+        "target_repository_id",
+        "feature_id",
+        "work_item_id",
+    ] {
+        properties.insert(
+            name.to_owned(),
+            json!({ "type": "string", "format": "uuid" }),
+        );
+    }
+    properties.insert(
+        "status".to_owned(),
+        json!({ "type": "string", "enum": ["pending", "claimed", "answered", "failed"] }),
+    );
+    json!({ "type": "object", "additionalProperties": false, "properties": properties })
+}
+
+pub(super) fn list_deliveries_schema() -> Value {
+    let mut properties = actor_properties();
+    properties.insert(
+        "status".to_owned(),
+        json!({ "type": "string", "enum": ["pending", "acknowledged", "all"], "default": "all" }),
+    );
+    properties.insert(
+        "after_delivery_id".to_owned(),
+        json!({ "type": "integer", "minimum": 0 }),
+    );
+    properties.insert(
+        "limit".to_owned(),
+        json!({ "type": "integer", "minimum": 1, "maximum": 50, "default": 20 }),
+    );
+    json!({ "type": "object", "additionalProperties": false, "properties": properties })
+}
+
+pub(super) fn list_messages_schema() -> Value {
+    let mut properties = history_properties("after_message_id");
+    for name in [
+        "feature_id",
+        "work_item_id",
+        "request_id",
+        "thread_id",
+        "producer_repository_id",
+        "recipient_repository_id",
+    ] {
+        properties.insert(
+            name.to_owned(),
+            json!({ "type": "string", "format": "uuid" }),
+        );
+    }
+    properties.insert(
+        "kind".to_owned(),
+        json!({ "type": "string", "enum": ["report", "announcement", "command"] }),
+    );
+    json!({ "type": "object", "additionalProperties": false, "properties": properties })
+}
+
+pub(super) fn list_artifacts_schema() -> Value {
+    let mut properties = history_properties("after_artifact_id");
+    for name in [
+        "feature_id",
+        "work_item_id",
+        "request_id",
+        "producer_repository_id",
+        "producer_worker_run_id",
+    ] {
+        properties.insert(
+            name.to_owned(),
+            json!({ "type": "string", "format": "uuid" }),
+        );
+    }
+    properties.insert(
+        "kind".to_owned(),
+        json!({
+            "type": "string",
+            "enum": ["implementation_report", "api_contract", "answer", "audit_report", "note"]
+        }),
+    );
+    json!({ "type": "object", "additionalProperties": false, "properties": properties })
+}
+
 pub(super) fn list_work_items_schema() -> Value {
     json!({
         "type": "object",
@@ -636,13 +817,18 @@ pub(super) fn wait_for_events_schema(max_wait_seconds: u16) -> Value {
     let mut properties = actor_properties();
     properties.insert(
         "cursor".to_owned(),
-        json!({ "type": "integer", "minimum": 0, "default": 0 }),
+        json!({
+            "type": "integer",
+            "minimum": 0,
+            "description": "Explicit last-processed event ID. Overrides consumer_key when both are provided."
+        }),
     );
+    properties.insert("consumer_key".to_owned(), consumer_key_schema());
     properties.insert(
         "kinds".to_owned(),
         json!({
             "type": "array",
-            "maxItems": 15,
+            "maxItems": 16,
             "uniqueItems": true,
             "items": {
                 "type": "string",
@@ -661,7 +847,8 @@ pub(super) fn wait_for_events_schema(max_wait_seconds: u16) -> Value {
                     "feature_completed",
                     "feature_cancelled",
                     "work_item_created",
-                    "work_item_updated"
+                    "work_item_updated",
+                    "audit_depth_increased"
                 ]
             }
         }),
@@ -683,6 +870,34 @@ pub(super) fn wait_for_events_schema(max_wait_seconds: u16) -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": properties
+    })
+}
+
+fn consumer_key_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9._-]+$"
+    })
+}
+
+pub(super) fn event_checkpoint_schema(commit: bool) -> Value {
+    let mut properties = actor_properties();
+    properties.insert("consumer_key".to_owned(), consumer_key_schema());
+    let mut required = vec!["consumer_key"];
+    if commit {
+        properties.insert(
+            "cursor".to_owned(),
+            json!({ "type": "integer", "minimum": 0 }),
+        );
+        required.push("cursor");
+    }
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": required
     })
 }
 

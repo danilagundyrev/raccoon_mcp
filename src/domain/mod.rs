@@ -1,4 +1,5 @@
 mod events;
+mod history;
 mod ids;
 mod messaging;
 mod operations;
@@ -13,7 +14,12 @@ pub const MAX_AUDIT_WORK_ITEMS: usize = 50;
 pub const MAX_WORK_ITEM_DEPENDENCIES: usize = 100;
 pub const MAX_MESSAGE_RECIPIENTS: usize = 100;
 
-pub use events::{EventBatch, EventEntityType, EventKind, HubEvent, WaitOutcome};
+pub use events::{EventBatch, EventCheckpoint, EventEntityType, EventKind, HubEvent, WaitOutcome};
+pub use history::{
+    ArtifactListFilter, ArtifactMetadata, ArtifactPage, DeliveryHistoryItem, DeliveryListStatus,
+    DeliveryPage, FeaturePage, MessageListFilter, MessagePage, RequestListFilter, RequestPage,
+    RequestSummary, WorkItemWorkerProjection, WorkerRunListFilter, WorkerRunPage, WorkerRunSummary,
+};
 pub use ids::{
     ArtifactId, FeatureId, InstanceId, MessageId, ProjectId, RepositoryId, RequestId, ThreadId,
     WorkItemId, WorkerRunId,
