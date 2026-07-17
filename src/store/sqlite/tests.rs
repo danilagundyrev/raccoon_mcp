@@ -23,6 +23,37 @@ async fn test_store(lease_seconds: u16) -> (SqliteStore, PathBuf) {
     (store, path)
 }
 
+async fn event_recipients(
+    store: &SqliteStore,
+    kind: EventKind,
+    entity_type: EventEntityType,
+    entity_id: &str,
+) -> Vec<RepositoryId> {
+    let rows = sqlx::query(
+        "SELECT recipient_repository_id FROM events
+         WHERE kind = ? AND entity_type = ? AND entity_id = ?",
+    )
+    .bind(kind.as_str())
+    .bind(entity_type.as_str())
+    .bind(entity_id)
+    .fetch_all(&store.pool)
+    .await
+    .unwrap();
+    rows.iter()
+        .map(|row| RepositoryId::parse(row.try_get("recipient_repository_id").unwrap()).unwrap())
+        .collect()
+}
+
+fn assert_exact_recipients(actual: &[RepositoryId], expected: &[RepositoryId]) {
+    assert_eq!(actual.len(), expected.len(), "unexpected recipient count");
+    for repository_id in expected {
+        assert!(
+            actual.contains(repository_id),
+            "missing event recipient {repository_id}"
+        );
+    }
+}
+
 fn connect_command(project: &str, repository: &str, path: &str) -> ConnectOrchestrator {
     ConnectOrchestrator {
         project_key: project.to_owned(),
@@ -544,6 +575,19 @@ async fn feature_completion_is_revisioned_coordinator_owned_and_waits_for_linked
         })
         .await
         .unwrap();
+    assert_exact_recipients(
+        &event_recipients(
+            &store,
+            EventKind::RequestAvailable,
+            EventEntityType::Request,
+            &request.request_id.to_string(),
+        )
+        .await,
+        &[
+            backend.repository.repository_id,
+            android.repository.repository_id,
+        ],
+    );
     assert_eq!(request.feature_id, Some(feature.feature_id));
     assert!(
         store
@@ -3113,6 +3157,20 @@ async fn event_headers_expose_routing_fields_and_support_feature_owner_filters()
         })
         .await
         .unwrap();
+    assert_exact_recipients(
+        &event_recipients(
+            &store,
+            EventKind::FeatureCreated,
+            EventEntityType::Feature,
+            &feature.feature_id.to_string(),
+        )
+        .await,
+        &[
+            backend.repository.repository_id,
+            android.repository.repository_id,
+            web.repository.repository_id,
+        ],
+    );
     let feature_events = store
         .wait_for_events_filtered(
             ActorRef::Orchestrator(backend.instance.instance_id),
@@ -3157,6 +3215,19 @@ async fn event_headers_expose_routing_fields_and_support_feature_owner_filters()
         })
         .await
         .unwrap();
+    assert_exact_recipients(
+        &event_recipients(
+            &store,
+            EventKind::WorkItemCreated,
+            EventEntityType::WorkItem,
+            &item.work_item_id.to_string(),
+        )
+        .await,
+        &[
+            backend.repository.repository_id,
+            android.repository.repository_id,
+        ],
+    );
     let item_events = store
         .wait_for_events_filtered(
             ActorRef::Orchestrator(backend.instance.instance_id),
@@ -3221,6 +3292,19 @@ async fn event_headers_expose_routing_fields_and_support_feature_owner_filters()
         })
         .await
         .unwrap();
+    assert_exact_recipients(
+        &event_recipients(
+            &store,
+            EventKind::WorkerRunCreated,
+            EventEntityType::WorkerRun,
+            &worker.worker_run_id.to_string(),
+        )
+        .await,
+        &[
+            backend.repository.repository_id,
+            android.repository.repository_id,
+        ],
+    );
     let worker_events = store
         .wait_for_events_filtered(
             ActorRef::Orchestrator(android.instance.instance_id),
@@ -3263,6 +3347,19 @@ async fn event_headers_expose_routing_fields_and_support_feature_owner_filters()
         })
         .await
         .unwrap();
+    assert_exact_recipients(
+        &event_recipients(
+            &store,
+            EventKind::RequestAvailable,
+            EventEntityType::Request,
+            &request.request_id.to_string(),
+        )
+        .await,
+        &[
+            backend.repository.repository_id,
+            android.repository.repository_id,
+        ],
+    );
     let request_events = store
         .wait_for_events_filtered(
             ActorRef::Orchestrator(android.instance.instance_id),
@@ -3296,6 +3393,19 @@ async fn event_headers_expose_routing_fields_and_support_feature_owner_filters()
         })
         .await
         .unwrap();
+    assert_exact_recipients(
+        &event_recipients(
+            &store,
+            EventKind::WorkerRunCreated,
+            EventEntityType::WorkerRun,
+            &butler.worker_run_id.to_string(),
+        )
+        .await,
+        &[
+            backend.repository.repository_id,
+            android.repository.repository_id,
+        ],
+    );
     let butler_events = store
         .wait_for_events_filtered(
             ActorRef::Orchestrator(android.instance.instance_id),
@@ -3316,6 +3426,26 @@ async fn event_headers_expose_routing_fields_and_support_feature_owner_filters()
     assert_eq!(butler_event.entity_id, butler.worker_run_id.to_string());
     assert_eq!(butler_event.work_item_id, None);
     assert_eq!(butler_event.request_id, Some(request.request_id));
+
+    let message = store
+        .publish_message(publish_command(
+            ActorRef::Orchestrator(backend.instance.instance_id),
+            MessageTarget::Repositories(vec![android.repository.repository_id]),
+            "Explicit delivery only",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_exact_recipients(
+        &event_recipients(
+            &store,
+            EventKind::MessageAvailable,
+            EventEntityType::Message,
+            &message.message.message_id.to_string(),
+        )
+        .await,
+        &[android.repository.repository_id],
+    );
 
     store.pool.close().await;
     remove_database(&path);

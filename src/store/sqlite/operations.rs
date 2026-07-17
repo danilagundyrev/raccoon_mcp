@@ -101,35 +101,35 @@ impl SqliteStore {
         let mut recipients = Vec::new();
         for row in expired_workers {
             let worker_run_id: String = row.try_get("worker_run_id")?;
-            let repository_id = RepositoryId::parse(row.try_get("repository_id")?)?;
             let project_id = ProjectId::parse(row.try_get("project_id")?)?;
-            append_event(
+            let event_recipients = append_routed_event(
                 &mut transaction,
                 project_id,
-                repository_id,
                 EventKind::WorkerRunFailed,
                 EventEntityType::WorkerRun,
                 &worker_run_id,
                 &now,
             )
             .await?;
-            recipients.push(repository_id);
+            for repository_id in event_recipients {
+                push_event_recipient(&mut recipients, repository_id);
+            }
         }
         for row in expired_requests {
             let request_id: String = row.try_get("request_id")?;
             let project_id = ProjectId::parse(row.try_get("project_id")?)?;
-            let repository_id = RepositoryId::parse(row.try_get("target_repository_id")?)?;
-            append_event(
+            let event_recipients = append_routed_event(
                 &mut transaction,
                 project_id,
-                repository_id,
                 EventKind::RequestAvailable,
                 EventEntityType::Request,
                 &request_id,
                 &now,
             )
             .await?;
-            recipients.push(repository_id);
+            for repository_id in event_recipients {
+                push_event_recipient(&mut recipients, repository_id);
+            }
         }
         transaction.commit().await?;
         self.notify_repositories(&recipients);

@@ -100,10 +100,9 @@ impl SqliteStore {
         .bind(&now)
         .execute(&mut *transaction)
         .await?;
-        append_event(
+        let recipients = append_routed_event(
             &mut transaction,
             actor.project_id,
-            command.target_repository_id,
             EventKind::RequestAvailable,
             EventEntityType::Request,
             &request_id.to_string(),
@@ -121,7 +120,7 @@ impl SqliteStore {
         )
         .await?;
         transaction.commit().await?;
-        self.notifications.notify(command.target_repository_id);
+        self.notify_repositories(&recipients);
         self.get_request(request_id).await
     }
 
@@ -225,10 +224,9 @@ impl SqliteStore {
             }
             return Err(request_transition_conflict(request_id, "claim"));
         }
-        append_event(
+        let recipients = append_routed_event(
             &mut transaction,
             actor.project_id,
-            actor.repository_id,
             EventKind::RequestClaimed,
             EventEntityType::Request,
             &request_id.to_string(),
@@ -236,7 +234,7 @@ impl SqliteStore {
         )
         .await?;
         transaction.commit().await?;
-        self.notifications.notify(actor.repository_id);
+        self.notify_repositories(&recipients);
         self.get_request(request_id).await
     }
 
@@ -305,10 +303,9 @@ impl SqliteStore {
         if result.rows_affected() != 1 {
             return Err(request_transition_conflict(request_id, "release claim"));
         }
-        append_event(
+        let recipients = append_routed_event(
             &mut transaction,
             actor.project_id,
-            actor.repository_id,
             EventKind::RequestAvailable,
             EventEntityType::Request,
             &request_id.to_string(),
@@ -316,7 +313,7 @@ impl SqliteStore {
         )
         .await?;
         transaction.commit().await?;
-        self.notifications.notify(actor.repository_id);
+        self.notify_repositories(&recipients);
         self.get_request(request_id).await
     }
 
@@ -429,10 +426,9 @@ impl SqliteStore {
             &now,
         )
         .await?;
-        append_event(
+        let recipients = append_routed_event(
             &mut transaction,
             actor.project_id,
-            request.requester_repository_id,
             EventKind::RequestAnswered,
             EventEntityType::Request,
             &command.request_id.to_string(),
@@ -440,7 +436,7 @@ impl SqliteStore {
         )
         .await?;
         transaction.commit().await?;
-        self.notifications.notify(request.requester_repository_id);
+        self.notify_repositories(&recipients);
         Ok(AnswerRequestResult {
             request: self.get_request(command.request_id).await?,
             message,
@@ -495,15 +491,14 @@ impl SqliteStore {
         if result.rows_affected() != 1 {
             return Err(request_transition_conflict(command.request_id, "fail"));
         }
-        let (recipient, event_kind) = if command.retryable {
-            (actor.repository_id, EventKind::RequestAvailable)
+        let event_kind = if command.retryable {
+            EventKind::RequestAvailable
         } else {
-            (request.requester_repository_id, EventKind::RequestFailed)
+            EventKind::RequestFailed
         };
-        append_event(
+        let recipients = append_routed_event(
             &mut transaction,
             actor.project_id,
-            recipient,
             event_kind,
             EventEntityType::Request,
             &command.request_id.to_string(),
@@ -511,7 +506,7 @@ impl SqliteStore {
         )
         .await?;
         transaction.commit().await?;
-        self.notifications.notify(recipient);
+        self.notify_repositories(&recipients);
         self.get_request(command.request_id).await
     }
 }

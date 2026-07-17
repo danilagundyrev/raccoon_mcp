@@ -58,7 +58,7 @@ impl SqliteStore {
         .bind(&now)
         .execute(&mut *transaction)
         .await?;
-        let recipients = append_project_event(
+        let recipients = append_routed_event(
             &mut transaction,
             actor.project_id,
             EventKind::FeatureCreated,
@@ -198,7 +198,7 @@ impl SqliteStore {
                 feature.feature_id
             )));
         }
-        append_project_event(
+        append_routed_event(
             &mut transaction,
             feature.project_id,
             EventKind::FeatureUpdated,
@@ -207,7 +207,7 @@ impl SqliteStore {
             &now,
         )
         .await?;
-        let recipients = append_project_event(
+        let recipients = append_routed_event(
             &mut transaction,
             feature.project_id,
             EventKind::FeatureCompleted,
@@ -304,7 +304,7 @@ impl SqliteStore {
                 feature.feature_id
             )));
         }
-        append_project_event(
+        append_routed_event(
             &mut transaction,
             feature.project_id,
             EventKind::FeatureUpdated,
@@ -313,7 +313,7 @@ impl SqliteStore {
             &now,
         )
         .await?;
-        let recipients = append_project_event(
+        let recipients = append_routed_event(
             &mut transaction,
             feature.project_id,
             EventKind::FeatureCancelled,
@@ -459,7 +459,7 @@ impl SqliteStore {
             .execute(&mut *transaction)
             .await?;
         }
-        let recipients = append_project_event(
+        let recipients = append_routed_event(
             &mut transaction,
             actor.project_id,
             EventKind::WorkItemCreated,
@@ -938,7 +938,7 @@ impl SqliteStore {
         .bind(&now)
         .execute(&mut *transaction)
         .await?;
-        append_project_event(
+        append_routed_event(
             &mut transaction,
             actor.project_id,
             EventKind::WorkItemUpdated,
@@ -947,7 +947,7 @@ impl SqliteStore {
             &now,
         )
         .await?;
-        let recipients = append_project_event(
+        let recipients = append_routed_event(
             &mut transaction,
             actor.project_id,
             EventKind::AuditDepthIncreased,
@@ -2171,40 +2171,6 @@ async fn unlock_dependents(
     Ok(unlocked)
 }
 
-async fn append_project_event(
-    transaction: &mut Transaction<'_, Sqlite>,
-    project_id: ProjectId,
-    kind: EventKind,
-    entity_type: EventEntityType,
-    entity_id: &str,
-    now: &str,
-) -> Result<Vec<RepositoryId>, StoreError> {
-    let metadata = load_event_metadata(transaction, entity_type, entity_id).await?;
-    let rows = sqlx::query("SELECT repository_id FROM repositories WHERE project_id = ?")
-        .bind(project_id.to_string())
-        .fetch_all(&mut **transaction)
-        .await?;
-    let mut recipients = Vec::with_capacity(rows.len());
-    for row in rows {
-        let repository_id = RepositoryId::parse(row.try_get("repository_id")?)?;
-        insert_event(
-            transaction,
-            NewEvent {
-                project_id,
-                recipient_repository_id: repository_id,
-                kind,
-                entity_type,
-                entity_id,
-                created_at: now,
-            },
-            &metadata,
-        )
-        .await?;
-        recipients.push(repository_id);
-    }
-    Ok(recipients)
-}
-
 async fn append_work_item_events(
     transaction: &mut Transaction<'_, Sqlite>,
     project_id: ProjectId,
@@ -2213,7 +2179,7 @@ async fn append_work_item_events(
 ) -> Result<Vec<RepositoryId>, StoreError> {
     let mut recipients = Vec::new();
     for work_item_id in work_item_ids {
-        recipients = append_project_event(
+        let item_recipients = append_routed_event(
             transaction,
             project_id,
             EventKind::WorkItemUpdated,
@@ -2222,6 +2188,9 @@ async fn append_work_item_events(
             now,
         )
         .await?;
+        for repository_id in item_recipients {
+            push_event_recipient(&mut recipients, repository_id);
+        }
     }
     Ok(recipients)
 }

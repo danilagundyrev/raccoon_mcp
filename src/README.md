@@ -665,6 +665,15 @@ Rules:
 
 `feature_id` and `owner_repository_id` are optional server-side filters. Returned headers include those fields plus `entity_status`, `entity_revision`, and linked `work_item_id`/`request_id` where applicable. Use the compact header to decide whether the event matters, then load the full entity only when necessary. Status and revision are immutable snapshots captured after the mutation; they do not change when the entity changes later.
 
+Events are persisted only for interested repositories:
+
+- Feature create, update, completion, and cancellation events go to every repository in the project;
+- WorkItem events and workers linked to those items go to the owner repository and the Feature coordinator, with duplicate recipients removed;
+- request events and request-linked butler events go to the requester and target repositories;
+- message events go only to their explicit delivery recipients, including the expanded recipient set of a broadcast message.
+
+This means an unrelated repository does not receive every state transition from another repository. Durable history remains available through the authorized list/read tools; event routing only controls wake-up hints.
+
 Named consumers are scoped by `(repository_id, consumer_key)`. Two orchestrators in one repository should use different keys unless they intentionally share progress. `get_event_checkpoint` returns cursor `0` for a new key without creating it. Commits are monotonic and cannot point beyond the current event high-water mark.
 
 An event is a pointer, not the full object. Use `entity_type` and `entity_id` to call `read_message`, `read_request`, `get_worker_run`, `get_feature`, or `get_work_item`.

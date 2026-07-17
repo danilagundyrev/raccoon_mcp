@@ -506,6 +506,167 @@ async fn append_event(
     .await
 }
 
+async fn append_routed_event(
+    transaction: &mut Transaction<'_, Sqlite>,
+    project_id: ProjectId,
+    kind: EventKind,
+    entity_type: EventEntityType,
+    entity_id: &str,
+    created_at: &str,
+) -> Result<Vec<RepositoryId>, StoreError> {
+    let metadata = load_event_metadata(transaction, entity_type, entity_id).await?;
+    let recipients =
+        routed_event_recipients(transaction, project_id, entity_type, entity_id, &metadata).await?;
+    for recipient_repository_id in &recipients {
+        insert_event(
+            transaction,
+            NewEvent {
+                project_id,
+                recipient_repository_id: *recipient_repository_id,
+                kind,
+                entity_type,
+                entity_id,
+                created_at,
+            },
+            &metadata,
+        )
+        .await?;
+    }
+    Ok(recipients)
+}
+
+async fn routed_event_recipients(
+    transaction: &mut Transaction<'_, Sqlite>,
+    project_id: ProjectId,
+    entity_type: EventEntityType,
+    entity_id: &str,
+    metadata: &EventMetadata,
+) -> Result<Vec<RepositoryId>, StoreError> {
+    let mut recipients = Vec::new();
+    match entity_type {
+        EventEntityType::Feature => {
+            let rows = sqlx::query(
+                "SELECT repository_id FROM repositories
+                 WHERE project_id = ? ORDER BY repository_id",
+            )
+            .bind(project_id.to_string())
+            .fetch_all(&mut **transaction)
+            .await?;
+            for row in rows {
+                push_event_recipient(
+                    &mut recipients,
+                    RepositoryId::parse(row.try_get("repository_id")?)?,
+                );
+            }
+        }
+        EventEntityType::WorkItem => {
+            if let Some(owner_repository_id) = metadata.owner_repository_id {
+                push_event_recipient(&mut recipients, owner_repository_id);
+            }
+            append_feature_coordinator(
+                transaction,
+                project_id,
+                metadata.feature_id,
+                &mut recipients,
+            )
+            .await?;
+        }
+        EventEntityType::WorkerRun if metadata.work_item_id.is_some() => {
+            if let Some(owner_repository_id) = metadata.owner_repository_id {
+                push_event_recipient(&mut recipients, owner_repository_id);
+            }
+            append_feature_coordinator(
+                transaction,
+                project_id,
+                metadata.feature_id,
+                &mut recipients,
+            )
+            .await?;
+        }
+        EventEntityType::WorkerRun if metadata.request_id.is_some() => {
+            append_request_participants(
+                transaction,
+                project_id,
+                metadata.request_id.expect("checked request link"),
+                &mut recipients,
+            )
+            .await?;
+        }
+        EventEntityType::WorkerRun => {
+            if let Some(owner_repository_id) = metadata.owner_repository_id {
+                push_event_recipient(&mut recipients, owner_repository_id);
+            }
+        }
+        EventEntityType::Request => {
+            append_request_participants(
+                transaction,
+                project_id,
+                RequestId::parse(entity_id)?,
+                &mut recipients,
+            )
+            .await?;
+        }
+        EventEntityType::Message => {
+            return Err(StoreError::Conflict(
+                "message events require explicit delivery recipients".to_owned(),
+            ));
+        }
+    }
+    Ok(recipients)
+}
+
+async fn append_feature_coordinator(
+    transaction: &mut Transaction<'_, Sqlite>,
+    project_id: ProjectId,
+    feature_id: Option<FeatureId>,
+    recipients: &mut Vec<RepositoryId>,
+) -> Result<(), StoreError> {
+    let Some(feature_id) = feature_id else {
+        return Ok(());
+    };
+    let coordinator_repository_id: String = sqlx::query_scalar(
+        "SELECT coordinator_repository_id FROM features
+         WHERE feature_id = ? AND project_id = ?",
+    )
+    .bind(feature_id.to_string())
+    .bind(project_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    push_event_recipient(recipients, RepositoryId::parse(&coordinator_repository_id)?);
+    Ok(())
+}
+
+async fn append_request_participants(
+    transaction: &mut Transaction<'_, Sqlite>,
+    project_id: ProjectId,
+    request_id: RequestId,
+    recipients: &mut Vec<RepositoryId>,
+) -> Result<(), StoreError> {
+    let row = sqlx::query(
+        "SELECT requester_repository_id, target_repository_id FROM requests
+         WHERE request_id = ? AND project_id = ?",
+    )
+    .bind(request_id.to_string())
+    .bind(project_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    push_event_recipient(
+        recipients,
+        RepositoryId::parse(row.try_get("requester_repository_id")?)?,
+    );
+    push_event_recipient(
+        recipients,
+        RepositoryId::parse(row.try_get("target_repository_id")?)?,
+    );
+    Ok(())
+}
+
+fn push_event_recipient(recipients: &mut Vec<RepositoryId>, repository_id: RepositoryId) {
+    if !recipients.contains(&repository_id) {
+        recipients.push(repository_id);
+    }
+}
+
 async fn insert_event(
     transaction: &mut Transaction<'_, Sqlite>,
     event: NewEvent<'_>,

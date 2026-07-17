@@ -616,6 +616,10 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
         guide_payload["event_headers"]["filters"],
         json!(["kinds", "feature_id", "owner_repository_id"])
     );
+    assert_eq!(
+        guide_payload["event_headers"]["recipient_policy"]["work_item_and_linked_worker"],
+        "owner repository plus Feature coordinator"
+    );
     assert!(
         guide_payload["work_flow"]
             .as_array()

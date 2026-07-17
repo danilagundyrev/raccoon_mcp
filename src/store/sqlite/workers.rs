@@ -112,7 +112,7 @@ impl SqliteStore {
         .execute(&mut *transaction)
         .await?;
 
-        let (work_item_recipients, audit_scope) = super::work::attach_worker_to_work_item(
+        let (mut recipients, audit_scope) = super::work::attach_worker_to_work_item(
             &mut transaction,
             worker_run_id,
             &command,
@@ -136,16 +136,18 @@ impl SqliteStore {
             .await?;
         }
 
-        append_event(
+        let worker_recipients = append_routed_event(
             &mut transaction,
             project_id,
-            repository_id,
             EventKind::WorkerRunCreated,
             EventEntityType::WorkerRun,
             &worker_run_id.to_string(),
             &now,
         )
         .await?;
+        for repository_id in worker_recipients {
+            push_event_recipient(&mut recipients, repository_id);
+        }
         record_idempotent_result(
             &mut transaction,
             &actor_key,
@@ -158,10 +160,7 @@ impl SqliteStore {
         .await?;
 
         transaction.commit().await?;
-        self.notifications.notify(repository_id);
-        for recipient_id in work_item_recipients {
-            self.notifications.notify(recipient_id);
-        }
+        self.notify_repositories(&recipients);
         self.get_worker_run(worker_run_id).await
     }
 
@@ -193,10 +192,9 @@ impl SqliteStore {
                 .await?;
                 let project_id =
                     repository_project_id(&mut transaction, worker.repository_id).await?;
-                append_event(
+                let recipients = append_routed_event(
                     &mut transaction,
                     project_id,
-                    worker.repository_id,
                     EventKind::WorkerRunActive,
                     EventEntityType::WorkerRun,
                     &worker_run_id.to_string(),
@@ -204,7 +202,7 @@ impl SqliteStore {
                 )
                 .await?;
                 transaction.commit().await?;
-                self.notifications.notify(worker.repository_id);
+                self.notify_repositories(&recipients);
                 self.get_worker_run(worker_run_id).await
             }
             WorkerRunStatus::Active => {
@@ -411,10 +409,9 @@ impl SqliteStore {
             WorkerRunStatus::Failed => EventKind::WorkerRunFailed,
             _ => unreachable!("finish_worker_run validates terminal status"),
         };
-        append_event(
+        let recipients = append_routed_event(
             &mut transaction,
             project_id,
-            worker.repository_id,
             event_kind,
             EventEntityType::WorkerRun,
             &worker_run_id.to_string(),
@@ -422,7 +419,7 @@ impl SqliteStore {
         )
         .await?;
         transaction.commit().await?;
-        self.notifications.notify(worker.repository_id);
+        self.notify_repositories(&recipients);
         self.get_worker_run(worker_run_id).await
     }
 }
