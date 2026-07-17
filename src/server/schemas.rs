@@ -54,7 +54,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "create_worker_run",
-            "description": "Create a worker for a claimed repository-owned work item, or a request-scoped butler. Work-item attempts are sequential: created, active or completed attempts block another run; retry is allowed after failed or abandoned.",
+            "description": "Create one exactly scoped worker run. Executor and auditor roles require work_item_id and forbid request_id; butler requires request_id and forbids work_item_id. Work-item attempts are sequential: created, active or completed attempts block another run; retry is allowed after failed or abandoned.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -85,12 +85,12 @@ pub(super) fn tool_definitions(
                     "work_item_id": {
                         "type": "string",
                         "format": "uuid",
-                        "description": "Claimed implementation, audit or remediation work item. Its kind must match the worker role."
+                        "description": "Required for executor and auditor, forbidden for butler. The claimed implementation, audit or remediation kind must match the worker role."
                     },
                     "request_id": {
                         "type": "string",
                         "format": "uuid",
-                        "description": "Required only for a request-scoped butler. The butler may claim and answer only this request."
+                        "description": "Required for butler and forbidden for executor/auditor. The butler may claim and answer only this request."
                     }
                 },
                 "required": ["instance_id", "role", "task_summary"]

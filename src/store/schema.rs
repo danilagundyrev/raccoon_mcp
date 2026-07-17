@@ -194,7 +194,10 @@ CREATE TABLE IF NOT EXISTS worker_runs (
     CHECK(
         (role = 'butler' AND request_id IS NOT NULL
             AND work_item_id IS NULL AND addresses_audit_run_id IS NULL)
-        OR (role <> 'butler' AND request_id IS NULL)
+        OR (role = 'auditor' AND work_item_id IS NOT NULL
+            AND request_id IS NULL AND addresses_audit_run_id IS NULL)
+        OR (role = 'executor' AND work_item_id IS NOT NULL
+            AND request_id IS NULL)
     )
 );
 

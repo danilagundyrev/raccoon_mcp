@@ -98,6 +98,80 @@ fn audit_outcome(work_item_id: WorkItemId, verdict: AuditVerdict) -> AuditOutcom
     }
 }
 
+#[test]
+fn worker_run_role_requires_exactly_one_matching_scope_link() {
+    let work_item_id = WorkItemId::new();
+    let request_id = RequestId::new();
+    let command = |role, work_item_id, request_id| CreateWorkerRun {
+        parent_instance_id: InstanceId::new(),
+        role,
+        task_summary: "Validate worker scope".to_owned(),
+        context_refs: json!([]),
+        addresses_audit_run_id: None,
+        work_item_id,
+        request_id,
+    };
+
+    assert!(
+        validate_worker_run_command(&command(WorkerRole::Executor, Some(work_item_id), None,))
+            .is_ok()
+    );
+    assert!(
+        validate_worker_run_command(&command(WorkerRole::Auditor, Some(work_item_id), None,))
+            .is_ok()
+    );
+    assert!(
+        validate_worker_run_command(&command(WorkerRole::Butler, None, Some(request_id),)).is_ok()
+    );
+
+    for invalid in [
+        command(WorkerRole::Executor, None, None),
+        command(WorkerRole::Executor, Some(work_item_id), Some(request_id)),
+        command(WorkerRole::Auditor, None, None),
+        command(WorkerRole::Auditor, Some(work_item_id), Some(request_id)),
+        command(WorkerRole::Butler, None, None),
+        command(WorkerRole::Butler, Some(work_item_id), None),
+        command(WorkerRole::Butler, Some(work_item_id), Some(request_id)),
+    ] {
+        assert!(matches!(
+            validate_worker_run_command(&invalid),
+            Err(StoreError::Conflict(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn fresh_schema_rejects_an_unscoped_executor_run() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "worker-scope-schema",
+            "backend",
+            "C:/worker-scope-schema/backend",
+        ))
+        .await
+        .unwrap();
+    let inserted = sqlx::query(
+        "INSERT INTO worker_runs(
+             worker_run_id, repository_id, parent_instance_id, role, status,
+             task_summary, context_refs_json, created_at, last_heartbeat_at, lease_expires_at
+         ) VALUES (?, ?, ?, 'executor', 'created', ?, '[]', ?, ?, ?)",
+    )
+    .bind(WorkerRunId::new().to_string())
+    .bind(connected.repository.repository_id.to_string())
+    .bind(connected.instance.instance_id.to_string())
+    .bind("Unscoped executor must be rejected")
+    .bind("2026-07-18T00:00:00Z")
+    .bind("2026-07-18T00:00:00Z")
+    .bind("2026-07-18T00:01:30Z")
+    .execute(&store.pool)
+    .await;
+    assert!(inserted.is_err());
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
 async fn create_claimed_audit_item(
     store: &SqliteStore,
     connected: &ConnectResult,
@@ -130,6 +204,72 @@ async fn create_claimed_audit_item(
         )
         .await
         .unwrap()
+}
+
+async fn create_claimed_implementation_item(
+    store: &SqliteStore,
+    connected: &ConnectResult,
+    label: &str,
+) -> WorkItem {
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: connected.instance.instance_id,
+            title: format!("Feature for {label}"),
+            summary: format!("Worker lifecycle fixture for {label}"),
+        })
+        .await
+        .unwrap();
+    let item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: label.to_owned(),
+            summary: format!("Implementation work for {label}"),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .claim_work_item(
+            connected.instance.instance_id,
+            item.work_item_id,
+            item.revision,
+        )
+        .await
+        .unwrap()
+}
+
+async fn publish_implementation_report(
+    store: &SqliteStore,
+    worker_run_id: WorkerRunId,
+    item: &WorkItem,
+) {
+    store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Worker(worker_run_id),
+            kind: MessageKind::Report,
+            target: MessageTarget::Broadcast,
+            summary: format!("{} implemented", item.title),
+            body: Some("Implementation evidence".to_owned()),
+            artifact_kind: ArtifactKind::ImplementationReport,
+            artifact_title: None,
+            content_type: "text/markdown".to_owned(),
+            feature_id: Some(item.feature_id),
+            work_item_id: Some(item.work_item_id),
+            request_id: None,
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap();
 }
 
 async fn create_auditor_run(
@@ -1326,6 +1466,7 @@ async fn worker_run_completes_full_lifecycle_in_parent_repository() {
         .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
         .await
         .unwrap();
+    let item = create_claimed_implementation_item(&store, &connected, "Fake endpoint").await;
     let created = store
         .create_worker_run(CreateWorkerRun {
             parent_instance_id: connected.instance.instance_id,
@@ -1334,7 +1475,7 @@ async fn worker_run_completes_full_lifecycle_in_parent_repository() {
             context_refs: json!([{ "kind": "message", "id": "message-1" }]),
             addresses_audit_run_id: None,
             request_id: None,
-            work_item_id: None,
+            work_item_id: Some(item.work_item_id),
         })
         .await
         .unwrap();
@@ -1347,6 +1488,7 @@ async fn worker_run_completes_full_lifecycle_in_parent_repository() {
         .unwrap();
     assert_eq!(active.status, WorkerRunStatus::Active);
     assert!(active.activated_at.is_some());
+    publish_implementation_report(&store, active.worker_run_id, &item).await;
     let completed = store
         .complete_worker_run(active.worker_run_id, "Fake endpoint implemented")
         .await
@@ -1474,6 +1616,7 @@ async fn completed_worker_run_rejects_reactivation() {
         .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
         .await
         .unwrap();
+    let item = create_claimed_implementation_item(&store, &connected, "Inspect contract").await;
     let created = store
         .create_worker_run(CreateWorkerRun {
             parent_instance_id: connected.instance.instance_id,
@@ -1482,7 +1625,7 @@ async fn completed_worker_run_rejects_reactivation() {
             context_refs: json!([]),
             addresses_audit_run_id: None,
             request_id: None,
-            work_item_id: None,
+            work_item_id: Some(item.work_item_id),
         })
         .await
         .unwrap();
@@ -1490,6 +1633,7 @@ async fn completed_worker_run_rejects_reactivation() {
         .activate_worker_run(created.worker_run_id)
         .await
         .unwrap();
+    publish_implementation_report(&store, created.worker_run_id, &item).await;
     store
         .complete_worker_run(created.worker_run_id, "Contract summarized")
         .await
@@ -1512,6 +1656,7 @@ async fn concurrent_finish_transitions_cannot_overwrite_each_other() {
         .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
         .await
         .unwrap();
+    let item = create_claimed_implementation_item(&store, &connected, "Race finish").await;
     let created = store
         .create_worker_run(CreateWorkerRun {
             parent_instance_id: connected.instance.instance_id,
@@ -1520,7 +1665,7 @@ async fn concurrent_finish_transitions_cannot_overwrite_each_other() {
             context_refs: json!([]),
             addresses_audit_run_id: None,
             request_id: None,
-            work_item_id: None,
+            work_item_id: Some(item.work_item_id),
         })
         .await
         .unwrap();
@@ -1555,6 +1700,7 @@ async fn expired_worker_run_cannot_complete_or_fail() {
         ))
         .await
         .unwrap();
+    let item = create_claimed_implementation_item(&store, &connected, "Expire before finish").await;
     let worker = store
         .create_worker_run(CreateWorkerRun {
             parent_instance_id: connected.instance.instance_id,
@@ -1563,7 +1709,7 @@ async fn expired_worker_run_cannot_complete_or_fail() {
             context_refs: json!([]),
             addresses_audit_run_id: None,
             request_id: None,
-            work_item_id: None,
+            work_item_id: Some(item.work_item_id),
         })
         .await
         .unwrap();
@@ -1812,6 +1958,7 @@ async fn active_worker_can_publish_without_creating_repository() {
         .connect_orchestrator(connect_command("project", "web", "C:/project/web"))
         .await
         .unwrap();
+    let item = create_claimed_implementation_item(&store, &backend, "Publish report").await;
     let worker = store
         .create_worker_run(CreateWorkerRun {
             parent_instance_id: backend.instance.instance_id,
@@ -1820,7 +1967,7 @@ async fn active_worker_can_publish_without_creating_repository() {
             context_refs: json!([]),
             addresses_audit_run_id: None,
             request_id: None,
-            work_item_id: None,
+            work_item_id: Some(item.work_item_id),
         })
         .await
         .unwrap();
@@ -1975,6 +2122,7 @@ async fn expired_worker_cannot_renew_or_publish() {
         .connect_orchestrator(connect_command("project", "backend", "C:/project/backend"))
         .await
         .unwrap();
+    let item = create_claimed_implementation_item(&store, &backend, "Expire publisher").await;
     let worker = store
         .create_worker_run(CreateWorkerRun {
             parent_instance_id: backend.instance.instance_id,
@@ -1983,7 +2131,7 @@ async fn expired_worker_cannot_renew_or_publish() {
             context_refs: json!([]),
             addresses_audit_run_id: None,
             request_id: None,
-            work_item_id: None,
+            work_item_id: Some(item.work_item_id),
         })
         .await
         .unwrap();
@@ -3171,6 +3319,103 @@ async fn queued_message_is_returned_as_repository_event() {
         published.message.message_id.to_string()
     );
     assert_eq!(batch.next_cursor, batch.events[0].event_id);
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn defensive_worker_routing_unions_every_persisted_scope_link() {
+    let (store, path) = test_store(90).await;
+    let backend = store
+        .connect_orchestrator(connect_command(
+            "defensive-routing",
+            "backend",
+            "C:/defensive-routing/backend",
+        ))
+        .await
+        .unwrap();
+    let android = store
+        .connect_orchestrator(connect_command(
+            "defensive-routing",
+            "android",
+            "C:/defensive-routing/android",
+        ))
+        .await
+        .unwrap();
+    let web = store
+        .connect_orchestrator(connect_command(
+            "defensive-routing",
+            "web",
+            "C:/defensive-routing/web",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: backend.instance.instance_id,
+            title: "Defensive routing".to_owned(),
+            summary: "Union recipients if persisted worker links are ever inconsistent".to_owned(),
+        })
+        .await
+        .unwrap();
+    let item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: backend.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: android.repository.repository_id,
+            title: "Android work".to_owned(),
+            summary: "Provides work-linked routing metadata".to_owned(),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    let request = store
+        .ask_repository(AskRepository {
+            actor: ActorRef::Orchestrator(backend.instance.instance_id),
+            target_repository_id: web.repository.repository_id,
+            feature_id: Some(feature.feature_id),
+            work_item_id: None,
+            question_summary: "Web question".to_owned(),
+            body: None,
+            context_refs: json!([]),
+            handler_requirement: HandlerRequirement::ButlerRequired,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
+        })
+        .await
+        .unwrap();
+
+    let mut transaction = store.pool.begin().await.unwrap();
+    let recipients = routed_event_recipients(
+        &mut transaction,
+        backend.project.project_id,
+        EventEntityType::WorkerRun,
+        &WorkerRunId::new().to_string(),
+        &EventMetadata {
+            feature_id: Some(feature.feature_id),
+            owner_repository_id: Some(android.repository.repository_id),
+            work_item_id: Some(item.work_item_id),
+            request_id: Some(request.request_id),
+            ..EventMetadata::default()
+        },
+    )
+    .await
+    .unwrap();
+    transaction.rollback().await.unwrap();
+    assert_exact_recipients(
+        &recipients,
+        &[
+            backend.repository.repository_id,
+            android.repository.repository_id,
+            web.repository.repository_id,
+        ],
+    );
 
     store.pool.close().await;
     remove_database(&path);
@@ -4490,6 +4735,14 @@ async fn creation_idempotency_replays_result_and_rejects_changed_payload() {
         first_work_item.work_item_id,
         replayed_work_item.work_item_id
     );
+    let claimed_work_item = store
+        .claim_work_item(
+            backend.instance.instance_id,
+            first_work_item.work_item_id,
+            first_work_item.revision,
+        )
+        .await
+        .unwrap();
 
     let worker_command = CreateWorkerRun {
         parent_instance_id: backend.instance.instance_id,
@@ -4498,7 +4751,7 @@ async fn creation_idempotency_replays_result_and_rejects_changed_payload() {
         context_refs: json!([]),
         addresses_audit_run_id: None,
         request_id: None,
-        work_item_id: None,
+        work_item_id: Some(claimed_work_item.work_item_id),
     };
     let first_worker = store
         .create_worker_run_idempotent(worker_command.clone(), Some("worker-key"))

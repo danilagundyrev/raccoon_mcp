@@ -44,6 +44,32 @@ fn worker_schema_uses_configured_summary_limit() {
 }
 
 #[test]
+fn worker_schema_documents_the_exclusive_role_scope_matrix() {
+    let tools = tool_definitions(1024, 4096, 60);
+    let worker = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "create_worker_run")
+        .unwrap();
+    let description = worker["description"].as_str().unwrap();
+    assert!(description.contains("Executor and auditor roles require work_item_id"));
+    assert!(description.contains("butler requires request_id"));
+    assert!(
+        worker["inputSchema"]["properties"]["work_item_id"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("forbidden for butler")
+    );
+    assert!(
+        worker["inputSchema"]["properties"]["request_id"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("forbidden for executor/auditor")
+    );
+}
+
+#[test]
 fn actor_scoped_schemas_keep_named_properties_without_top_level_composition() {
     for schema in [
         actor_entity_schema("request_id"),
@@ -174,6 +200,12 @@ fn rpc_trace_fields_separate_transport_and_coordination_request_ids() {
     let instance_id = InstanceId::new();
     let coordination_request_id = RequestId::new();
     let work_item_id = WorkItemId::new();
+    let owner_repository_id = RepositoryId::new();
+    let target_repository_id = RepositoryId::new();
+    let parent_work_item_id = WorkItemId::new();
+    let addresses_audit_run_id = WorkerRunId::new();
+    let thread_id = ThreadId::new();
+    let in_reply_to = MessageId::new();
     let payload = json!({
         "jsonrpc": "2.0",
         "id": 42,
@@ -183,7 +215,17 @@ fn rpc_trace_fields_separate_transport_and_coordination_request_ids() {
             "arguments": {
                 "instance_id": instance_id,
                 "request_id": coordination_request_id,
-                "work_item_id": work_item_id
+                "work_item_id": work_item_id,
+                "owner_repository_id": owner_repository_id,
+                "target_repository_id": target_repository_id,
+                "parent_work_item_id": parent_work_item_id,
+                "addresses_audit_run_id": addresses_audit_run_id,
+                "thread_id": thread_id,
+                "in_reply_to": in_reply_to,
+                "correlation_id": "trace-correlation",
+                "dependency_ids": [WorkItemId::new(), WorkItemId::new()],
+                "audit_scope_work_item_ids": [WorkItemId::new()],
+                "target_repository_ids": [RepositoryId::new(), RepositoryId::new()]
             }
         }
     });
@@ -199,7 +241,64 @@ fn rpc_trace_fields_separate_transport_and_coordination_request_ids() {
         coordination_request_id.to_string()
     );
     assert_eq!(fields.work_item_id, work_item_id.to_string());
+    assert_eq!(fields.owner_repository_id, owner_repository_id.to_string());
+    assert_eq!(
+        fields.target_repository_id,
+        target_repository_id.to_string()
+    );
+    assert_eq!(fields.parent_work_item_id, parent_work_item_id.to_string());
+    assert_eq!(
+        fields.addresses_audit_run_id,
+        addresses_audit_run_id.to_string()
+    );
+    assert_eq!(fields.thread_id, thread_id.to_string());
+    assert_eq!(fields.in_reply_to, in_reply_to.to_string());
+    assert_eq!(fields.correlation_id, "trace-correlation");
+    assert_eq!(fields.dependency_count, 2);
+    assert_eq!(fields.audit_scope_count, 1);
+    assert_eq!(fields.target_repository_count, 2);
     assert!(!fields.is_notification);
+}
+
+#[test]
+fn rpc_trace_fields_cover_control_and_recovery_envelopes_compactly() {
+    let cancelled = RpcTraceFields::from_payload(
+        Some("session-123"),
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": "rpc-to-cancel" }
+        }),
+    );
+    assert_eq!(cancelled.cancelled_rpc_request_id, "rpc-to-cancel");
+    assert!(cancelled.is_notification);
+
+    let resource = RpcTraceFields::from_payload(
+        Some("session-123"),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "resource-call",
+            "method": "resources/read",
+            "params": { "uri": "hub://work-item/example" }
+        }),
+    );
+    assert_eq!(resource.resource_uri, "hub://work-item/example");
+
+    let cursor = MessageId::new();
+    let history = RpcTraceFields::from_payload(
+        Some("session-123"),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "history-call",
+            "method": "tools/call",
+            "params": {
+                "name": "list_messages",
+                "arguments": { "after_message_id": cursor }
+            }
+        }),
+    );
+    assert_eq!(history.page_cursor_field, "after_message_id");
+    assert_eq!(history.page_cursor, cursor.to_string());
 }
 
 #[test]

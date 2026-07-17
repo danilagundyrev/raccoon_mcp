@@ -768,6 +768,11 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 | `complete_worker_run` | Complete an active worker. |
 | `fail_worker_run` | Fail a created or active worker. |
 
+Worker scope is exclusive. An `executor` or `auditor` must carry `work_item_id` and
+must not carry `request_id`; a `butler` must carry `request_id` and must not carry
+`work_item_id`. The runtime returns a stable conflict for an invalid combination,
+and a fresh database enforces the same matrix with a SQLite constraint.
+
 ### Requests
 
 | Tool | Purpose |
@@ -843,6 +848,8 @@ Every parsed JSON-RPC call produces one `MCP request completed` event inside an 
 - `session_id`, JSON-RPC `rpc_request_id`, method, and tool name;
 - raw actor and linked-entity IDs supplied by the client;
 - `coordination_request_id`, kept separate from the JSON-RPC request ID;
+- scalar ownership, lineage, thread/reply, cancellation, resource, and page-cursor links;
+- counts for dependency, audit-scope, and recipient arrays instead of dumping those arrays;
 - resolved `project_id` and `repository_id` after actor authorization;
 - total `duration_ms`, outcome, and a stable error code when the call failed.
 
@@ -1007,6 +1014,8 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
      claimed item.
 
 4. Use tracked worker runs for delegated child-agent work.
+   - Scope every run exactly once: executor/auditor use only `work_item_id`; butler uses
+     only `request_id`. Never submit both links or neither link.
    - Before spawning a child agent, claim the owner work item when the run implements a
      specific item, then call `create_worker_run` with role `executor` and that
      `work_item_id`.

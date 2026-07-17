@@ -92,13 +92,27 @@ struct RpcTraceFields {
     tool_name: String,
     raw_project_id: String,
     raw_repository_id: String,
+    owner_repository_id: String,
+    target_repository_id: String,
     instance_id: String,
     worker_run_id: String,
     coordination_request_id: String,
     feature_id: String,
     work_item_id: String,
+    parent_work_item_id: String,
+    addresses_audit_run_id: String,
     message_id: String,
     artifact_id: String,
+    thread_id: String,
+    in_reply_to: String,
+    correlation_id: String,
+    cancelled_rpc_request_id: String,
+    resource_uri: String,
+    page_cursor_field: String,
+    page_cursor: String,
+    dependency_count: usize,
+    audit_scope_count: usize,
+    target_repository_count: usize,
     is_notification: bool,
 }
 
@@ -143,6 +157,32 @@ impl RpcTraceFields {
                 .unwrap_or_default()
                 .to_owned()
         };
+        let collection_count = |name: &str| {
+            arguments
+                .and_then(|arguments| arguments.get(name))
+                .or_else(|| params.and_then(|params| params.get(name)))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len)
+        };
+        let (page_cursor_field, page_cursor) = [
+            "after_feature_id",
+            "after_work_item_id",
+            "after_worker_run_id",
+            "after_request_id",
+            "after_delivery_id",
+            "after_message_id",
+            "after_artifact_id",
+        ]
+        .into_iter()
+        .find_map(|name| {
+            arguments
+                .and_then(|arguments| arguments.get(name))
+                .or_else(|| params.and_then(|params| params.get(name)))
+                .map(json_rpc_id_text)
+                .filter(|value| !value.is_empty())
+                .map(|value| (name.to_owned(), value))
+        })
+        .unwrap_or_default();
         let rpc_request_id = request
             .and_then(|request| request.get("id"))
             .map(json_rpc_id_text)
@@ -162,13 +202,30 @@ impl RpcTraceFields {
                 .to_owned(),
             raw_project_id: field("project_id"),
             raw_repository_id: field("repository_id"),
+            owner_repository_id: field("owner_repository_id"),
+            target_repository_id: field("target_repository_id"),
             instance_id: field("instance_id"),
             worker_run_id: field("worker_run_id"),
             coordination_request_id: field("request_id"),
             feature_id: field("feature_id"),
             work_item_id: field("work_item_id"),
+            parent_work_item_id: field("parent_work_item_id"),
+            addresses_audit_run_id: field("addresses_audit_run_id"),
             message_id: field("message_id"),
             artifact_id: field("artifact_id"),
+            thread_id: field("thread_id"),
+            in_reply_to: field("in_reply_to"),
+            correlation_id: field("correlation_id"),
+            cancelled_rpc_request_id: params
+                .and_then(|params| params.get("requestId"))
+                .map(json_rpc_id_text)
+                .unwrap_or_default(),
+            resource_uri: field("uri"),
+            page_cursor_field,
+            page_cursor,
+            dependency_count: collection_count("dependency_ids"),
+            audit_scope_count: collection_count("audit_scope_work_item_ids"),
+            target_repository_count: collection_count("target_repository_ids"),
             is_notification: request.is_some_and(|request| !request.contains_key("id")),
         }
     }
@@ -182,13 +239,27 @@ impl RpcTraceFields {
             tool_name = %self.tool_name,
             raw_project_id = %self.raw_project_id,
             raw_repository_id = %self.raw_repository_id,
+            owner_repository_id = %self.owner_repository_id,
+            target_repository_id = %self.target_repository_id,
             instance_id = %self.instance_id,
             worker_run_id = %self.worker_run_id,
             coordination_request_id = %self.coordination_request_id,
             feature_id = %self.feature_id,
             work_item_id = %self.work_item_id,
+            parent_work_item_id = %self.parent_work_item_id,
+            addresses_audit_run_id = %self.addresses_audit_run_id,
             message_id = %self.message_id,
             artifact_id = %self.artifact_id,
+            thread_id = %self.thread_id,
+            in_reply_to = %self.in_reply_to,
+            correlation_id = %self.correlation_id,
+            cancelled_rpc_request_id = %self.cancelled_rpc_request_id,
+            resource_uri = %self.resource_uri,
+            page_cursor_field = %self.page_cursor_field,
+            page_cursor = %self.page_cursor,
+            dependency_count = self.dependency_count,
+            audit_scope_count = self.audit_scope_count,
+            target_repository_count = self.target_repository_count,
             project_id = tracing::field::Empty,
             repository_id = tracing::field::Empty,
             duration_ms = tracing::field::Empty,

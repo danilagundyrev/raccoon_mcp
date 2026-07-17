@@ -927,6 +927,7 @@ pub(super) async fn read_resource(
                 },
                 "worker_flow": [
                     "The orchestrator calls create_worker_run before spawning a child.",
+                    "Worker scope is exclusive: executor and auditor require work_item_id with no request_id; butler requires request_id with no work_item_id.",
                     "The child receives worker_run_id and calls activate_worker_run.",
                     "The child calls complete_worker_run or fail_worker_run before exiting.",
                     "Use one fresh executor child context per independent implementation WorkItem. Never move it to an unrelated WorkItem.",
@@ -1009,7 +1010,7 @@ pub(super) async fn read_resource(
                     "shutdown": "Graceful shutdown stops accepting calls, cancels session waiters and expires local actor and claim leases."
                 },
                 "observability": {
-                    "request_span": "Every parsed JSON-RPC call emits one INFO completion event inside an mcp_request span. The span separates rpc_request_id from coordination_request_id and adds resolved project_id/repository_id after authorization.",
+                    "request_span": "Every parsed JSON-RPC call emits one INFO completion event inside an mcp_request span. It separates rpc_request_id from coordination_request_id; records compact scalar entity links, collection counts, cancellation target, resource URI and recovery cursor; and adds resolved project_id/repository_id after authorization.",
                     "completion_fields": ["duration_ms", "outcome", "error_code"],
                     "wait_fields": ["wait_requested_timeout_seconds", "wait_effective_timeout_seconds", "wait_start_cursor", "wait_end_cursor", "wait_event_count", "wait_elapsed_ms", "wait_exit_reason"],
                     "maintenance": "Zero-change lease passes are DEBUG; INFO is emitted only when state is reaped or requeued."

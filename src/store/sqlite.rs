@@ -578,29 +578,27 @@ async fn routed_event_recipients(
             )
             .await?;
         }
-        EventEntityType::WorkerRun if metadata.work_item_id.is_some() => {
-            if let Some(owner_repository_id) = metadata.owner_repository_id {
-                push_event_recipient(&mut recipients, owner_repository_id);
-            }
-            append_feature_coordinator(
-                transaction,
-                project_id,
-                metadata.feature_id,
-                &mut recipients,
-            )
-            .await?;
-        }
-        EventEntityType::WorkerRun if metadata.request_id.is_some() => {
-            append_request_participants(
-                transaction,
-                project_id,
-                metadata.request_id.expect("checked request link"),
-                &mut recipients,
-            )
-            .await?;
-        }
         EventEntityType::WorkerRun => {
-            if let Some(owner_repository_id) = metadata.owner_repository_id {
+            if metadata.work_item_id.is_some() {
+                if let Some(owner_repository_id) = metadata.owner_repository_id {
+                    push_event_recipient(&mut recipients, owner_repository_id);
+                }
+                append_feature_coordinator(
+                    transaction,
+                    project_id,
+                    metadata.feature_id,
+                    &mut recipients,
+                )
+                .await?;
+            }
+            if let Some(request_id) = metadata.request_id {
+                append_request_participants(transaction, project_id, request_id, &mut recipients)
+                    .await?;
+            }
+            if metadata.work_item_id.is_none()
+                && metadata.request_id.is_none()
+                && let Some(owner_repository_id) = metadata.owner_repository_id
+            {
                 push_event_recipient(&mut recipients, owner_repository_id);
             }
         }
@@ -1098,9 +1096,10 @@ fn validate_worker_run_command(command: &CreateWorkerRun) -> Result<(), StoreErr
             }
         }
         WorkerRole::Executor => {
-            if command.addresses_audit_run_id.is_some() && command.work_item_id.is_none() {
+            if command.work_item_id.is_none() {
                 return Err(StoreError::Conflict(
-                    "remediation executor requires a claimed remediation work_item_id".to_owned(),
+                    "executor run requires a claimed implementation or remediation work_item_id"
+                        .to_owned(),
                 ));
             }
             if command.request_id.is_some() {
