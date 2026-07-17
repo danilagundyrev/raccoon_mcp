@@ -1433,7 +1433,9 @@ async fn upsert_project(
         .await?;
     if let Some(row) = existing {
         let project = project_from_row(&row)?;
-        if let Some(display_name) = command.project_display_name.as_deref() {
+        if let Some(display_name) = command.project_display_name.as_deref()
+            && display_name != project.display_name
+        {
             sqlx::query(
                 "UPDATE projects SET display_name = ?, updated_at = ? WHERE project_id = ?",
             )
@@ -1495,7 +1497,9 @@ async fn upsert_repository(
                 repository.repository_key, repository.canonical_path, command.canonical_path
             )
         });
-        if let Some(display_name) = command.repository_display_name.as_deref() {
+        if let Some(display_name) = command.repository_display_name.as_deref()
+            && display_name != repository.display_name
+        {
             sqlx::query(
                 "UPDATE repositories SET display_name = ?, updated_at = ? WHERE repository_id = ?",
             )

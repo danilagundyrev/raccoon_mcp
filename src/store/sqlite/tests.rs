@@ -528,6 +528,61 @@ async fn connects_multiple_repositories_to_one_project() {
 }
 
 #[tokio::test]
+async fn reconnect_updates_metadata_timestamps_only_when_stored_values_change() {
+    let (store, path) = test_store(90).await;
+    let mut initial = connect_command("metadata-time", "backend", "C:/metadata/backend");
+    initial.project_display_name = Some("Metadata Project".to_owned());
+    initial.repository_display_name = Some("Backend".to_owned());
+    let first = store.connect_orchestrator(initial.clone()).await.unwrap();
+
+    store.heartbeat(first.instance.instance_id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let identical = store.connect_orchestrator(initial.clone()).await.unwrap();
+    assert_eq!(identical.project.updated_at, first.project.updated_at);
+    assert_eq!(identical.repository.updated_at, first.repository.updated_at);
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let mut renamed_project = initial.clone();
+    renamed_project.project_display_name = Some("Renamed Project".to_owned());
+    let renamed_project = store.connect_orchestrator(renamed_project).await.unwrap();
+    assert_ne!(renamed_project.project.updated_at, first.project.updated_at);
+    assert_eq!(
+        renamed_project.repository.updated_at,
+        first.repository.updated_at
+    );
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let mut moved = connect_command("metadata-time", "backend", "D:/other/backend");
+    moved.project_display_name = None;
+    moved.repository_display_name = None;
+    let moved = store.connect_orchestrator(moved).await.unwrap();
+    assert_eq!(moved.project.updated_at, renamed_project.project.updated_at);
+    assert_eq!(moved.repository.updated_at, first.repository.updated_at);
+    assert_eq!(moved.repository.canonical_path, "C:/metadata/backend");
+    assert_eq!(moved.warnings.len(), 1);
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let mut renamed_repository = initial;
+    renamed_repository.project_display_name = None;
+    renamed_repository.repository_display_name = Some("Backend Platform".to_owned());
+    let renamed_repository = store
+        .connect_orchestrator(renamed_repository)
+        .await
+        .unwrap();
+    assert_eq!(
+        renamed_repository.project.updated_at,
+        renamed_project.project.updated_at
+    );
+    assert_ne!(
+        renamed_repository.repository.updated_at,
+        first.repository.updated_at
+    );
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn feature_completion_is_revisioned_coordinator_owned_and_waits_for_linked_requests() {
     let (store, path) = test_store(90).await;
     let backend = store

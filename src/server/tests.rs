@@ -698,6 +698,12 @@ async fn protocol_rejects_batches_and_never_responds_to_notifications() {
             .contains(&json!("wait_exit_reason"))
     );
     assert!(
+        guide_payload["operations"]["metadata_timestamps"]
+            .as_str()
+            .unwrap()
+            .contains("stored display metadata")
+    );
+    assert!(
         guide_payload["work_flow"]
             .as_array()
             .unwrap()

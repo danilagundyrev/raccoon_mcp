@@ -1005,6 +1005,7 @@ pub(super) async fn read_resource(
                     "readiness": "GET /readyz performs a harmless SQLite write and rolls the transaction back.",
                     "metrics": "GET /metrics is exposed only with --enable-metrics and computes compact counters on demand without message or artifact bodies.",
                     "maintenance": "A frequent indexed lease/session sweep disconnects expired actors and requeues expired request claims. Retention is disabled by default; when configured, each pass deletes at most 1000 old events and 1000 idempotency records.",
+                    "metadata_timestamps": "Project and repository updated_at values change only when stored display metadata changes. Heartbeat/reconnect presence does not touch them; a path mismatch preserves the registered canonical path and returns a warning.",
                     "shutdown": "Graceful shutdown stops accepting calls, cancels session waiters and expires local actor and claim leases."
                 },
                 "observability": {

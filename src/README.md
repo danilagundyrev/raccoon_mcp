@@ -163,6 +163,8 @@ Keep the returned IDs in the agent's working context:
 
 For a normal fresh process, omit `instance_id`. To reconnect a known instance, pass its previously returned ID. Never invent IDs or reuse an ID of another entity.
 
+Project and repository `updated_at` values describe stored metadata, not presence. Reconnecting or sending heartbeats with identical display names and paths leaves them unchanged. Supplying a different display name updates that entity and its timestamp. A different path for an existing repository key is not accepted silently: the original canonical path remains stored and `connect_orchestrator` returns a warning.
+
 After connecting, read `hub://guide`. It provides machine-readable bootstrap instructions and the current server limits.
 
 ## The normal delivery workflow
