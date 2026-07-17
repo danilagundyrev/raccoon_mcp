@@ -759,7 +759,7 @@ pub(super) async fn read_resource(
                     "The child calls complete_worker_run or fail_worker_run before exiting.",
                     "Use one fresh executor child context per independent implementation WorkItem. Never move it to an unrelated WorkItem.",
                     "Same-lineage remediation may continue in the original executor child when that context remains healthy, but create a new linked remediation worker_run_id. Use a fresh remediation child if the original is unavailable, saturated, repeatedly confused, or anchored to a fundamentally rejected approach.",
-                    "A failed or abandoned audit/remediation worker may be replaced on the same reclaimed work item; an active or completed attempt blocks replacement.",
+                    "A failed or abandoned work-item worker may be replaced on the same reopened and reclaimed card; any created, active or completed attempt blocks replacement.",
                     "A worker never calls connect_orchestrator and never creates a repository identity."
                 ],
                 "work_flow": [
@@ -767,9 +767,10 @@ pub(super) async fn read_resource(
                     "Higher numeric priority values are listed and claimed before lower values when other eligibility rules are equal.",
                     "Claim a ready item with expected_revision, then create an executor worker run linked by work_item_id.",
                     "The latest executor linked to the item publishes an implementation_report and completes its worker run.",
+                    "Once a linked executor publishes implementation_report, the implementation card cannot be cancelled to bypass verification; complete it with that report and audit it.",
                     "An orchestrator holding the active repository claim completes the item through update_work_item. A completed repository-local worker report remains valid after an expired claim is taken over by another orchestrator instance.",
                     "Every mutation increments revision and emits project-wide compact work_item_updated events; stale writes return the current card.",
-                    "The feature coordinator repository calls complete_feature with its current revision only after durable linked work, requests and workers are terminal; cancel_feature closes abandoned work under its stricter safety checks.",
+                    "The feature coordinator repository calls complete_feature with its current revision only after durable linked work, requests and every linked worker are terminal, including a butler whose request is already answered; cancel_feature closes abandoned work under its stricter safety checks.",
                     "Peer repositories stop waiting on feature_completed or feature_cancelled for the current feature and call disconnect_orchestrator before exit. MCP session DELETE is transport cleanup, not the durable completion signal."
                 ],
                 "audit_flow": [

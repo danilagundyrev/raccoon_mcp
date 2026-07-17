@@ -264,6 +264,8 @@ The linked item must have a live claim owned by the parent orchestrator. Creatin
 
 Spawn a new executor child context for every independent implementation WorkItem. Do not turn one long-lived child into a general repository worker that moves across unrelated cards. The context may be retained for remediation of that same WorkItem lineage after an independent audit, but remediation still receives a new `worker_run_id` and `addresses_audit_run_id`. Use a fresh remediation child when the original context is unavailable, saturated, repeatedly confused, or anchored to an approach the audit rejected fundamentally.
 
+A WorkItem has sequential worker attempts. While one attempt is `created` or `active`, another cannot be created; a `completed` attempt is final. A replacement run is allowed only after the previous attempt becomes `failed` or `abandoned` and the card is reopened and claimed again.
+
 Then spawn the child agent through the client/orchestrator mechanism and provide at least:
 
 - `worker_run_id`;
@@ -312,6 +314,8 @@ Before completion, the executor publishes its implementation report:
 
 Passing `body` creates the artifact. An executor linked to a work item cannot successfully call `complete_worker_run` until it has published its own `implementation_report` artifact.
 
+After any linked executor publishes an `implementation_report`, the implementation WorkItem cannot be cancelled. The orchestrator must accept the report through normal completion and obtain independent audit coverage. This prevents cancellation from becoming a verification bypass.
+
 Finish the worker run:
 
 ```json
@@ -343,10 +347,12 @@ The server verifies that the artifact is an `implementation_report` from the com
 planned -- dependencies complete --> ready
 ready -- claim_work_item -------> claimed
 claimed -- linked executor -----> in_progress
-in_progress --------------------> completed | failed | blocked | cancelled
-blocked ------------------------> in_progress | failed | cancelled
+in_progress --------------------> completed | failed | blocked | cancelled*
+blocked ------------------------> in_progress | failed | cancelled*
 failed -------------------------> ready | cancelled
 ```
+
+`cancelled*` is unavailable for an implementation WorkItem after any linked executor has published an `implementation_report`.
 
 Owner repository, parent item, and dependencies can only be changed while the item is `planned` or `ready`.
 
@@ -592,7 +598,7 @@ The repository that created a feature is its coordinator. After durable work sta
 }
 ```
 
-`complete_feature` rejects unfinished work items, open linked repository requests, active linked executors, auditors, and remediation runs. It also rejects every accepted implementation report whose WorkItem is not `verified` by an independent passing audit. `cancel_feature` rejects active claims, workers, and requests and atomically cancels remaining unclaimed `planned`, `ready`, or `failed` items; cancellation never changes verification state into `verified`. Both operations increment the feature revision and emit a terminal project-wide event.
+`complete_feature` rejects unfinished work items, open linked repository requests, and every active linked worker, including a butler whose request has already been answered. It also rejects every published implementation report whose WorkItem is not `verified` by an independent passing audit. `cancel_feature` rejects active claims, workers, and requests and atomically cancels remaining unclaimed `planned`, `ready`, or `failed` items; cancellation never changes verification state into `verified`. Both operations increment the feature revision and emit a terminal project-wide event.
 
 Peer repositories stop their wait loop when they receive `feature_completed` or `feature_cancelled` for the current feature. A repository that joins later reads the durable terminal status through `get_feature` or `list_features`; events are wake-up hints, not the source of truth. Every orchestrator calls `disconnect_orchestrator` before it exits. MCP session DELETE is transport cleanup, not the shared completion signal.
 
@@ -937,6 +943,11 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
    - The parent rereads the work item and completes it through `update_work_item` with the
      returned implementation artifact ID and current revision. A worker terminal state
      alone does not finish the work item.
+   - Worker attempts for one WorkItem are sequential. A `created`, `active`, or `completed`
+     attempt blocks another run; retry only after `failed` or `abandoned`, after reopening
+     and reclaiming the card.
+   - Never cancel an implementation WorkItem after a linked executor publishes an
+     `implementation_report`; the server requires normal completion and independent audit.
    - The same executor child may receive a focused remediation turn for its own WorkItem
      lineage when its context remains healthy, but create a new remediation `worker_run_id`
      linked through `addresses_audit_run_id`. Spawn a fresh remediation child when the old
@@ -1025,8 +1036,10 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
 10. Finish coordination from durable state.
     - Treat the requested shared task as complete only when its relevant work items are
       in the intended terminal states, required implementation reports are linked,
-      every accepted implementation report is `verified`, required audits/remediation are
+      every published implementation report is `verified`, required audits/remediation are
       finished, and no request necessary for completion remains unresolved.
+    - Before Feature completion or cancellation, ensure every linked worker is terminal,
+      including a request-scoped butler whose request has already been answered.
     - Use work-item states, worker-run states, requests, and linked artifacts as the
       completion source of truth.
     - If this repository coordinates the feature, reread it and call `complete_feature`

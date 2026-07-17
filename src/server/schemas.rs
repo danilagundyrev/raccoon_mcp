@@ -54,7 +54,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "create_worker_run",
-            "description": "Create a worker for a claimed repository-owned work item, or a request-scoped butler. Audit scope and remediation lineage come from the work item.",
+            "description": "Create a worker for a claimed repository-owned work item, or a request-scoped butler. Work-item attempts are sequential: created, active or completed attempts block another run; retry is allowed after failed or abandoned.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -177,7 +177,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "complete_feature",
-            "description": "Complete an active feature after all linked work, repository requests and worker runs are terminal and every accepted implementation report is independently verified. Only its coordinator repository may close it.",
+            "description": "Complete an active feature after all linked work, repository requests and worker runs are terminal, including request-linked butlers, and every published implementation report is independently verified. Only its coordinator repository may close it.",
             "inputSchema": feature_transition_schema(),
             "annotations": mutation_annotations(false)
         },
@@ -207,7 +207,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "update_work_item",
-            "description": "Update a work item using optimistic expected_revision. Completing implementation or remediation requires implementation_artifact_id from its completed executor; completing audit requires its completed auditor and audit_report and rejects implementation_artifact_id.",
+            "description": "Update a work item using optimistic expected_revision. Completing implementation or remediation requires implementation_artifact_id from its completed executor; completing audit requires its completed auditor and audit_report. An implementation item cannot be cancelled after a linked executor publishes implementation_report.",
             "inputSchema": update_work_item_schema(max_summary_bytes),
             "annotations": mutation_annotations(false)
         },

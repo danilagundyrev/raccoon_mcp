@@ -670,6 +670,227 @@ async fn feature_completion_is_revisioned_coordinator_owned_and_waits_for_linked
 }
 
 #[tokio::test]
+async fn reported_implementation_cannot_be_cancelled_to_bypass_audit() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "reported-cancellation",
+            "backend",
+            "C:/reported-cancellation/backend",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: connected.instance.instance_id,
+            title: "Reported implementation".to_owned(),
+            summary: "A report must not disappear through cancellation".to_owned(),
+        })
+        .await
+        .unwrap();
+    let item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: "Implement endpoint".to_owned(),
+            summary: "Implementation that has produced evidence".to_owned(),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 2,
+        })
+        .await
+        .unwrap();
+    let item = store
+        .claim_work_item(
+            connected.instance.instance_id,
+            item.work_item_id,
+            item.revision,
+        )
+        .await
+        .unwrap();
+    let executor = store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: connected.instance.instance_id,
+            role: WorkerRole::Executor,
+            task_summary: "Implement endpoint".to_owned(),
+            context_refs: json!([]),
+            addresses_audit_run_id: None,
+            request_id: None,
+            work_item_id: Some(item.work_item_id),
+        })
+        .await
+        .unwrap();
+    store
+        .activate_worker_run(executor.worker_run_id)
+        .await
+        .unwrap();
+    store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Worker(executor.worker_run_id),
+            kind: MessageKind::Report,
+            target: MessageTarget::Broadcast,
+            summary: "Endpoint implemented".to_owned(),
+            body: Some("Implementation evidence".to_owned()),
+            artifact_kind: ArtifactKind::ImplementationReport,
+            artifact_title: None,
+            content_type: "text/markdown".to_owned(),
+            feature_id: Some(feature.feature_id),
+            work_item_id: Some(item.work_item_id),
+            request_id: None,
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap();
+    store
+        .complete_worker_run(executor.worker_run_id, "Implementation complete")
+        .await
+        .unwrap();
+
+    let current = store.get_work_item(item.work_item_id).await.unwrap();
+    assert!(matches!(
+        store
+            .update_work_item(UpdateWorkItem {
+                parent_instance_id: connected.instance.instance_id,
+                work_item_id: item.work_item_id,
+                expected_revision: current.revision,
+                title: None,
+                summary: None,
+                owner_repository_id: None,
+                parent_work_item_id: None,
+                dependency_ids: None,
+                priority: None,
+                status: Some(WorkItemStatus::Cancelled),
+                implementation_artifact_id: None,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store
+            .complete_feature(CompleteFeature {
+                parent_instance_id: connected.instance.instance_id,
+                feature_id: feature.feature_id,
+                expected_revision: feature.revision,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn feature_waits_for_answered_request_butler_to_finish() {
+    let (store, path) = test_store(90).await;
+    let coordinator = store
+        .connect_orchestrator(connect_command(
+            "feature-butler",
+            "backend",
+            "C:/feature-butler/backend",
+        ))
+        .await
+        .unwrap();
+    let target = store
+        .connect_orchestrator(connect_command(
+            "feature-butler",
+            "android",
+            "C:/feature-butler/android",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: coordinator.instance.instance_id,
+            title: "Butler lifecycle".to_owned(),
+            summary: "The child must finish before the feature".to_owned(),
+        })
+        .await
+        .unwrap();
+    let request = store
+        .ask_repository(AskRepository {
+            actor: ActorRef::Orchestrator(coordinator.instance.instance_id),
+            target_repository_id: target.repository.repository_id,
+            feature_id: Some(feature.feature_id),
+            work_item_id: None,
+            question_summary: "Inspect the Android contract".to_owned(),
+            body: None,
+            context_refs: json!([]),
+            handler_requirement: HandlerRequirement::ButlerRequired,
+            answer_requirement: AnswerRequirement::SummaryAllowed,
+        })
+        .await
+        .unwrap();
+    let butler = store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: target.instance.instance_id,
+            role: WorkerRole::Butler,
+            task_summary: "Inspect the Android contract".to_owned(),
+            context_refs: json!([]),
+            addresses_audit_run_id: None,
+            request_id: Some(request.request_id),
+            work_item_id: None,
+        })
+        .await
+        .unwrap();
+    let butler = store
+        .activate_worker_run(butler.worker_run_id)
+        .await
+        .unwrap();
+    store
+        .claim_request(ActorRef::Worker(butler.worker_run_id), request.request_id)
+        .await
+        .unwrap();
+    store
+        .answer_request(AnswerRequest {
+            actor: ActorRef::Worker(butler.worker_run_id),
+            request_id: request.request_id,
+            answer_summary: "Android contract inspected".to_owned(),
+            body: None,
+            content_type: "text/plain".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .complete_feature(CompleteFeature {
+                parent_instance_id: coordinator.instance.instance_id,
+                feature_id: feature.feature_id,
+                expected_revision: feature.revision,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    store
+        .complete_worker_run(butler.worker_run_id, "Request answered")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .complete_feature(CompleteFeature {
+                parent_instance_id: coordinator.instance.instance_id,
+                feature_id: feature.feature_id,
+                expected_revision: feature.revision,
+            })
+            .await
+            .unwrap()
+            .status,
+        FeatureStatus::Completed
+    );
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
 async fn repository_request_infers_and_validates_work_item_feature_scope() {
     let (store, path) = test_store(90).await;
     let backend = store
@@ -1063,6 +1284,85 @@ async fn worker_run_completes_full_lifecycle_in_parent_repository() {
             EventKind::WorkerRunCompleted,
         ]
     );
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn implementation_worker_attempts_are_sequential_and_retryable() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "implementation-attempts",
+            "backend",
+            "C:/implementation-attempts/backend",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: connected.instance.instance_id,
+            title: "Sequential attempts".to_owned(),
+            summary: "Only one implementation executor may run at once".to_owned(),
+        })
+        .await
+        .unwrap();
+    let item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: "Implement sequentially".to_owned(),
+            summary: "Retry only after a terminal unsuccessful attempt".to_owned(),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 2,
+        })
+        .await
+        .unwrap();
+    let item = store
+        .claim_work_item(
+            connected.instance.instance_id,
+            item.work_item_id,
+            item.revision,
+        )
+        .await
+        .unwrap();
+    let worker_command = || CreateWorkerRun {
+        parent_instance_id: connected.instance.instance_id,
+        role: WorkerRole::Executor,
+        task_summary: "Implementation attempt".to_owned(),
+        context_refs: json!([]),
+        addresses_audit_run_id: None,
+        request_id: None,
+        work_item_id: Some(item.work_item_id),
+    };
+    let first = store.create_worker_run(worker_command()).await.unwrap();
+    store
+        .activate_worker_run(first.worker_run_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.create_worker_run(worker_command()).await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    store
+        .fail_worker_run(first.worker_run_id, "Transient failure")
+        .await
+        .unwrap();
+    fail_reopen_and_claim_work_item(&store, &connected, item.work_item_id).await;
+    let retry = store.create_worker_run(worker_command()).await.unwrap();
+    assert_ne!(retry.worker_run_id, first.worker_run_id);
+    assert!(matches!(
+        store.create_worker_run(worker_command()).await,
+        Err(StoreError::Conflict(_))
+    ));
 
     store.pool.close().await;
     remove_database(&path);

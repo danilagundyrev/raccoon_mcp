@@ -634,6 +634,28 @@ impl SqliteStore {
         let implementation_artifact_id = command
             .implementation_artifact_id
             .or(current.implementation_artifact_id);
+        if current.kind == WorkItemKind::Implementation && next_status == WorkItemStatus::Cancelled
+        {
+            let published_report: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM worker_runs worker
+                     JOIN artifacts artifact
+                       ON artifact.producer_worker_run_id = worker.worker_run_id
+                      AND artifact.kind = 'implementation_report'
+                     WHERE worker.work_item_id = ? AND worker.role = 'executor'
+                 )",
+            )
+            .bind(current.work_item_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+            if published_report != 0 {
+                return Err(StoreError::Conflict(
+                    "an implementation work item with a published implementation_report cannot be cancelled; complete and audit it instead"
+                        .to_owned(),
+                ));
+            }
+        }
         let verification_status = if current.kind == WorkItemKind::Implementation
             && next_status == WorkItemStatus::Completed
         {
@@ -1244,9 +1266,14 @@ async fn ensure_feature_has_no_active_workers(
                  SELECT 1 FROM worker_run_audit_items ai
                  JOIN work_items wi ON wi.work_item_id = ai.work_item_id
                  WHERE ai.worker_run_id = wr.addresses_audit_run_id AND wi.feature_id = ?
+             ) OR EXISTS (
+                 SELECT 1 FROM requests linked_request
+                 WHERE linked_request.request_id = wr.request_id
+                   AND linked_request.feature_id = ?
              )
          )",
     )
+    .bind(feature_id.to_string())
     .bind(feature_id.to_string())
     .bind(feature_id.to_string())
     .bind(feature_id.to_string())
@@ -1265,10 +1292,21 @@ async fn ensure_feature_implementation_is_verified(
     feature_id: FeatureId,
 ) -> Result<(), StoreError> {
     let unverified: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM work_items
-         WHERE feature_id = ? AND kind = 'implementation'
-           AND implementation_artifact_id IS NOT NULL
-           AND COALESCE(verification_status, '') <> 'verified'",
+        "SELECT COUNT(*) FROM work_items item
+         WHERE item.feature_id = ? AND item.kind = 'implementation'
+           AND COALESCE(item.verification_status, '') <> 'verified'
+           AND (
+               item.implementation_artifact_id IS NOT NULL
+               OR EXISTS (
+                   SELECT 1
+                   FROM worker_runs worker
+                   JOIN artifacts artifact
+                     ON artifact.producer_worker_run_id = worker.worker_run_id
+                    AND artifact.kind = 'implementation_report'
+                   WHERE worker.work_item_id = item.work_item_id
+                     AND worker.role = 'executor'
+               )
+           )",
     )
     .bind(feature_id.to_string())
     .fetch_one(&mut **transaction)
@@ -2076,23 +2114,21 @@ pub(super) async fn attach_worker_to_work_item(
             )));
         }
     }
-    if matches!(item.kind, WorkItemKind::Audit | WorkItemKind::Remediation) {
-        let blocking_attempts: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM worker_runs
-             WHERE work_item_id = ? AND worker_run_id <> ?
-               AND status IN ('created', 'active', 'completed')",
-        )
-        .bind(work_item_id.to_string())
-        .bind(worker_run_id.to_string())
-        .fetch_one(&mut **transaction)
-        .await?;
-        if blocking_attempts != 0 {
-            return Err(StoreError::Conflict(format!(
-                "{} work item {} already has an active or completed worker attempt",
-                item.kind.as_str(),
-                item.work_item_id
-            )));
-        }
+    let blocking_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM worker_runs
+         WHERE work_item_id = ? AND worker_run_id <> ?
+           AND status IN ('created', 'active', 'completed')",
+    )
+    .bind(work_item_id.to_string())
+    .bind(worker_run_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if blocking_attempts != 0 {
+        return Err(StoreError::Conflict(format!(
+            "{} work item {} already has an active or completed worker attempt",
+            item.kind.as_str(),
+            item.work_item_id
+        )));
     }
     if item.owner_repository_id != repository_id
         || item.assignee_instance_id != Some(command.parent_instance_id)
