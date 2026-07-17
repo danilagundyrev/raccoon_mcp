@@ -19,8 +19,8 @@ pub use ids::{
     WorkItemId, WorkerRunId,
 };
 pub use messaging::{
-    ActorRef, Artifact, ArtifactKind, DeliveryAck, InboxItem, InboxPage, Message, MessageKind,
-    MessageTarget, PublishMessage, PublishResult,
+    ActorRef, Artifact, ArtifactKind, AuditOutcomeInput, AuditVerdict, DeliveryAck, InboxItem,
+    InboxPage, Message, MessageKind, MessageTarget, PublishMessage, PublishResult,
 };
 pub use operations::{LeaseMaintenanceReport, OperationalMetrics, RetentionReport};
 pub use presence::{
@@ -33,7 +33,8 @@ pub use requests::{
 };
 pub use work::{
     CancelFeature, CompleteFeature, CreateFeature, CreateWorkItem, Feature, FeatureStatus,
-    UpdateWorkItem, WorkItem, WorkItemKind, WorkItemPage, WorkItemStatus,
+    IncreaseAuditDepth, UpdateWorkItem, VerificationStatus, WorkItem, WorkItemKind, WorkItemPage,
+    WorkItemStatus,
 };
 pub use worker::{AuditScopeItem, CreateWorkerRun, WorkerRole, WorkerRun, WorkerRunStatus};
 

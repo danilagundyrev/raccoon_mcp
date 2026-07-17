@@ -59,6 +59,14 @@ fn publish_command(
     }
 }
 
+fn audit_outcome(work_item_id: WorkItemId, verdict: AuditVerdict) -> AuditOutcomeInput {
+    AuditOutcomeInput {
+        work_item_id,
+        verdict,
+        summary: format!("Structured verdict for {work_item_id}"),
+    }
+}
+
 async fn create_claimed_audit_item(
     store: &SqliteStore,
     connected: &ConnectResult,
@@ -235,22 +243,28 @@ async fn feature_with_completed_item_and_audit(
         .await
         .unwrap();
     store
-        .publish_message(PublishMessage {
-            actor: ActorRef::Worker(audit.worker_run_id),
-            kind: MessageKind::Report,
-            target: MessageTarget::Broadcast,
-            summary: format!("{label} audit report"),
-            body: Some("No findings".to_owned()),
-            artifact_kind: ArtifactKind::AuditReport,
-            artifact_title: None,
-            content_type: "text/markdown".to_owned(),
-            feature_id: Some(feature.feature_id),
-            work_item_id: Some(item.work_item_id),
-            request_id: None,
-            thread_id: None,
-            correlation_id: None,
-            in_reply_to: None,
-        })
+        .publish_message_with_audit_outcomes(
+            PublishMessage {
+                actor: ActorRef::Worker(audit.worker_run_id),
+                kind: MessageKind::Report,
+                target: MessageTarget::Broadcast,
+                summary: format!("{label} audit report"),
+                body: Some("No findings".to_owned()),
+                artifact_kind: ArtifactKind::AuditReport,
+                artifact_title: None,
+                content_type: "text/markdown".to_owned(),
+                feature_id: Some(feature.feature_id),
+                work_item_id: Some(item.work_item_id),
+                request_id: None,
+                thread_id: None,
+                correlation_id: None,
+                in_reply_to: None,
+            },
+            &[audit_outcome(
+                item.work_item_id,
+                AuditVerdict::ChangesRequired,
+            )],
+        )
         .await
         .unwrap();
     let audit = store
@@ -259,6 +273,124 @@ async fn feature_with_completed_item_and_audit(
         .unwrap();
     complete_audit_work_item(store, connected, audit_item.work_item_id).await;
     (feature, item, audit)
+}
+
+async fn complete_implementation_work(
+    store: &SqliteStore,
+    connected: &ConnectResult,
+    feature_id: FeatureId,
+    item: &WorkItem,
+) -> WorkItem {
+    let claimed = store
+        .claim_work_item(
+            connected.instance.instance_id,
+            item.work_item_id,
+            item.revision,
+        )
+        .await
+        .unwrap();
+    let worker = store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: connected.instance.instance_id,
+            role: WorkerRole::Executor,
+            task_summary: format!("Implement {}", item.title),
+            context_refs: json!([]),
+            addresses_audit_run_id: None,
+            work_item_id: Some(item.work_item_id),
+        })
+        .await
+        .unwrap();
+    store
+        .activate_worker_run(worker.worker_run_id)
+        .await
+        .unwrap();
+    let report = store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Worker(worker.worker_run_id),
+            kind: MessageKind::Report,
+            target: MessageTarget::Broadcast,
+            summary: format!("{} implemented", item.title),
+            body: Some("Implementation report".to_owned()),
+            artifact_kind: ArtifactKind::ImplementationReport,
+            artifact_title: None,
+            content_type: "text/markdown".to_owned(),
+            feature_id: Some(feature_id),
+            work_item_id: Some(item.work_item_id),
+            request_id: None,
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
+    store
+        .complete_worker_run(worker.worker_run_id, "Implementation complete")
+        .await
+        .unwrap();
+    let current = store.get_work_item(item.work_item_id).await.unwrap();
+    assert!(current.revision > claimed.revision);
+    store
+        .update_work_item(UpdateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            work_item_id: item.work_item_id,
+            expected_revision: current.revision,
+            title: None,
+            summary: None,
+            owner_repository_id: None,
+            parent_work_item_id: None,
+            dependency_ids: None,
+            priority: None,
+            status: Some(WorkItemStatus::Completed),
+            implementation_artifact_id: Some(report.artifact_id),
+        })
+        .await
+        .unwrap()
+}
+
+async fn complete_audit_with_outcomes(
+    store: &SqliteStore,
+    connected: &ConnectResult,
+    feature_id: FeatureId,
+    scope: Vec<WorkItemId>,
+    outcomes: &[AuditOutcomeInput],
+) -> WorkerRun {
+    let audit_item =
+        create_claimed_audit_item(store, connected, feature_id, scope, "verification scope").await;
+    let audit = create_auditor_run(store, connected, &audit_item, "Independent audit").await;
+    store
+        .activate_worker_run(audit.worker_run_id)
+        .await
+        .unwrap();
+    store
+        .publish_message_with_audit_outcomes(
+            PublishMessage {
+                actor: ActorRef::Worker(audit.worker_run_id),
+                kind: MessageKind::Report,
+                target: MessageTarget::Broadcast,
+                summary: "Independent audit report".to_owned(),
+                body: Some("Audit report".to_owned()),
+                artifact_kind: ArtifactKind::AuditReport,
+                artifact_title: None,
+                content_type: "text/markdown".to_owned(),
+                feature_id: Some(feature_id),
+                work_item_id: Some(audit_item.work_item_id),
+                request_id: None,
+                thread_id: None,
+                correlation_id: None,
+                in_reply_to: None,
+            },
+            outcomes,
+        )
+        .await
+        .unwrap();
+    store
+        .complete_worker_run(audit.worker_run_id, "Audit complete")
+        .await
+        .unwrap();
+    complete_audit_work_item(store, connected, audit_item.work_item_id).await;
+    audit
 }
 
 fn remove_database(path: &Path) {
@@ -1735,34 +1867,13 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
         .await
         .unwrap();
     let audit_report = store
-        .publish_message(PublishMessage {
-            actor: ActorRef::Worker(first_audit.worker_run_id),
-            kind: crate::domain::MessageKind::Report,
-            target: MessageTarget::Broadcast,
-            summary: "Audit findings".to_owned(),
-            body: Some("# Audit report".to_owned()),
-            artifact_kind: crate::domain::ArtifactKind::AuditReport,
-            artifact_title: None,
-            content_type: "text/markdown".to_owned(),
-            feature_id: Some(feature.feature_id),
-            work_item_id: None,
-            request_id: None,
-            thread_id: None,
-            correlation_id: None,
-            in_reply_to: None,
-        })
-        .await
-        .unwrap()
-        .artifact
-        .unwrap();
-    assert!(matches!(
-        store
-            .publish_message(PublishMessage {
+        .publish_message_with_audit_outcomes(
+            PublishMessage {
                 actor: ActorRef::Worker(first_audit.worker_run_id),
                 kind: crate::domain::MessageKind::Report,
                 target: MessageTarget::Broadcast,
-                summary: "Duplicate audit report".to_owned(),
-                body: Some("Must be rejected".to_owned()),
+                summary: "Audit findings".to_owned(),
+                body: Some("# Audit report".to_owned()),
                 artifact_kind: crate::domain::ArtifactKind::AuditReport,
                 artifact_title: None,
                 content_type: "text/markdown".to_owned(),
@@ -1772,7 +1883,40 @@ async fn auditor_batches_items_and_enforces_per_item_depth() {
                 thread_id: None,
                 correlation_id: None,
                 in_reply_to: None,
-            })
+            },
+            &[
+                audit_outcome(first_item, AuditVerdict::ChangesRequired),
+                audit_outcome(second_item, AuditVerdict::ChangesRequired),
+            ],
+        )
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
+    assert!(matches!(
+        store
+            .publish_message_with_audit_outcomes(
+                PublishMessage {
+                    actor: ActorRef::Worker(first_audit.worker_run_id),
+                    kind: crate::domain::MessageKind::Report,
+                    target: MessageTarget::Broadcast,
+                    summary: "Duplicate audit report".to_owned(),
+                    body: Some("Must be rejected".to_owned()),
+                    artifact_kind: crate::domain::ArtifactKind::AuditReport,
+                    artifact_title: None,
+                    content_type: "text/markdown".to_owned(),
+                    feature_id: Some(feature.feature_id),
+                    work_item_id: None,
+                    request_id: None,
+                    thread_id: None,
+                    correlation_id: None,
+                    in_reply_to: None,
+                },
+                &[
+                    audit_outcome(first_item, AuditVerdict::ChangesRequired),
+                    audit_outcome(second_item, AuditVerdict::ChangesRequired),
+                ]
+            )
             .await,
         Err(StoreError::Conflict(_))
     ));
@@ -2028,22 +2172,25 @@ async fn remediation_cannot_start_after_the_next_audit_iteration() {
         .await
         .unwrap();
     store
-        .publish_message(PublishMessage {
-            actor: ActorRef::Worker(first.worker_run_id),
-            kind: MessageKind::Report,
-            target: MessageTarget::Broadcast,
-            summary: "No findings".to_owned(),
-            body: Some("Audit report".to_owned()),
-            artifact_kind: ArtifactKind::AuditReport,
-            artifact_title: None,
-            content_type: "text/markdown".to_owned(),
-            feature_id: Some(feature.feature_id),
-            work_item_id: Some(item.work_item_id),
-            request_id: None,
-            thread_id: None,
-            correlation_id: None,
-            in_reply_to: None,
-        })
+        .publish_message_with_audit_outcomes(
+            PublishMessage {
+                actor: ActorRef::Worker(first.worker_run_id),
+                kind: MessageKind::Report,
+                target: MessageTarget::Broadcast,
+                summary: "Audit blocked".to_owned(),
+                body: Some("Audit report".to_owned()),
+                artifact_kind: ArtifactKind::AuditReport,
+                artifact_title: None,
+                content_type: "text/markdown".to_owned(),
+                feature_id: Some(feature.feature_id),
+                work_item_id: Some(item.work_item_id),
+                request_id: None,
+                thread_id: None,
+                correlation_id: None,
+                in_reply_to: None,
+            },
+            &[audit_outcome(item.work_item_id, AuditVerdict::Blocked)],
+        )
         .await
         .unwrap();
     store
@@ -3357,11 +3504,11 @@ async fn creation_idempotency_replays_result_and_rejects_changed_payload() {
         Some("One body"),
     );
     let first_message = store
-        .publish_message_idempotent(message_command.clone(), Some("message-key"))
+        .publish_message_idempotent(message_command.clone(), &[], Some("message-key"))
         .await
         .unwrap();
     let replayed_message = store
-        .publish_message_idempotent(message_command, Some("message-key"))
+        .publish_message_idempotent(message_command, &[], Some("message-key"))
         .await
         .unwrap();
     assert_eq!(
@@ -4063,6 +4210,386 @@ async fn work_item_pages_are_bounded_and_reads_keep_revision_with_dependencies()
         }
     };
     tokio::join!(writer, reader);
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn verification_requires_remediation_and_passing_reaudit_before_feature_completion() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "verification-loop",
+            "backend",
+            "C:/verification/backend",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: connected.instance.instance_id,
+            title: "Verified feature".to_owned(),
+            summary: "Exercise remediation and re-audit".to_owned(),
+        })
+        .await
+        .unwrap();
+    let item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: "Implement endpoint".to_owned(),
+            summary: "Implementation requiring independent review".to_owned(),
+            kind: WorkItemKind::Implementation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: None,
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 2,
+        })
+        .await
+        .unwrap();
+    let implemented =
+        complete_implementation_work(&store, &connected, feature.feature_id, &item).await;
+    assert_eq!(
+        implemented.verification_status,
+        Some(VerificationStatus::PendingAudit)
+    );
+    assert!(matches!(
+        store
+            .complete_feature(CompleteFeature {
+                parent_instance_id: connected.instance.instance_id,
+                feature_id: feature.feature_id,
+                expected_revision: feature.revision,
+            })
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let first_audit = complete_audit_with_outcomes(
+        &store,
+        &connected,
+        feature.feature_id,
+        vec![item.work_item_id],
+        &[audit_outcome(
+            item.work_item_id,
+            AuditVerdict::ChangesRequired,
+        )],
+    )
+    .await;
+    assert_eq!(
+        store
+            .get_work_item(item.work_item_id)
+            .await
+            .unwrap()
+            .verification_status,
+        Some(VerificationStatus::RemediationRequired)
+    );
+
+    let remediation = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: "Address audit".to_owned(),
+            summary: "Apply actionable audit findings".to_owned(),
+            kind: WorkItemKind::Remediation,
+            audit_scope_work_item_ids: Vec::new(),
+            addresses_audit_run_id: Some(first_audit.worker_run_id),
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 1,
+        })
+        .await
+        .unwrap();
+    let remediation = store
+        .claim_work_item(
+            connected.instance.instance_id,
+            remediation.work_item_id,
+            remediation.revision,
+        )
+        .await
+        .unwrap();
+    let remediation_run = store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: connected.instance.instance_id,
+            role: WorkerRole::Executor,
+            task_summary: "Address audit".to_owned(),
+            context_refs: json!([]),
+            addresses_audit_run_id: Some(first_audit.worker_run_id),
+            work_item_id: Some(remediation.work_item_id),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_work_item(item.work_item_id)
+            .await
+            .unwrap()
+            .verification_status,
+        Some(VerificationStatus::Remediating)
+    );
+    store
+        .activate_worker_run(remediation_run.worker_run_id)
+        .await
+        .unwrap();
+    let report = store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Worker(remediation_run.worker_run_id),
+            kind: MessageKind::Report,
+            target: MessageTarget::Broadcast,
+            summary: "Audit findings addressed".to_owned(),
+            body: Some("Remediation report".to_owned()),
+            artifact_kind: ArtifactKind::ImplementationReport,
+            artifact_title: None,
+            content_type: "text/markdown".to_owned(),
+            feature_id: Some(feature.feature_id),
+            work_item_id: Some(remediation.work_item_id),
+            request_id: None,
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
+    store
+        .complete_worker_run(remediation_run.worker_run_id, "Remediation complete")
+        .await
+        .unwrap();
+    let current_remediation = store.get_work_item(remediation.work_item_id).await.unwrap();
+    store
+        .update_work_item(UpdateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            work_item_id: remediation.work_item_id,
+            expected_revision: current_remediation.revision,
+            title: None,
+            summary: None,
+            owner_repository_id: None,
+            parent_work_item_id: None,
+            dependency_ids: None,
+            priority: None,
+            status: Some(WorkItemStatus::Completed),
+            implementation_artifact_id: Some(report.artifact_id),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_work_item(item.work_item_id)
+            .await
+            .unwrap()
+            .verification_status,
+        Some(VerificationStatus::PendingReaudit)
+    );
+
+    complete_audit_with_outcomes(
+        &store,
+        &connected,
+        feature.feature_id,
+        vec![item.work_item_id],
+        &[audit_outcome(item.work_item_id, AuditVerdict::Passed)],
+    )
+    .await;
+    assert_eq!(
+        store
+            .get_work_item(item.work_item_id)
+            .await
+            .unwrap()
+            .verification_status,
+        Some(VerificationStatus::Verified)
+    );
+    let completed = store
+        .complete_feature(CompleteFeature {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            expected_revision: feature.revision,
+        })
+        .await
+        .unwrap();
+    assert_eq!(completed.status, FeatureStatus::Completed);
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn audit_batch_requires_exact_outcomes_and_depth_reopening_is_revisioned_and_evented() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "audit-depth",
+            "backend",
+            "C:/audit-depth/backend",
+        ))
+        .await
+        .unwrap();
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: connected.instance.instance_id,
+            title: "Batch audit".to_owned(),
+            summary: "Exercise exact coverage and depth reopening".to_owned(),
+        })
+        .await
+        .unwrap();
+    let mut items = Vec::new();
+    for title in ["First", "Second"] {
+        let item = store
+            .create_work_item(CreateWorkItem {
+                parent_instance_id: connected.instance.instance_id,
+                feature_id: feature.feature_id,
+                parent_work_item_id: None,
+                owner_repository_id: connected.repository.repository_id,
+                title: title.to_owned(),
+                summary: "Audited implementation".to_owned(),
+                kind: WorkItemKind::Implementation,
+                audit_scope_work_item_ids: Vec::new(),
+                addresses_audit_run_id: None,
+                dependency_ids: Vec::new(),
+                priority: 0,
+                max_audit_iterations: 1,
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE work_items SET status = 'completed', verification_status = 'pending_audit'
+             WHERE work_item_id = ?",
+        )
+        .bind(item.work_item_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        items.push(item.work_item_id);
+    }
+    let audit_item = create_claimed_audit_item(
+        &store,
+        &connected,
+        feature.feature_id,
+        items.clone(),
+        "batch",
+    )
+    .await;
+    let audit = create_auditor_run(&store, &connected, &audit_item, "Audit batch").await;
+    store
+        .activate_worker_run(audit.worker_run_id)
+        .await
+        .unwrap();
+    let command = PublishMessage {
+        actor: ActorRef::Worker(audit.worker_run_id),
+        kind: MessageKind::Report,
+        target: MessageTarget::Broadcast,
+        summary: "Batch verdict".to_owned(),
+        body: Some("Batch audit report".to_owned()),
+        artifact_kind: ArtifactKind::AuditReport,
+        artifact_title: None,
+        content_type: "text/markdown".to_owned(),
+        feature_id: Some(feature.feature_id),
+        work_item_id: Some(audit_item.work_item_id),
+        request_id: None,
+        thread_id: None,
+        correlation_id: None,
+        in_reply_to: None,
+    };
+    assert!(matches!(
+        store
+            .publish_message_with_audit_outcomes(
+                command.clone(),
+                &[audit_outcome(items[0], AuditVerdict::Passed)],
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    store
+        .publish_message_with_audit_outcomes(
+            command,
+            &[
+                audit_outcome(items[0], AuditVerdict::Passed),
+                audit_outcome(items[1], AuditVerdict::Blocked),
+            ],
+        )
+        .await
+        .unwrap();
+    store
+        .complete_worker_run(audit.worker_run_id, "Batch audit complete")
+        .await
+        .unwrap();
+    complete_audit_work_item(&store, &connected, audit_item.work_item_id).await;
+    assert_eq!(
+        store
+            .get_work_item(items[0])
+            .await
+            .unwrap()
+            .verification_status,
+        Some(VerificationStatus::Verified)
+    );
+    let blocked = store.get_work_item(items[1]).await.unwrap();
+    assert_eq!(
+        blocked.verification_status,
+        Some(VerificationStatus::VerificationBlocked)
+    );
+    let reopened = store
+        .increase_audit_depth(IncreaseAuditDepth {
+            parent_instance_id: connected.instance.instance_id,
+            work_item_id: items[1],
+            expected_revision: blocked.revision,
+            max_audit_iterations: 2,
+            reason: "User approved one additional independent audit".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(reopened.max_audit_iterations, 2);
+    assert_eq!(
+        reopened.verification_status,
+        Some(VerificationStatus::PendingReaudit)
+    );
+    let reason: String =
+        sqlx::query_scalar("SELECT reason FROM audit_depth_changes WHERE work_item_id = ?")
+            .bind(items[1].to_string())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert!(reason.contains("additional independent audit"));
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events
+         WHERE entity_id = ? AND kind = 'audit_depth_increased'",
+    )
+    .bind(items[1].to_string())
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    assert!(events > 0);
+    assert!(matches!(
+        store
+            .increase_audit_depth(IncreaseAuditDepth {
+                parent_instance_id: connected.instance.instance_id,
+                work_item_id: items[1],
+                expected_revision: blocked.revision,
+                max_audit_iterations: 3,
+                reason: "Stale retry".to_owned(),
+            })
+            .await,
+        Err(StoreError::RevisionConflict { .. })
+    ));
+    complete_audit_with_outcomes(
+        &store,
+        &connected,
+        feature.feature_id,
+        vec![items[1]],
+        &[audit_outcome(items[1], AuditVerdict::Passed)],
+    )
+    .await;
+    assert_eq!(
+        store
+            .get_work_item(items[1])
+            .await
+            .unwrap()
+            .verification_status,
+        Some(VerificationStatus::Verified)
+    );
 
     store.pool.close().await;
     remove_database(&path);

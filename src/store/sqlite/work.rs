@@ -123,6 +123,7 @@ impl SqliteStore {
         ensure_feature_has_no_open_work(&mut transaction, feature.feature_id).await?;
         ensure_feature_has_no_open_requests(&mut transaction, feature.feature_id).await?;
         ensure_feature_has_no_active_workers(&mut transaction, feature.feature_id).await?;
+        ensure_feature_implementation_is_verified(&mut transaction, feature.feature_id).await?;
 
         let updated = sqlx::query(
             "UPDATE features
@@ -371,8 +372,8 @@ impl SqliteStore {
                  assignee_instance_id, title, summary, kind, addresses_audit_run_id,
                  priority, status, revision,
                  max_audit_iterations, claim_expires_at, implementation_artifact_id,
-                 latest_audit_artifact_id, created_at, updated_at, finished_at
-             ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL, NULL, ?, ?, NULL)",
+                 latest_audit_artifact_id, verification_status, created_at, updated_at, finished_at
+             ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL, NULL, NULL, ?, ?, NULL)",
         )
         .bind(work_item_id.to_string())
         .bind(command.feature_id.to_string())
@@ -633,6 +634,13 @@ impl SqliteStore {
         let implementation_artifact_id = command
             .implementation_artifact_id
             .or(current.implementation_artifact_id);
+        let verification_status = if current.kind == WorkItemKind::Implementation
+            && next_status == WorkItemStatus::Completed
+        {
+            Some(VerificationStatus::PendingAudit)
+        } else {
+            current.verification_status
+        };
         if next_status == WorkItemStatus::Completed {
             match current.kind {
                 WorkItemKind::Implementation | WorkItemKind::Remediation => {
@@ -686,7 +694,8 @@ impl SqliteStore {
                  priority = ?, status = ?, revision = revision + 1,
                  assignee_instance_id = CASE WHEN ? THEN NULL ELSE assignee_instance_id END,
                  claim_expires_at = CASE WHEN ? THEN NULL ELSE claim_expires_at END,
-                 implementation_artifact_id = ?, updated_at = ?, finished_at = ?
+                 implementation_artifact_id = ?, verification_status = ?,
+                 updated_at = ?, finished_at = ?
              WHERE work_item_id = ? AND revision = ?",
         )
         .bind(next_parent.map(|id| id.to_string()))
@@ -698,6 +707,7 @@ impl SqliteStore {
         .bind(clear_claim)
         .bind(clear_claim)
         .bind(implementation_artifact_id.map(|id| id.to_string()))
+        .bind(verification_status.map(VerificationStatus::as_str))
         .bind(&now)
         .bind(terminal.then_some(now.as_str()))
         .bind(command.work_item_id.to_string())
@@ -713,6 +723,46 @@ impl SqliteStore {
                 .await?;
         }
         let mut changed_items = vec![command.work_item_id];
+        match current.kind {
+            WorkItemKind::Audit => {
+                if next_status == WorkItemStatus::Completed {
+                    changed_items.extend(
+                        apply_completed_audit_outcomes(
+                            &mut transaction,
+                            current.work_item_id,
+                            &now,
+                        )
+                        .await?,
+                    );
+                } else if matches!(
+                    next_status,
+                    WorkItemStatus::Failed | WorkItemStatus::Cancelled
+                ) {
+                    changed_items.extend(
+                        set_audit_scope_retry_status(&mut transaction, current.work_item_id, &now)
+                            .await?,
+                    );
+                }
+            }
+            WorkItemKind::Remediation => {
+                let linked_status = match next_status {
+                    WorkItemStatus::Completed => Some(VerificationStatus::PendingReaudit),
+                    WorkItemStatus::Failed | WorkItemStatus::Cancelled => {
+                        Some(VerificationStatus::RemediationRequired)
+                    }
+                    _ => None,
+                };
+                if let (Some(audit_run_id), Some(status)) =
+                    (current.addresses_audit_run_id, linked_status)
+                {
+                    changed_items.extend(
+                        set_remediation_scope_status(&mut transaction, audit_run_id, status, &now)
+                            .await?,
+                    );
+                }
+            }
+            WorkItemKind::Implementation => {}
+        }
         if next_status == WorkItemStatus::Completed {
             changed_items
                 .extend(unlock_dependents(&mut transaction, command.work_item_id, &now).await?);
@@ -720,6 +770,112 @@ impl SqliteStore {
         let recipients =
             append_work_item_events(&mut transaction, actor.project_id, &changed_items, &now)
                 .await?;
+        transaction.commit().await?;
+        self.notify_repositories(&recipients);
+        self.get_work_item(command.work_item_id).await
+    }
+
+    pub async fn increase_audit_depth(
+        &self,
+        command: IncreaseAuditDepth,
+    ) -> Result<WorkItem, StoreError> {
+        validate_audit_depth(command.max_audit_iterations)?;
+        let reason = command.reason.trim();
+        if reason.is_empty() {
+            return Err(StoreError::Conflict("reason must not be empty".to_owned()));
+        }
+        let _write_guard = self.write_lock.lock().await;
+        let now = utc_now();
+        let mut transaction = self.pool.begin().await?;
+        let actor = self
+            .resolve_actor(
+                &mut transaction,
+                ActorRef::Orchestrator(command.parent_instance_id),
+                &now,
+            )
+            .await?;
+        let current = get_work_item_tx(&mut transaction, command.work_item_id).await?;
+        ensure_work_item_project(&mut transaction, &current, actor.project_id).await?;
+        ensure_revision(&current, command.expected_revision)?;
+        ensure_active_feature_project(&mut transaction, current.feature_id, actor.project_id)
+            .await?;
+        if current.kind != WorkItemKind::Implementation
+            || current.owner_repository_id != actor.repository_id
+            || current.verification_status != Some(VerificationStatus::VerificationBlocked)
+        {
+            return Err(StoreError::Conflict(
+                "audit depth can only be increased by the owner repository for a verification_blocked implementation item"
+                    .to_owned(),
+            ));
+        }
+        if command.max_audit_iterations <= current.max_audit_iterations {
+            return Err(StoreError::Conflict(format!(
+                "new audit depth must exceed current depth {}",
+                current.max_audit_iterations
+            )));
+        }
+        let latest_verdict: String = sqlx::query_scalar(
+            "SELECT outcome.verdict
+             FROM audit_outcomes outcome
+             JOIN worker_run_audit_items scope
+               ON scope.worker_run_id = outcome.audit_worker_run_id
+              AND scope.work_item_id = outcome.scoped_work_item_id
+             WHERE outcome.scoped_work_item_id = ?
+             ORDER BY scope.audit_iteration DESC LIMIT 1",
+        )
+        .bind(command.work_item_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let reopened_status = if latest_verdict == AuditVerdict::ChangesRequired.as_str() {
+            VerificationStatus::RemediationRequired
+        } else {
+            VerificationStatus::PendingReaudit
+        };
+        sqlx::query(
+            "UPDATE work_items
+             SET max_audit_iterations = ?, verification_status = ?,
+                 revision = revision + 1, updated_at = ?
+             WHERE work_item_id = ? AND revision = ?",
+        )
+        .bind(i64::from(command.max_audit_iterations))
+        .bind(reopened_status.as_str())
+        .bind(&now)
+        .bind(command.work_item_id.to_string())
+        .bind(command.expected_revision as i64)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO audit_depth_changes(
+                 work_item_id, changed_by_instance_id, old_max_iterations,
+                 new_max_iterations, reason, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(command.work_item_id.to_string())
+        .bind(command.parent_instance_id.to_string())
+        .bind(i64::from(current.max_audit_iterations))
+        .bind(i64::from(command.max_audit_iterations))
+        .bind(reason)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?;
+        append_project_event(
+            &mut transaction,
+            actor.project_id,
+            EventKind::WorkItemUpdated,
+            EventEntityType::WorkItem,
+            &command.work_item_id.to_string(),
+            &now,
+        )
+        .await?;
+        let recipients = append_project_event(
+            &mut transaction,
+            actor.project_id,
+            EventKind::AuditDepthIncreased,
+            EventEntityType::WorkItem,
+            &command.work_item_id.to_string(),
+            &now,
+        )
+        .await?;
         transaction.commit().await?;
         self.notify_repositories(&recipients);
         self.get_work_item(command.work_item_id).await
@@ -966,6 +1122,10 @@ fn work_item_from_row(
             row.try_get("latest_audit_artifact_id")?,
             ArtifactId::parse,
         )?,
+        verification_status: row
+            .try_get::<Option<String>, _>("verification_status")?
+            .map(|value| value.parse().map_err(StoreError::Conflict))
+            .transpose()?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         finished_at: row.try_get("finished_at")?,
@@ -1102,6 +1262,27 @@ async fn ensure_feature_has_no_active_workers(
     Ok(())
 }
 
+async fn ensure_feature_implementation_is_verified(
+    transaction: &mut Transaction<'_, Sqlite>,
+    feature_id: FeatureId,
+) -> Result<(), StoreError> {
+    let unverified: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items
+         WHERE feature_id = ? AND kind = 'implementation'
+           AND implementation_artifact_id IS NOT NULL
+           AND COALESCE(verification_status, '') <> 'verified'",
+    )
+    .bind(feature_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if unverified != 0 {
+        return Err(StoreError::Conflict(format!(
+            "feature {feature_id} has {unverified} implementation work item(s) without passing independent audit"
+        )));
+    }
+    Ok(())
+}
+
 fn ensure_revision(current: &WorkItem, expected: u64) -> Result<(), StoreError> {
     if current.revision != expected {
         return Err(revision_conflict(current.clone(), expected));
@@ -1187,7 +1368,8 @@ async fn prepare_audit_work_item_scope(
             )));
         }
         let item = sqlx::query(
-            "SELECT kind, status, feature_id, owner_repository_id, max_audit_iterations
+            "SELECT kind, status, feature_id, owner_repository_id, max_audit_iterations,
+                    verification_status
              FROM work_items WHERE work_item_id = ?",
         )
         .bind(work_item_id.to_string())
@@ -1198,6 +1380,7 @@ async fn prepare_audit_work_item_scope(
         let item_owner_id = RepositoryId::parse(item.try_get("owner_repository_id")?)?;
         let kind: String = item.try_get("kind")?;
         let status: String = item.try_get("status")?;
+        let verification_status: Option<String> = item.try_get("verification_status")?;
         if item_feature_id != feature_id
             || item_owner_id != owner_repository_id
             || kind != WorkItemKind::Implementation.as_str()
@@ -1205,6 +1388,14 @@ async fn prepare_audit_work_item_scope(
         {
             return Err(StoreError::Conflict(format!(
                 "audit scope item {work_item_id} must be a completed implementation item in the same feature and owner repository"
+            )));
+        }
+        if !matches!(
+            verification_status.as_deref(),
+            None | Some("pending_audit") | Some("pending_reaudit")
+        ) {
+            return Err(StoreError::Conflict(format!(
+                "audit scope item {work_item_id} is not awaiting an audit"
             )));
         }
         let max_iterations = item.try_get::<i64, _>("max_audit_iterations")? as u8;
@@ -1222,6 +1413,7 @@ async fn prepare_audit_work_item_scope(
              LEFT JOIN worker_runs audit_run
                ON audit_run.work_item_id = audit_item.work_item_id
               AND audit_run.role = 'auditor'
+              AND audit_run.status = 'completed'
              LEFT JOIN work_items remediation
                ON remediation.addresses_audit_run_id = audit_run.worker_run_id
               AND remediation.kind = 'remediation'
@@ -1238,9 +1430,9 @@ async fn prepare_audit_work_item_scope(
             let audit_run_status: Option<String> = previous.try_get("audit_run_status")?;
             let report_count: i64 = previous.try_get("report_count")?;
             let remediation_status: Option<String> = previous.try_get("remediation_status")?;
-            if stored_max != i64::from(max_iterations) {
+            if stored_max > i64::from(max_iterations) {
                 return Err(StoreError::Conflict(format!(
-                    "work item {work_item_id} audit depth is already fixed at {stored_max}"
+                    "work item {work_item_id} audit depth is below its recorded depth {stored_max}"
                 )));
             }
             if audit_item_status != WorkItemStatus::Completed.as_str()
@@ -1651,6 +1843,127 @@ async fn validate_audit_work_item_completion(
     Ok(())
 }
 
+async fn apply_completed_audit_outcomes(
+    transaction: &mut Transaction<'_, Sqlite>,
+    audit_work_item_id: WorkItemId,
+    now: &str,
+) -> Result<Vec<WorkItemId>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT outcome.scoped_work_item_id, outcome.verdict,
+                scope.audit_iteration, item.max_audit_iterations
+         FROM worker_runs worker
+         JOIN audit_outcomes outcome
+           ON outcome.audit_worker_run_id = worker.worker_run_id
+         JOIN work_item_audit_scope scope
+           ON scope.audit_work_item_id = worker.work_item_id
+          AND scope.scoped_work_item_id = outcome.scoped_work_item_id
+         JOIN work_items item ON item.work_item_id = outcome.scoped_work_item_id
+         WHERE worker.work_item_id = ? AND worker.role = 'auditor'
+           AND worker.status = 'completed'",
+    )
+    .bind(audit_work_item_id.to_string())
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut changed = Vec::with_capacity(rows.len());
+    for row in rows {
+        let work_item_id = WorkItemId::parse(row.try_get("scoped_work_item_id")?)?;
+        let verdict: AuditVerdict = row
+            .try_get::<String, _>("verdict")?
+            .parse()
+            .map_err(StoreError::Conflict)?;
+        let iteration: i64 = row.try_get("audit_iteration")?;
+        let max_iterations: i64 = row.try_get("max_audit_iterations")?;
+        let status = match verdict {
+            AuditVerdict::Passed => VerificationStatus::Verified,
+            AuditVerdict::ChangesRequired if iteration < max_iterations => {
+                VerificationStatus::RemediationRequired
+            }
+            AuditVerdict::Blocked if iteration < max_iterations => {
+                VerificationStatus::PendingReaudit
+            }
+            AuditVerdict::ChangesRequired | AuditVerdict::Blocked => {
+                VerificationStatus::VerificationBlocked
+            }
+        };
+        sqlx::query(
+            "UPDATE work_items
+             SET verification_status = ?, revision = revision + 1, updated_at = ?
+             WHERE work_item_id = ? AND kind = 'implementation'",
+        )
+        .bind(status.as_str())
+        .bind(now)
+        .bind(work_item_id.to_string())
+        .execute(&mut **transaction)
+        .await?;
+        changed.push(work_item_id);
+    }
+    Ok(changed)
+}
+
+async fn set_audit_scope_retry_status(
+    transaction: &mut Transaction<'_, Sqlite>,
+    audit_work_item_id: WorkItemId,
+    now: &str,
+) -> Result<Vec<WorkItemId>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT scoped_work_item_id, audit_iteration
+         FROM work_item_audit_scope WHERE audit_work_item_id = ?",
+    )
+    .bind(audit_work_item_id.to_string())
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut changed = Vec::with_capacity(rows.len());
+    for row in rows {
+        let work_item_id = WorkItemId::parse(row.try_get("scoped_work_item_id")?)?;
+        let status = if row.try_get::<i64, _>("audit_iteration")? == 1 {
+            VerificationStatus::PendingAudit
+        } else {
+            VerificationStatus::PendingReaudit
+        };
+        sqlx::query(
+            "UPDATE work_items SET verification_status = ?, revision = revision + 1, updated_at = ?
+             WHERE work_item_id = ?",
+        )
+        .bind(status.as_str())
+        .bind(now)
+        .bind(work_item_id.to_string())
+        .execute(&mut **transaction)
+        .await?;
+        changed.push(work_item_id);
+    }
+    Ok(changed)
+}
+
+async fn set_remediation_scope_status(
+    transaction: &mut Transaction<'_, Sqlite>,
+    audit_run_id: WorkerRunId,
+    status: VerificationStatus,
+    now: &str,
+) -> Result<Vec<WorkItemId>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT scoped_work_item_id FROM audit_outcomes
+         WHERE audit_worker_run_id = ? AND verdict = 'changes_required'",
+    )
+    .bind(audit_run_id.to_string())
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut changed = Vec::with_capacity(rows.len());
+    for row in rows {
+        let work_item_id = WorkItemId::parse(row.try_get("scoped_work_item_id")?)?;
+        sqlx::query(
+            "UPDATE work_items SET verification_status = ?, revision = revision + 1, updated_at = ?
+             WHERE work_item_id = ?",
+        )
+        .bind(status.as_str())
+        .bind(now)
+        .bind(work_item_id.to_string())
+        .execute(&mut **transaction)
+        .await?;
+        changed.push(work_item_id);
+    }
+    Ok(changed)
+}
+
 async fn unlock_dependents(
     transaction: &mut Transaction<'_, Sqlite>,
     completed_id: WorkItemId,
@@ -1815,6 +2128,37 @@ pub(super) async fn attach_worker_to_work_item(
                 .to_owned(),
         ));
     }
+    let audit_scope = load_audit_scope(transaction, work_item_id).await?;
+    let mut changed_items = Vec::new();
+    match item.kind {
+        WorkItemKind::Audit => {
+            for scope_item in &audit_scope {
+                sqlx::query(
+                    "UPDATE work_items
+                     SET verification_status = 'auditing', revision = revision + 1, updated_at = ?
+                     WHERE work_item_id = ?",
+                )
+                .bind(now)
+                .bind(scope_item.work_item_id.to_string())
+                .execute(&mut **transaction)
+                .await?;
+                changed_items.push(scope_item.work_item_id);
+            }
+        }
+        WorkItemKind::Remediation => {
+            changed_items.extend(
+                set_remediation_scope_status(
+                    transaction,
+                    item.addresses_audit_run_id
+                        .expect("validated remediation link"),
+                    VerificationStatus::Remediating,
+                    now,
+                )
+                .await?,
+            );
+        }
+        WorkItemKind::Implementation => {}
+    }
     if item.status == WorkItemStatus::Claimed {
         sqlx::query(
             "UPDATE work_items
@@ -1826,18 +2170,10 @@ pub(super) async fn attach_worker_to_work_item(
         .bind(item.revision as i64)
         .execute(&mut **transaction)
         .await?;
-        let recipients =
-            append_work_item_events(transaction, project_id, &[work_item_id], now).await?;
-        Ok((
-            recipients,
-            load_audit_scope(transaction, work_item_id).await?,
-        ))
-    } else {
-        Ok((
-            Vec::new(),
-            load_audit_scope(transaction, work_item_id).await?,
-        ))
+        changed_items.push(work_item_id);
     }
+    let recipients = append_work_item_events(transaction, project_id, &changed_items, now).await?;
+    Ok((recipients, audit_scope))
 }
 
 async fn load_audit_scope(
@@ -1868,6 +2204,7 @@ pub(super) async fn link_audit_report(
     transaction: &mut Transaction<'_, Sqlite>,
     actor: &ResolvedActor,
     artifact: &Artifact,
+    audit_outcomes: &[AuditOutcomeInput],
     now: &str,
 ) -> Result<Vec<RepositoryId>, StoreError> {
     if artifact.kind != ArtifactKind::AuditReport {
@@ -1884,6 +2221,27 @@ pub(super) async fn link_audit_report(
         return Err(StoreError::Conflict(
             "audit_report must be published by an auditor run".to_owned(),
         ));
+    }
+    let audit_work_item_id: String =
+        sqlx::query_scalar("SELECT work_item_id FROM worker_runs WHERE worker_run_id = ?")
+            .bind(worker_run_id.to_string())
+            .fetch_one(&mut **transaction)
+            .await?;
+    for outcome in audit_outcomes {
+        sqlx::query(
+            "INSERT INTO audit_outcomes(
+                 audit_artifact_id, audit_worker_run_id, audit_work_item_id,
+                 scoped_work_item_id, verdict, summary
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(artifact.artifact_id.to_string())
+        .bind(worker_run_id.to_string())
+        .bind(&audit_work_item_id)
+        .bind(outcome.work_item_id.to_string())
+        .bind(outcome.verdict.as_str())
+        .bind(outcome.summary.trim())
+        .execute(&mut **transaction)
+        .await?;
     }
     let rows = sqlx::query(
         "SELECT audit.work_item_id
@@ -1911,11 +2269,6 @@ pub(super) async fn link_audit_report(
         .await?;
         work_item_ids.push(work_item_id);
     }
-    let audit_work_item_id: String =
-        sqlx::query_scalar("SELECT work_item_id FROM worker_runs WHERE worker_run_id = ?")
-            .bind(worker_run_id.to_string())
-            .fetch_one(&mut **transaction)
-            .await?;
     sqlx::query(
         "UPDATE work_items
          SET latest_audit_artifact_id = ?, revision = revision + 1, updated_at = ?
@@ -1933,6 +2286,7 @@ pub(super) async fn link_audit_report(
 pub(super) async fn validate_audit_report_publication(
     transaction: &mut Transaction<'_, Sqlite>,
     actor: &ResolvedActor,
+    audit_outcomes: &[AuditOutcomeInput],
 ) -> Result<(), StoreError> {
     let worker_run_id = actor.worker_run_id.ok_or_else(|| {
         StoreError::Conflict("audit_report must be published by an active auditor run".to_owned())
@@ -1952,6 +2306,36 @@ pub(super) async fn validate_audit_report_publication(
     if role != "auditor" || report_count != 0 {
         return Err(StoreError::Conflict(
             "an auditor run can publish exactly one audit_report".to_owned(),
+        ));
+    }
+    let scope_rows = sqlx::query(
+        "SELECT work_item_id FROM worker_run_audit_items
+         WHERE worker_run_id = ? ORDER BY work_item_id",
+    )
+    .bind(worker_run_id.to_string())
+    .fetch_all(&mut **transaction)
+    .await?;
+    let expected = scope_rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("work_item_id"))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut actual = BTreeSet::new();
+    for outcome in audit_outcomes {
+        if outcome.summary.trim().is_empty() {
+            return Err(StoreError::Conflict(
+                "each audit outcome requires a non-empty summary".to_owned(),
+            ));
+        }
+        if !actual.insert(outcome.work_item_id.to_string()) {
+            return Err(StoreError::Conflict(format!(
+                "audit outcome for work item {} appears more than once",
+                outcome.work_item_id
+            )));
+        }
+    }
+    if actual != expected {
+        return Err(StoreError::Conflict(
+            "audit_outcomes must cover every scoped work item exactly once".to_owned(),
         ));
     }
     Ok(())

@@ -113,6 +113,10 @@ CREATE TABLE IF NOT EXISTS work_items (
     claim_expires_at TEXT,
     implementation_artifact_id TEXT REFERENCES artifacts(artifact_id) ON DELETE SET NULL,
     latest_audit_artifact_id TEXT REFERENCES artifacts(artifact_id) ON DELETE SET NULL,
+    verification_status TEXT CHECK(verification_status IS NULL OR verification_status IN (
+        'pending_audit', 'auditing', 'remediation_required', 'remediating',
+        'pending_reaudit', 'verified', 'verification_blocked'
+    )),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     finished_at TEXT,
@@ -120,7 +124,8 @@ CREATE TABLE IF NOT EXISTS work_items (
         (kind = 'implementation' AND addresses_audit_run_id IS NULL)
         OR (kind = 'audit' AND addresses_audit_run_id IS NULL)
         OR (kind = 'remediation' AND addresses_audit_run_id IS NOT NULL)
-    )
+    ),
+    CHECK(kind = 'implementation' OR verification_status IS NULL)
 );
 
 CREATE INDEX IF NOT EXISTS work_items_feature_status_idx
@@ -257,6 +262,32 @@ WHEN (
 BEGIN
     SELECT RAISE(ABORT, 'audit worker and work item must belong to the same project');
 END;
+
+CREATE TABLE IF NOT EXISTS audit_outcomes (
+    audit_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+    audit_worker_run_id TEXT NOT NULL REFERENCES worker_runs(worker_run_id) ON DELETE CASCADE,
+    audit_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE CASCADE,
+    scoped_work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE RESTRICT,
+    verdict TEXT NOT NULL CHECK(verdict IN ('passed', 'changes_required', 'blocked')),
+    summary TEXT NOT NULL,
+    PRIMARY KEY(audit_worker_run_id, scoped_work_item_id),
+    UNIQUE(audit_artifact_id, scoped_work_item_id)
+);
+
+CREATE INDEX IF NOT EXISTS audit_outcomes_scope_idx
+    ON audit_outcomes(scoped_work_item_id, audit_worker_run_id);
+
+CREATE TABLE IF NOT EXISTS audit_depth_changes (
+    change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    work_item_id TEXT NOT NULL REFERENCES work_items(work_item_id) ON DELETE CASCADE,
+    changed_by_instance_id TEXT NOT NULL REFERENCES agent_instances(instance_id) ON DELETE RESTRICT,
+    old_max_iterations INTEGER NOT NULL,
+    new_max_iterations INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    CHECK(new_max_iterations > old_max_iterations),
+    CHECK(length(trim(reason)) > 0)
+);
 
 CREATE TRIGGER IF NOT EXISTS worker_run_audit_items_active_feature
 BEFORE INSERT ON worker_run_audit_items
@@ -486,7 +517,8 @@ CREATE TABLE IF NOT EXISTS events (
         'feature_completed',
         'feature_cancelled',
         'work_item_created',
-        'work_item_updated'
+        'work_item_updated',
+        'audit_depth_increased'
     )),
     entity_type TEXT NOT NULL CHECK(entity_type IN (
         'message', 'worker_run', 'request', 'feature', 'work_item'

@@ -22,15 +22,16 @@ use tokio::{
 
 use crate::domain::{
     ActorRef, AgentInstance, AnswerRequest, AnswerRequestResult, Artifact, ArtifactId,
-    ArtifactKind, AskRepository, AuditScopeItem, CancelFeature, CompleteFeature,
-    ConnectOrchestrator, ConnectResult, CoordinationRequest, CreateFeature, CreateWorkItem,
-    CreateWorkerRun, DeliveryAck, EventBatch, EventEntityType, EventKind, FailRequest, Feature,
-    FeatureId, FeatureStatus, HubEvent, InboxItem, InboxPage, InstanceId, LeaseMaintenanceReport,
-    MAX_AUDIT_WORK_ITEMS, MAX_CONTEXT_REFS, MAX_MESSAGE_RECIPIENTS, MAX_WORK_ITEM_DEPENDENCIES,
-    Message, MessageId, MessageKind, MessageTarget, OperationalMetrics, PresenceStatus, Project,
-    ProjectId, ProjectOverview, PublishMessage, PublishResult, Repository, RepositoryId,
-    RepositoryPresence, RepositoryPresenceFilter, RequestId, RequestStatus, RetentionReport,
-    ThreadId, UpdateWorkItem, WaitOutcome, WorkItem, WorkItemId, WorkItemKind, WorkItemPage,
+    ArtifactKind, AskRepository, AuditOutcomeInput, AuditScopeItem, AuditVerdict, CancelFeature,
+    CompleteFeature, ConnectOrchestrator, ConnectResult, CoordinationRequest, CreateFeature,
+    CreateWorkItem, CreateWorkerRun, DeliveryAck, EventBatch, EventEntityType, EventKind,
+    FailRequest, Feature, FeatureId, FeatureStatus, HubEvent, InboxItem, InboxPage,
+    IncreaseAuditDepth, InstanceId, LeaseMaintenanceReport, MAX_AUDIT_WORK_ITEMS, MAX_CONTEXT_REFS,
+    MAX_MESSAGE_RECIPIENTS, MAX_WORK_ITEM_DEPENDENCIES, Message, MessageId, MessageKind,
+    MessageTarget, OperationalMetrics, PresenceStatus, Project, ProjectId, ProjectOverview,
+    PublishMessage, PublishResult, Repository, RepositoryId, RepositoryPresence,
+    RepositoryPresenceFilter, RequestId, RequestStatus, RetentionReport, ThreadId, UpdateWorkItem,
+    VerificationStatus, WaitOutcome, WorkItem, WorkItemId, WorkItemKind, WorkItemPage,
     WorkItemStatus, WorkerRole, WorkerRun, WorkerRunId, WorkerRunStatus,
 };
 
@@ -495,7 +496,10 @@ fn worker_run_fingerprint(command: &CreateWorkerRun) -> Result<String, StoreErro
     }))
 }
 
-fn publish_message_fingerprint(command: &PublishMessage) -> Result<String, StoreError> {
+fn publish_message_fingerprint(
+    command: &PublishMessage,
+    audit_outcomes: &[AuditOutcomeInput],
+) -> Result<String, StoreError> {
     let target = match &command.target {
         MessageTarget::Repositories(repository_ids) => serde_json::json!({
             "repositories": repository_ids,
@@ -516,6 +520,7 @@ fn publish_message_fingerprint(command: &PublishMessage) -> Result<String, Store
         "thread_id": command.thread_id,
         "correlation_id": command.correlation_id,
         "in_reply_to": command.in_reply_to,
+        "audit_outcomes": audit_outcomes,
     }))
 }
 
@@ -749,6 +754,26 @@ async fn validate_remediation_audit(
     {
         return Err(StoreError::Conflict(format!(
             "worker run {audit_run_id} must be a completed repository-local audit work item with exactly one report"
+        )));
+    }
+    let actionable: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM audit_outcomes outcome
+         JOIN worker_run_audit_items scope
+           ON scope.worker_run_id = outcome.audit_worker_run_id
+          AND scope.work_item_id = outcome.scoped_work_item_id
+         JOIN work_items item ON item.work_item_id = outcome.scoped_work_item_id
+         WHERE outcome.audit_worker_run_id = ?
+           AND outcome.verdict = 'changes_required'
+           AND scope.audit_iteration < item.max_audit_iterations
+           AND item.verification_status = 'remediation_required'",
+    )
+    .bind(audit_run_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if actionable == 0 {
+        return Err(StoreError::Conflict(format!(
+            "audit worker run {audit_run_id} has no changes_required outcome to remediate"
         )));
     }
     let inactive_features: i64 = sqlx::query_scalar(

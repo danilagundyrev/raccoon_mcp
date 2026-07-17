@@ -126,6 +126,49 @@ pub enum WorkItemKind {
     Remediation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    PendingAudit,
+    Auditing,
+    RemediationRequired,
+    Remediating,
+    PendingReaudit,
+    Verified,
+    VerificationBlocked,
+}
+
+impl VerificationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingAudit => "pending_audit",
+            Self::Auditing => "auditing",
+            Self::RemediationRequired => "remediation_required",
+            Self::Remediating => "remediating",
+            Self::PendingReaudit => "pending_reaudit",
+            Self::Verified => "verified",
+            Self::VerificationBlocked => "verification_blocked",
+        }
+    }
+}
+
+impl FromStr for VerificationStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending_audit" => Ok(Self::PendingAudit),
+            "auditing" => Ok(Self::Auditing),
+            "remediation_required" => Ok(Self::RemediationRequired),
+            "remediating" => Ok(Self::Remediating),
+            "pending_reaudit" => Ok(Self::PendingReaudit),
+            "verified" => Ok(Self::Verified),
+            "verification_blocked" => Ok(Self::VerificationBlocked),
+            _ => Err(format!("unknown verification status '{value}'")),
+        }
+    }
+}
+
 impl WorkItemKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -180,6 +223,15 @@ pub struct UpdateWorkItem {
     pub implementation_artifact_id: Option<ArtifactId>,
 }
 
+#[derive(Clone, Debug)]
+pub struct IncreaseAuditDepth {
+    pub parent_instance_id: InstanceId,
+    pub work_item_id: WorkItemId,
+    pub expected_revision: u64,
+    pub max_audit_iterations: u8,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkItem {
     pub work_item_id: WorkItemId,
@@ -200,6 +252,7 @@ pub struct WorkItem {
     pub claim_expires_at: Option<String>,
     pub implementation_artifact_id: Option<ArtifactId>,
     pub latest_audit_artifact_id: Option<ArtifactId>,
+    pub verification_status: Option<VerificationStatus>,
     pub created_at: String,
     pub updated_at: String,
     pub finished_at: Option<String>,

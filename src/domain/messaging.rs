@@ -56,6 +56,44 @@ pub enum ArtifactKind {
     Note,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditVerdict {
+    Passed,
+    ChangesRequired,
+    Blocked,
+}
+
+impl AuditVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::ChangesRequired => "changes_required",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+impl FromStr for AuditVerdict {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "passed" => Ok(Self::Passed),
+            "changes_required" => Ok(Self::ChangesRequired),
+            "blocked" => Ok(Self::Blocked),
+            _ => Err(format!("unknown audit verdict '{value}'")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AuditOutcomeInput {
+    pub work_item_id: WorkItemId,
+    pub verdict: AuditVerdict,
+    pub summary: String,
+}
+
 impl ArtifactKind {
     pub fn as_str(self) -> &'static str {
         match self {

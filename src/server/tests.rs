@@ -1125,6 +1125,7 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
         "get_work_item",
         "list_work_items",
         "update_work_item",
+        "increase_audit_depth",
         "claim_work_item",
         "renew_work_item_claim",
         "release_work_item_claim",
@@ -1160,6 +1161,22 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
     assert_eq!(create["properties"]["dependency_ids"]["uniqueItems"], true);
     assert_eq!(create["properties"]["max_audit_iterations"]["maximum"], 10);
     assert_eq!(create["properties"]["max_audit_iterations"]["default"], 2);
+    let increase = increase_audit_depth_schema(2048);
+    assert_eq!(
+        increase["properties"]["max_audit_iterations"]["maximum"],
+        10
+    );
+    assert!(
+        increase["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("reason"))
+    );
+    let publish = publish_message_schema(2048, 65_536);
+    assert_eq!(
+        publish["properties"]["audit_outcomes"]["items"]["properties"]["verdict"]["enum"],
+        json!(["passed", "changes_required", "blocked"])
+    );
     assert_eq!(
         create["properties"]["kind"]["enum"],
         json!(["implementation", "audit", "remediation"])
@@ -1190,4 +1207,37 @@ fn work_graph_tools_publish_revision_and_dependency_contracts() {
             .len(),
         1
     );
+}
+
+#[test]
+fn structured_audit_outcomes_are_typed_and_bounded() {
+    let work_item_id = WorkItemId::new();
+    let mut arguments = JsonMap::new();
+    arguments.insert(
+        "audit_outcomes".to_owned(),
+        json!([{
+            "work_item_id": work_item_id,
+            "verdict": "changes_required",
+            "summary": "Fix the contract mismatch"
+        }]),
+    );
+    let outcomes = optional_audit_outcomes(&arguments, 1024).unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].work_item_id, work_item_id);
+    assert_eq!(outcomes[0].verdict, AuditVerdict::ChangesRequired);
+
+    arguments["audit_outcomes"][0]["verdict"] = json!("nitpick");
+    assert!(optional_audit_outcomes(&arguments, 1024).is_err());
+    arguments["audit_outcomes"] = Value::Array(
+        (0..=MAX_AUDIT_WORK_ITEMS)
+            .map(|_| {
+                json!({
+                    "work_item_id": WorkItemId::new(),
+                    "verdict": "passed",
+                    "summary": "Pass"
+                })
+            })
+            .collect(),
+    );
+    assert!(optional_audit_outcomes(&arguments, 1024).is_err());
 }

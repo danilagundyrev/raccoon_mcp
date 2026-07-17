@@ -269,6 +269,39 @@ pub(super) fn optional_audit_scope_work_item_ids(
     Ok(ids)
 }
 
+pub(super) fn optional_audit_outcomes(
+    arguments: &JsonMap<String, Value>,
+    max_summary_bytes: u16,
+) -> Result<Vec<AuditOutcomeInput>, RpcError> {
+    let Some(value) = arguments.get("audit_outcomes") else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid_argument("'audit_outcomes' must be an array".to_owned()))?;
+    ensure_array_limit("audit_outcomes", values.len(), MAX_AUDIT_WORK_ITEMS)?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let object = value.as_object().ok_or_else(|| {
+                invalid_argument(format!("'audit_outcomes[{index}]' must be an object"))
+            })?;
+            let work_item_id = WorkItemId::parse(&require_string(object, "work_item_id")?)
+                .map_err(invalid_uuid)?;
+            let verdict = require_string(object, "verdict")?
+                .parse::<AuditVerdict>()
+                .map_err(invalid_argument)?;
+            let summary = validated_summary(object, "summary", max_summary_bytes)?;
+            Ok(AuditOutcomeInput {
+                work_item_id,
+                verdict,
+                summary,
+            })
+        })
+        .collect()
+}
+
 pub(super) fn optional_validated_summary(
     arguments: &JsonMap<String, Value>,
     field_name: &str,

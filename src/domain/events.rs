@@ -22,6 +22,7 @@ pub enum EventKind {
     FeatureCancelled,
     WorkItemCreated,
     WorkItemUpdated,
+    AuditDepthIncreased,
 }
 
 impl EventKind {
@@ -42,6 +43,7 @@ impl EventKind {
             Self::FeatureCancelled => "feature_cancelled",
             Self::WorkItemCreated => "work_item_created",
             Self::WorkItemUpdated => "work_item_updated",
+            Self::AuditDepthIncreased => "audit_depth_increased",
         }
     }
 }
@@ -66,6 +68,7 @@ impl FromStr for EventKind {
             "feature_cancelled" => Ok(Self::FeatureCancelled),
             "work_item_created" => Ok(Self::WorkItemCreated),
             "work_item_updated" => Ok(Self::WorkItemUpdated),
+            "audit_depth_increased" => Ok(Self::AuditDepthIncreased),
             _ => Err(format!("unknown event kind '{value}'")),
         }
     }

@@ -6,16 +6,27 @@ impl SqliteStore {
         &self,
         command: PublishMessage,
     ) -> Result<PublishResult, StoreError> {
-        self.publish_message_idempotent(command, None).await
+        self.publish_message_idempotent(command, &[], None).await
+    }
+
+    #[cfg(test)]
+    pub async fn publish_message_with_audit_outcomes(
+        &self,
+        command: PublishMessage,
+        audit_outcomes: &[AuditOutcomeInput],
+    ) -> Result<PublishResult, StoreError> {
+        self.publish_message_idempotent(command, audit_outcomes, None)
+            .await
     }
 
     pub async fn publish_message_idempotent(
         &self,
         command: PublishMessage,
+        audit_outcomes: &[AuditOutcomeInput],
         idempotency_key: Option<&str>,
     ) -> Result<PublishResult, StoreError> {
         let _write_guard = self.write_lock.lock().await;
-        let request_fingerprint = publish_message_fingerprint(&command)?;
+        let request_fingerprint = publish_message_fingerprint(&command, audit_outcomes)?;
         let now = utc_now();
         let mut transaction = self.pool.begin().await?;
         let actor = self
@@ -109,7 +120,16 @@ impl SqliteStore {
             resolve_recipients(&mut transaction, actor.project_id, command.target).await?;
 
         if command.body.is_some() && command.artifact_kind == ArtifactKind::AuditReport {
-            super::work::validate_audit_report_publication(&mut transaction, &actor).await?;
+            super::work::validate_audit_report_publication(
+                &mut transaction,
+                &actor,
+                audit_outcomes,
+            )
+            .await?;
+        } else if !audit_outcomes.is_empty() {
+            return Err(StoreError::Conflict(
+                "audit_outcomes are only accepted with an audit_report artifact".to_owned(),
+            ));
         }
 
         let artifact = if let Some(content) = command.body {
@@ -133,7 +153,8 @@ impl SqliteStore {
             None
         };
         let work_event_recipients = if let Some(artifact) = &artifact {
-            super::work::link_audit_report(&mut transaction, &actor, artifact, &now).await?
+            super::work::link_audit_report(&mut transaction, &actor, artifact, audit_outcomes, &now)
+                .await?
         } else {
             Vec::new()
         };

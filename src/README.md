@@ -191,7 +191,7 @@ An item without dependencies starts as `ready`:
   "title": "Implement checkout API",
   "summary": "Add endpoint, validation, and an API contract artifact",
   "priority": 100,
-  "max_audit_iterations": 1,
+  "max_audit_iterations": 2,
   "idempotency_key": "checkout-backend-item-v1"
 }
 ```
@@ -207,7 +207,7 @@ A dependent item starts as `planned` until every dependency is completed:
   "summary": "Consume the checkout API and add UI states",
   "dependency_ids": ["<backend-work-item-id>"],
   "priority": 90,
-  "max_audit_iterations": 1,
+  "max_audit_iterations": 2,
   "idempotency_key": "checkout-frontend-item-v1"
 }
 ```
@@ -519,11 +519,20 @@ The auditor activates, examines its local checkout, and publishes exactly one `a
   "body": "## Findings\n...",
   "artifact_kind": "audit_report",
   "artifact_title": "Checkout audit iteration 1",
-  "feature_id": "<feature-id>"
+  "feature_id": "<feature-id>",
+  "audit_outcomes": [
+    {
+      "work_item_id": "<completed-work-item-id>",
+      "verdict": "changes_required",
+      "summary": "Validation accepts an invalid checkout state"
+    }
+  ]
 }
 ```
 
-Without its own `audit_report`, the auditor cannot complete. A second report from the same run is rejected. After the worker completes, its parent orchestrator completes the audit work item through `update_work_item` without an `implementation_artifact_id`. If an auditor attempt fails or its lease is abandoned, reclaim the same audit card and create a fresh worker run; another active attempt or any completed attempt blocks replacement.
+`audit_outcomes` is required with `audit_report` and must cover every scoped implementation exactly once. Supported verdicts are `passed`, `changes_required`, and `blocked`. Without its own report and exact structured outcomes, the auditor cannot complete. A second report from the same run is rejected. After the worker completes, its parent orchestrator completes the audit work item through `update_work_item` without an `implementation_artifact_id`; only then are the verdicts applied. If an auditor attempt fails or its lease is abandoned, reclaim the same audit card and create a fresh worker run; another active attempt or any completed attempt blocks replacement.
+
+Implementation execution and verification are separate. `verification_status` progresses through `pending_audit`, `auditing`, `remediation_required`, `remediating`, `pending_reaudit`, and finally `verified`. A non-passing final allowed audit produces `verification_blocked`.
 
 If the report contains findings, create exactly one `remediation` work item in the same repository:
 
@@ -542,9 +551,9 @@ If the report contains findings, create exactly one `remediation` work item in t
 
 Claim that card, then create its executor with both `work_item_id` and the same `addresses_audit_run_id`. The executor publishes an `implementation_report`; its orchestrator completes the remediation card with that artifact. A failed or abandoned executor can likewise be retried on the same reclaimed remediation card, but attempts cannot overlap and a completed attempt is final.
 
-The next audit card is allowed only after the prior audit card and any remediation card complete. Every scoped implementation must still have remaining audit depth. Remediation cannot be created retroactively after a later audit iteration starts.
+The next audit card is allowed only after the prior audit card and any remediation card complete. Remediation completion produces `pending_reaudit`, never `verified`; another independent passing auditor is required. A `blocked` outcome with remaining depth can proceed directly to a later audit after its external blocker is resolved. Remediation cannot be created retroactively after a later audit iteration starts.
 
-This stage records repository ownership and bounded lineage. Structured per-item verdicts and the mandatory Feature verification gate are described in the update plan and are implemented in the next stage.
+If the last configured audit is non-passing, the implementation becomes `verification_blocked`. Do not silently extend the loop. After explicit user authorization, the owner repository may call `increase_audit_depth` with the current WorkItem revision, a larger value, and a durable reason. The mutation emits `audit_depth_increased` and reopens the correct next state.
 
 ## Complete or cancel a feature
 
@@ -558,7 +567,7 @@ The repository that created a feature is its coordinator. After durable work sta
 }
 ```
 
-`complete_feature` rejects unfinished work items, open linked repository requests, active linked executors, auditors, and remediation runs. `cancel_feature` rejects active claims, workers, and requests and atomically cancels remaining unclaimed `planned`, `ready`, or `failed` items. Both operations increment the feature revision and emit a terminal project-wide event.
+`complete_feature` rejects unfinished work items, open linked repository requests, active linked executors, auditors, and remediation runs. It also rejects every accepted implementation report whose WorkItem is not `verified` by an independent passing audit. `cancel_feature` rejects active claims, workers, and requests and atomically cancels remaining unclaimed `planned`, `ready`, or `failed` items; cancellation never changes verification state into `verified`. Both operations increment the feature revision and emit a terminal project-wide event.
 
 Peer repositories stop their wait loop when they receive `feature_completed` or `feature_cancelled` for the current feature. A repository that joins later reads the durable terminal status through `get_feature` or `list_features`; events are wake-up hints, not the source of truth. Every orchestrator calls `disconnect_orchestrator` before it exits. MCP session DELETE is transport cleanup, not the shared completion signal.
 
@@ -660,6 +669,7 @@ Inbox, messages, and artifacts are intentionally not resources. They require an 
 | `get_work_item` | Read a consistent item snapshot with dependencies. |
 | `list_work_items` | Read a bounded page of feature items. |
 | `update_work_item` | Update an item using `expected_revision`. |
+| `increase_audit_depth` | Explicitly reopen `verification_blocked` work with a larger depth, current revision, and reason. |
 | `claim_work_item` | Atomically claim a ready owner-repository item. |
 | `renew_work_item_claim` | Renew an owned, unexpired claim. |
 | `release_work_item_claim` | Return an owned claim to `ready`. |
@@ -936,18 +946,20 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
    - Persist or clearly report the newest processed cursor before ending a session that
      expects later continuation.
 
-8. Apply bounded audit/remediation when the task requires review.
+8. Apply bounded audit/remediation to every completed implementation.
    - Create a repository-owned `audit` work item whose `audit_scope_work_item_ids`
      contains only completed implementation cards from that same repository. Split a
      cross-repository review into one card per owner.
    - The owner repository claims the audit card, creates a fresh role `auditor` worker
-     linked by `work_item_id`, and requires exactly one `audit_report` before completing
-     both the worker and audit card.
+     linked by `work_item_id`, and requires exactly one `audit_report` with one structured
+     `audit_outcomes` verdict per scoped item before completing both the worker and audit card.
    - If the report contains actionable findings, create at most one `remediation` card
      linked by `addresses_audit_run_id`; claim it and create a matching executor with
      both the card and audit-run links.
-   - Start a later audit card only after the prior audit card and any remediation card
-     are completed, and never exceed each implementation's `max_audit_iterations`.
+   - Treat remediation completion as `pending_reaudit`, not verified. Start a later audit
+     card only after the prior audit card and any remediation card are completed.
+   - Never exceed `max_audit_iterations` automatically. If verification becomes blocked,
+     ask the user before calling `increase_audit_depth` with a reason and current revision.
    - Do not create an endless review loop for minor preferences. Stop when the configured
      depth is exhausted or remaining findings do not justify another implementation run.
 
@@ -964,8 +976,8 @@ the active repository's `AGENTS.md`. Follow the user's latest explicit override.
 10. Finish coordination from durable state.
     - Treat the requested shared task as complete only when its relevant work items are
       in the intended terminal states, required implementation reports are linked,
-      required audits/remediation are finished, and no request necessary for completion
-      remains unresolved.
+      every accepted implementation report is `verified`, required audits/remediation are
+      finished, and no request necessary for completion remains unresolved.
     - Use work-item states, worker-run states, requests, and linked artifacts as the
       completion source of truth.
     - If this repository coordinates the feature, reread it and call `complete_feature`

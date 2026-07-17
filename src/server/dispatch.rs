@@ -35,7 +35,7 @@ pub(super) async fn dispatch(
                 "title": SERVER_TITLE,
                 "version": SERVER_VERSION,
             },
-            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use bounded list_work_items pages and expected_revision, and claim an owner-repository item before creating its matching worker run. Implementation and remediation cards use executors; audit cards use fresh auditors and carry their own repository-local scope. Linked workers publish the required report before their orchestrator completes the card. Workers never register as repositories. Use ask_repository for durable questions and actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for finite repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. JSON-RPC batches are not supported.",
+            "instructions": "This is a project/repository coordination hub. Start with connect_orchestrator using a user-defined project_key and repository_key, then read hub://guide for the complete machine-readable workflow. Model shared work with create_feature/create_work_item, use bounded list_work_items pages and expected_revision, and claim an owner-repository item before creating its matching worker run. Implementation and remediation cards use executors; audit cards use fresh auditors and carry their own repository-local scope. Every audit_report includes exact structured audit_outcomes; remediation requires a later passing audit, and Feature completion requires verified coverage for every accepted implementation report. Workers never register as repositories. Use ask_repository for durable questions and actor-scoped idempotency_key values for retryable creation calls. Use wait_for_events for finite repository-scoped waiting; an active wait renews actor, request-claim and work-item-claim leases. JSON-RPC batches are not supported.",
             }))
         }
         "notifications/initialized" | "notifications/cancelled" => Ok(Value::Null),
@@ -375,6 +375,25 @@ pub(super) async fn call_tool(
                 .await
                 .map(|value| json!(value))
         }
+        "increase_audit_depth" => {
+            let parent_instance_id = parse_instance_id(&arguments)?;
+            let work_item_id = parse_work_item_id(&arguments)?;
+            let expected_revision = required_revision(&arguments)?;
+            let max_audit_iterations =
+                optional_bounded_u8(&arguments, "max_audit_iterations", 2, 10)?
+                    .expect("required by tool schema validation");
+            let reason = validated_summary(&arguments, "reason", max_summary_bytes)?;
+            store
+                .increase_audit_depth(IncreaseAuditDepth {
+                    parent_instance_id,
+                    work_item_id,
+                    expected_revision,
+                    max_audit_iterations,
+                    reason,
+                })
+                .await
+                .map(|value| json!(value))
+        }
         "claim_work_item" | "renew_work_item_claim" | "release_work_item_claim" => {
             let instance_id = parse_instance_id(&arguments)?;
             let work_item_id = parse_work_item_id(&arguments)?;
@@ -451,6 +470,7 @@ pub(super) async fn call_tool(
                 ));
             }
             let idempotency_key = optional_idempotency_key(&arguments)?;
+            let audit_outcomes = optional_audit_outcomes(&arguments, max_summary_bytes)?;
             store
                 .publish_message_idempotent(
                     PublishMessage {
@@ -470,6 +490,7 @@ pub(super) async fn call_tool(
                         correlation_id,
                         in_reply_to,
                     },
+                    &audit_outcomes,
                     idempotency_key.as_deref(),
                 )
                 .await
@@ -730,9 +751,10 @@ pub(super) async fn read_resource(
                 "audit_flow": [
                     "Create one kind=audit work item in the repository that owns every completed implementation in audit_scope_work_item_ids; split cross-repository batches.",
                     "The owner repository claims the audit card and creates a fresh auditor linked by work_item_id. Its scope and iteration are derived from the card.",
-                    "The auditor publishes exactly one audit_report and completes; the owner orchestrator then completes the audit card without implementation_artifact_id.",
-                    "If remediation is needed, create one kind=remediation work item with addresses_audit_run_id, claim it in the same repository and create its executor with both matching links.",
-                    "A later audit card waits for the previous audit card and any remediation card to complete, increments each implementation item's iteration independently, and is rejected after max_audit_iterations is exhausted."
+                    "The auditor publishes exactly one audit_report with one audit_outcomes verdict per scoped item and completes; the owner orchestrator then completes the audit card without implementation_artifact_id.",
+                    "A changes_required verdict with remaining depth permits one kind=remediation work item with addresses_audit_run_id. Completing it produces pending_reaudit, never verified.",
+                    "A later fresh auditor must pass each remediated item. A final non-passing verdict produces verification_blocked; increase_audit_depth requires the current revision, an explicit reason, and user authorization.",
+                    "The Feature coordinator calls complete_feature only after every accepted implementation report has verification_status=verified."
                 ],
                 "request_flow": [
                     "Create a durable directed question with ask_repository and include feature_id/work_item_id when it affects tracked work; a work-item link infers its feature. The target receives request_available.",

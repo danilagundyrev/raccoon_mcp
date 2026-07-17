@@ -172,7 +172,7 @@ pub(super) fn tool_definitions(
         },
         {
             "name": "complete_feature",
-            "description": "Complete an active feature after all linked work, repository requests and worker runs are terminal. Only its coordinator repository may close it.",
+            "description": "Complete an active feature after all linked work, repository requests and worker runs are terminal and every accepted implementation report is independently verified. Only its coordinator repository may close it.",
             "inputSchema": feature_transition_schema(),
             "annotations": mutation_annotations(false)
         },
@@ -204,6 +204,12 @@ pub(super) fn tool_definitions(
             "name": "update_work_item",
             "description": "Update a work item using optimistic expected_revision. Completing implementation or remediation requires implementation_artifact_id from its completed executor; completing audit requires its completed auditor and audit_report and rejects implementation_artifact_id.",
             "inputSchema": update_work_item_schema(max_summary_bytes),
+            "annotations": mutation_annotations(false)
+        },
+        {
+            "name": "increase_audit_depth",
+            "description": "Explicitly reopen verification after audit depth is exhausted. Requires the current revision and a durable reason.",
+            "inputSchema": increase_audit_depth_schema(max_summary_bytes),
             "annotations": mutation_annotations(false)
         },
         {
@@ -497,6 +503,21 @@ pub(super) fn work_item_claim_schema() -> Value {
             "expected_revision": { "type": "integer", "minimum": 1 }
         },
         "required": ["instance_id", "work_item_id", "expected_revision"]
+    })
+}
+
+pub(super) fn increase_audit_depth_schema(max_summary_bytes: u16) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "instance_id": { "type": "string", "format": "uuid" },
+            "work_item_id": { "type": "string", "format": "uuid" },
+            "expected_revision": { "type": "integer", "minimum": 1 },
+            "max_audit_iterations": { "type": "integer", "minimum": 2, "maximum": 10 },
+            "reason": { "type": "string", "minLength": 1, "maxLength": max_summary_bytes }
+        },
+        "required": ["instance_id", "work_item_id", "expected_revision", "max_audit_iterations", "reason"]
     })
 }
 
@@ -830,6 +851,28 @@ pub(super) fn publish_message_schema(max_summary_bytes: u16, max_artifact_bytes:
         (
             "in_reply_to".to_owned(),
             json!({ "type": "string", "format": "uuid" }),
+        ),
+        (
+            "audit_outcomes".to_owned(),
+            json!({
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_AUDIT_WORK_ITEMS,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "work_item_id": { "type": "string", "format": "uuid" },
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["passed", "changes_required", "blocked"]
+                        },
+                        "summary": { "type": "string", "minLength": 1, "maxLength": max_summary_bytes }
+                    },
+                    "required": ["work_item_id", "verdict", "summary"]
+                },
+                "description": "Required with audit_report. Must cover the auditor run scope exactly once."
+            }),
         ),
         ("idempotency_key".to_owned(), idempotency_key_schema()),
     ]));
