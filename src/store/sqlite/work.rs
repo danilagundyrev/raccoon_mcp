@@ -656,7 +656,6 @@ impl SqliteStore {
                         current.work_item_id,
                         actor.project_id,
                         current.owner_repository_id,
-                        current.assignee_instance_id,
                     )
                     .await?;
                 }
@@ -671,7 +670,6 @@ impl SqliteStore {
                         &mut transaction,
                         current.work_item_id,
                         current.owner_repository_id,
-                        current.assignee_instance_id,
                     )
                     .await?;
                 }
@@ -1489,7 +1487,7 @@ pub(super) fn validate_status_transition(
         ) | (WorkItemStatus::Ready, WorkItemStatus::Cancelled)
             | (
                 WorkItemStatus::Claimed,
-                WorkItemStatus::InProgress | WorkItemStatus::Cancelled
+                WorkItemStatus::InProgress | WorkItemStatus::Completed | WorkItemStatus::Cancelled
             )
             | (
                 WorkItemStatus::InProgress,
@@ -1757,13 +1755,7 @@ async fn validate_implementation_artifact(
     work_item_id: WorkItemId,
     project_id: ProjectId,
     owner_repository_id: RepositoryId,
-    assignee_instance_id: Option<InstanceId>,
 ) -> Result<(), StoreError> {
-    let assignee_instance_id = assignee_instance_id.ok_or_else(|| {
-        StoreError::Conflict(
-            "completed work item must still be owned by its claimed orchestrator".to_owned(),
-        )
-    })?;
     let exists: i64 = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
@@ -1777,7 +1769,6 @@ async fn validate_implementation_artifact(
                AND worker.role = 'executor'
                AND worker.status = 'completed'
                AND worker.work_item_id = ?
-               AND worker.parent_instance_id = ?
                AND worker.worker_run_id = (
                    SELECT latest.worker_run_id
                    FROM worker_runs latest
@@ -1791,7 +1782,6 @@ async fn validate_implementation_artifact(
     .bind(project_id.to_string())
     .bind(owner_repository_id.to_string())
     .bind(work_item_id.to_string())
-    .bind(assignee_instance_id.to_string())
     .bind(work_item_id.to_string())
     .fetch_one(&mut **transaction)
     .await?;
@@ -1808,13 +1798,7 @@ async fn validate_audit_work_item_completion(
     transaction: &mut Transaction<'_, Sqlite>,
     work_item_id: WorkItemId,
     owner_repository_id: RepositoryId,
-    assignee_instance_id: Option<InstanceId>,
 ) -> Result<(), StoreError> {
-    let assignee_instance_id = assignee_instance_id.ok_or_else(|| {
-        StoreError::Conflict(
-            "completed audit work item must still be owned by its claimed orchestrator".to_owned(),
-        )
-    })?;
     let valid: i64 = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
@@ -1824,14 +1808,12 @@ async fn validate_audit_work_item_completion(
               AND report.kind = 'audit_report'
              WHERE worker.work_item_id = ?
                AND worker.repository_id = ?
-               AND worker.parent_instance_id = ?
                AND worker.role = 'auditor'
                AND worker.status = 'completed'
          )",
     )
     .bind(work_item_id.to_string())
     .bind(owner_repository_id.to_string())
-    .bind(assignee_instance_id.to_string())
     .fetch_one(&mut **transaction)
     .await?;
     if valid == 0 {

@@ -434,6 +434,51 @@ async fn unknown_answer_argument_is_rejected_before_request_mutation() {
 }
 
 #[tokio::test]
+async fn increase_audit_depth_requires_a_non_null_depth_without_panicking() {
+    let path = std::env::temp_dir()
+        .join("raccoon-mcp-server-tests")
+        .join(format!("{}.sqlite3", uuid::Uuid::new_v4()));
+    let store = SqliteStore::open(&path, 1, 90, 3600, 600, 3600)
+        .await
+        .unwrap();
+    for (id, depth) in [(1, None), (2, Some(Value::Null))] {
+        let mut arguments = json!({
+            "instance_id": InstanceId::new(),
+            "work_item_id": WorkItemId::new(),
+            "expected_revision": 1,
+            "reason": "Explicit reopening"
+        });
+        if let Some(depth) = depth {
+            arguments["max_audit_iterations"] = depth;
+        }
+        let (status, body) = handle_rpc_payload(
+            &store,
+            1024,
+            4096,
+            60,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "increase_audit_depth",
+                    "arguments": arguments
+                }
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.unwrap()["error"]["data"]["code"], "invalid_params");
+    }
+
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+}
+
+#[tokio::test]
 async fn protocol_rejects_batches_and_never_responds_to_notifications() {
     let path = std::env::temp_dir()
         .join("raccoon-mcp-server-tests")

@@ -756,24 +756,33 @@ async fn validate_remediation_audit(
             "worker run {audit_run_id} must be a completed repository-local audit work item with exactly one report"
         )));
     }
-    let actionable: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)
+    let actionable = sqlx::query(
+        "SELECT COUNT(*) AS total_count,
+                COALESCE(SUM(CASE
+                    WHEN scope.audit_iteration < item.max_audit_iterations
+                     AND item.verification_status = 'remediation_required'
+                    THEN 1 ELSE 0 END), 0) AS eligible_count
          FROM audit_outcomes outcome
          JOIN worker_run_audit_items scope
            ON scope.worker_run_id = outcome.audit_worker_run_id
           AND scope.work_item_id = outcome.scoped_work_item_id
          JOIN work_items item ON item.work_item_id = outcome.scoped_work_item_id
          WHERE outcome.audit_worker_run_id = ?
-           AND outcome.verdict = 'changes_required'
-           AND scope.audit_iteration < item.max_audit_iterations
-           AND item.verification_status = 'remediation_required'",
+           AND outcome.verdict = 'changes_required'",
     )
     .bind(audit_run_id.to_string())
     .fetch_one(&mut **transaction)
     .await?;
-    if actionable == 0 {
+    let total_count: i64 = actionable.try_get("total_count")?;
+    let eligible_count: i64 = actionable.try_get("eligible_count")?;
+    if total_count == 0 {
         return Err(StoreError::Conflict(format!(
             "audit worker run {audit_run_id} has no changes_required outcome to remediate"
+        )));
+    }
+    if eligible_count != total_count {
+        return Err(StoreError::Conflict(format!(
+            "all {total_count} changes_required outcomes from audit worker run {audit_run_id} must have remaining audit depth before its single remediation can start"
         )));
     }
     let inactive_features: i64 = sqlx::query_scalar(

@@ -549,7 +549,9 @@ If the report contains findings, create exactly one `remediation` work item in t
 }
 ```
 
-Claim that card, then create its executor with both `work_item_id` and the same `addresses_audit_run_id`. The executor publishes an `implementation_report`; its orchestrator completes the remediation card with that artifact. A failed or abandoned executor can likewise be retried on the same reclaimed remediation card, but attempts cannot overlap and a completed attempt is final.
+Claim that card, then create its executor with both `work_item_id` and the same `addresses_audit_run_id`. The executor publishes an `implementation_report`; an orchestrator holding the active repository claim completes the remediation card with that artifact. A failed or abandoned executor can likewise be retried on the same reclaimed remediation card, but attempts cannot overlap and a completed attempt is final.
+
+A batch audit still has exactly one remediation card. Therefore every `changes_required` item in that audit must have remaining audit depth before the card can be created. If several items became `verification_blocked`, explicitly increase depth for all of them first; reopening only part of the batch is rejected and does not mutate neighbouring items.
 
 The next audit card is allowed only after the prior audit card and any remediation card complete. Remediation completion produces `pending_reaudit`, never `verified`; another independent passing auditor is required. A `blocked` outcome with remaining depth can proceed directly to a later audit after its external blocker is resolved. Remediation cannot be created retroactively after a later audit iteration starts.
 
@@ -806,11 +808,11 @@ Use `get_worker_run`. An expired worker becomes `abandoned` and cannot be revive
 
 Check that:
 
-1. the item is `in_progress`;
-2. its claim is still owned by the current orchestrator;
+1. the item is `in_progress`, or `claimed` after recovery of an already completed worker report;
+2. its claim is currently owned by the calling orchestrator;
 3. the linked executor completed;
 4. `expected_revision` is current;
-5. `implementation_artifact_id` belongs to the linked executor and item.
+5. `implementation_artifact_id` belongs to the latest completed executor for that repository and item. The executor's original parent instance need not remain online: after claim expiry, another orchestrator in the same repository can take over and accept the durable report.
 
 
 ## Recommended Codex skill

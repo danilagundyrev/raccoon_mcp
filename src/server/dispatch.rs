@@ -380,8 +380,13 @@ pub(super) async fn call_tool(
             let work_item_id = parse_work_item_id(&arguments)?;
             let expected_revision = required_revision(&arguments)?;
             let max_audit_iterations =
-                optional_bounded_u8(&arguments, "max_audit_iterations", 2, 10)?
-                    .expect("required by tool schema validation");
+                optional_bounded_u8(&arguments, "max_audit_iterations", 2, 10)?.ok_or_else(
+                    || {
+                        invalid_argument(
+                            "'max_audit_iterations' is required and must not be null".to_owned(),
+                        )
+                    },
+                )?;
             let reason = validated_summary(&arguments, "reason", max_summary_bytes)?;
             store
                 .increase_audit_depth(IncreaseAuditDepth {
@@ -743,7 +748,7 @@ pub(super) async fn read_resource(
                     "Higher numeric priority values are listed and claimed before lower values when other eligibility rules are equal.",
                     "Claim a ready item with expected_revision, then create an executor worker run linked by work_item_id.",
                     "The latest executor linked to the item publishes an implementation_report and completes its worker run.",
-                    "Its assigned orchestrator then completes the item through update_work_item while the claim is still active.",
+                    "An orchestrator holding the active repository claim completes the item through update_work_item. A completed repository-local worker report remains valid after an expired claim is taken over by another orchestrator instance.",
                     "Every mutation increments revision and emits project-wide compact work_item_updated events; stale writes return the current card.",
                     "The feature coordinator repository calls complete_feature with its current revision only after durable linked work, requests and workers are terminal; cancel_feature closes abandoned work under its stricter safety checks.",
                     "Peer repositories stop waiting on feature_completed or feature_cancelled for the current feature and call disconnect_orchestrator before exit. MCP session DELETE is transport cleanup, not the durable completion signal."
@@ -752,7 +757,7 @@ pub(super) async fn read_resource(
                     "Create one kind=audit work item in the repository that owns every completed implementation in audit_scope_work_item_ids; split cross-repository batches.",
                     "The owner repository claims the audit card and creates a fresh auditor linked by work_item_id. Its scope and iteration are derived from the card.",
                     "The auditor publishes exactly one audit_report with one audit_outcomes verdict per scoped item and completes; the owner orchestrator then completes the audit card without implementation_artifact_id.",
-                    "A changes_required verdict with remaining depth permits one kind=remediation work item with addresses_audit_run_id. Completing it produces pending_reaudit, never verified.",
+                    "A changes_required batch permits one kind=remediation work item only when every changes_required item has remaining depth; partially reopened batches are rejected. Completing remediation produces pending_reaudit, never verified.",
                     "A later fresh auditor must pass each remediated item. A final non-passing verdict produces verification_blocked; increase_audit_depth requires the current revision, an explicit reason, and user authorization.",
                     "The Feature coordinator calls complete_feature only after every accepted implementation report has verification_status=verified."
                 ],
