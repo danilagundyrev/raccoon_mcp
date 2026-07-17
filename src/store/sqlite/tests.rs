@@ -59,6 +59,82 @@ fn publish_command(
     }
 }
 
+async fn feature_with_completed_item_and_audit(
+    store: &SqliteStore,
+    connected: &ConnectResult,
+    label: &str,
+) -> (Feature, WorkItem, WorkerRun) {
+    let feature = store
+        .create_feature(CreateFeature {
+            parent_instance_id: connected.instance.instance_id,
+            title: format!("{label} feature"),
+            summary: "Terminal worker-link regression".to_owned(),
+        })
+        .await
+        .unwrap();
+    let item = store
+        .create_work_item(CreateWorkItem {
+            parent_instance_id: connected.instance.instance_id,
+            feature_id: feature.feature_id,
+            parent_work_item_id: None,
+            owner_repository_id: connected.repository.repository_id,
+            title: format!("{label} item"),
+            summary: "Completed audit target".to_owned(),
+            dependency_ids: Vec::new(),
+            priority: 0,
+            max_audit_iterations: 2,
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE work_items SET status = 'completed' WHERE work_item_id = ?")
+        .bind(item.work_item_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let audit = store
+        .create_worker_run(CreateWorkerRun {
+            parent_instance_id: connected.instance.instance_id,
+            role: WorkerRole::Auditor,
+            task_summary: format!("Audit {label} item"),
+            context_refs: json!([]),
+            audit_work_items: vec![AuditWorkItemInput {
+                work_item_id: item.work_item_id,
+            }],
+            addresses_audit_run_id: None,
+            work_item_id: None,
+        })
+        .await
+        .unwrap();
+    store
+        .activate_worker_run(audit.worker_run_id)
+        .await
+        .unwrap();
+    store
+        .publish_message(PublishMessage {
+            actor: ActorRef::Worker(audit.worker_run_id),
+            kind: MessageKind::Report,
+            target: MessageTarget::Broadcast,
+            summary: format!("{label} audit report"),
+            body: Some("No findings".to_owned()),
+            artifact_kind: ArtifactKind::AuditReport,
+            artifact_title: None,
+            content_type: "text/markdown".to_owned(),
+            feature_id: Some(feature.feature_id),
+            work_item_id: Some(item.work_item_id),
+            request_id: None,
+            thread_id: None,
+            correlation_id: None,
+            in_reply_to: None,
+        })
+        .await
+        .unwrap();
+    let audit = store
+        .complete_worker_run(audit.worker_run_id, "Audit complete")
+        .await
+        .unwrap();
+    (feature, item, audit)
+}
+
 fn remove_database(path: &Path) {
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
@@ -499,6 +575,79 @@ async fn feature_cancellation_cancels_unclaimed_items_but_rejects_active_work() 
             .await
             .is_err()
     );
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn terminal_features_reject_new_audit_and_remediation_workers() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "terminal-worker-links",
+            "backend",
+            "C:/terminal/backend",
+        ))
+        .await
+        .unwrap();
+
+    for terminal_status in [FeatureStatus::Completed, FeatureStatus::Cancelled] {
+        let label = terminal_status.as_str();
+        let (feature, item, audit) =
+            feature_with_completed_item_and_audit(&store, &connected, label).await;
+        match terminal_status {
+            FeatureStatus::Completed => {
+                store
+                    .complete_feature(CompleteFeature {
+                        parent_instance_id: connected.instance.instance_id,
+                        feature_id: feature.feature_id,
+                        expected_revision: feature.revision,
+                    })
+                    .await
+                    .unwrap();
+            }
+            FeatureStatus::Cancelled => {
+                store
+                    .cancel_feature(CancelFeature {
+                        parent_instance_id: connected.instance.instance_id,
+                        feature_id: feature.feature_id,
+                        expected_revision: feature.revision,
+                    })
+                    .await
+                    .unwrap();
+            }
+            FeatureStatus::Active => unreachable!(),
+        }
+
+        let new_audit = store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: connected.instance.instance_id,
+                role: WorkerRole::Auditor,
+                task_summary: "Audit terminal feature".to_owned(),
+                context_refs: json!([]),
+                audit_work_items: vec![AuditWorkItemInput {
+                    work_item_id: item.work_item_id,
+                }],
+                addresses_audit_run_id: None,
+                work_item_id: None,
+            })
+            .await;
+        assert!(matches!(new_audit, Err(StoreError::Conflict(_))));
+
+        let remediation = store
+            .create_worker_run(CreateWorkerRun {
+                parent_instance_id: connected.instance.instance_id,
+                role: WorkerRole::Executor,
+                task_summary: "Remediate terminal feature".to_owned(),
+                context_refs: json!([]),
+                audit_work_items: Vec::new(),
+                addresses_audit_run_id: Some(audit.worker_run_id),
+                work_item_id: None,
+            })
+            .await;
+        assert!(matches!(remediation, Err(StoreError::Conflict(_))));
+    }
 
     store.pool.close().await;
     remove_database(&path);
@@ -1940,6 +2089,42 @@ async fn wait_timeout_preserves_cursor_and_renews_lease() {
     assert!(batch.events.is_empty());
     assert!(renewed.last_heartbeat_at > initial_heartbeat);
     assert!(renewed.lease_expires_at > utc_now());
+
+    store.pool.close().await;
+    remove_database(&path);
+}
+
+#[tokio::test]
+async fn wait_deadline_includes_initial_write_lock_contention() {
+    let (store, path) = test_store(90).await;
+    let connected = store
+        .connect_orchestrator(connect_command(
+            "wait-contention",
+            "backend",
+            "C:/wait-contention/backend",
+        ))
+        .await
+        .unwrap();
+    let write_guard = store.write_lock.lock().await;
+    let started_at = tokio::time::Instant::now();
+    let batch = tokio::time::timeout(
+        Duration::from_millis(500),
+        store.wait_for_events(
+            ActorRef::Orchestrator(connected.instance.instance_id),
+            77,
+            &[],
+            Duration::from_millis(100),
+            20,
+        ),
+    )
+    .await
+    .expect("wait_for_events exceeded its full-call deadline")
+    .unwrap();
+    assert_eq!(batch.outcome, WaitOutcome::Deadline);
+    assert_eq!(batch.next_cursor, 77);
+    assert!(batch.events.is_empty());
+    assert!(started_at.elapsed() < Duration::from_millis(300));
+    drop(write_guard);
 
     store.pool.close().await;
     remove_database(&path);

@@ -207,6 +207,33 @@ BEGIN
     SELECT RAISE(ABORT, 'audit worker and work item must belong to the same project');
 END;
 
+CREATE TRIGGER IF NOT EXISTS worker_run_audit_items_active_feature
+BEFORE INSERT ON worker_run_audit_items
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM work_items
+    JOIN features ON features.feature_id = work_items.feature_id
+    WHERE work_items.work_item_id = NEW.work_item_id
+      AND features.status = 'active'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'audit worker requires an active feature');
+END;
+
+CREATE TRIGGER IF NOT EXISTS worker_runs_remediation_active_feature
+BEFORE INSERT ON worker_runs
+WHEN NEW.addresses_audit_run_id IS NOT NULL AND EXISTS (
+    SELECT 1
+    FROM worker_run_audit_items audit_scope
+    JOIN work_items ON work_items.work_item_id = audit_scope.work_item_id
+    JOIN features ON features.feature_id = work_items.feature_id
+    WHERE audit_scope.worker_run_id = NEW.addresses_audit_run_id
+      AND features.status <> 'active'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'remediation worker requires active feature scope');
+END;
+
 CREATE TABLE IF NOT EXISTS artifacts (
     artifact_id TEXT PRIMARY KEY NOT NULL,
     project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,

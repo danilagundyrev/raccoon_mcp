@@ -239,7 +239,7 @@ async fn event_wait_reaches_the_configured_deadline_and_reports_clamping() {
     assert_eq!(payload["requested_timeout_seconds"], 65_535);
     assert_eq!(payload["effective_timeout_seconds"], 1);
     assert!(payload["elapsed_ms"].as_u64().unwrap() >= 900);
-    assert!(started_at.elapsed() < Duration::from_secs(2));
+    assert!(started_at.elapsed() < Duration::from_millis(1_500));
 
     drop(store);
     let _ = std::fs::remove_file(&path);

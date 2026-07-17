@@ -9,6 +9,7 @@ impl SqliteStore {
         timeout: Duration,
         limit: u8,
     ) -> Result<EventBatch, StoreError> {
+        let deadline = Instant::now() + timeout;
         if cursor < 0 {
             return Err(StoreError::Conflict(
                 "event cursor must be non-negative".to_owned(),
@@ -20,6 +21,30 @@ impl SqliteStore {
             ));
         }
 
+        if timeout.is_zero() {
+            return self
+                .wait_for_events_until(actor_ref, cursor, kinds, limit, deadline)
+                .await;
+        }
+        match timeout_at(
+            deadline,
+            self.wait_for_events_until(actor_ref, cursor, kinds, limit, deadline),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(deadline_event_batch(cursor)),
+        }
+    }
+
+    async fn wait_for_events_until(
+        &self,
+        actor_ref: ActorRef,
+        cursor: i64,
+        kinds: &[EventKind],
+        limit: u8,
+        deadline: Instant,
+    ) -> Result<EventBatch, StoreError> {
         let actor = self.touch_actor(actor_ref).await?;
         let repository_id = actor.repository_id;
         let notifier = self.notifications.for_repository(repository_id);
@@ -37,8 +62,6 @@ impl SqliteStore {
         let heartbeat_every =
             Duration::from_secs((lease_seconds.min(renewal_seconds) / 3).max(1) as u64);
         let mut heartbeat = interval_at(Instant::now() + heartbeat_every, heartbeat_every);
-        let deadline = Instant::now() + timeout;
-
         loop {
             // Register before querying so a commit between the query and await cannot be missed.
             let notified = notifier.notified();
@@ -63,12 +86,7 @@ impl SqliteStore {
                     }
                 }
                 _ = wait_until(deadline) => {
-                    return Ok(EventBatch {
-                        outcome: WaitOutcome::Deadline,
-                        events: Vec::new(),
-                        next_cursor: cursor,
-                        has_more: false,
-                    });
+                    return Ok(deadline_event_batch(cursor));
                 }
             }
         }
@@ -125,5 +143,14 @@ impl SqliteStore {
             next_cursor,
             has_more,
         })
+    }
+}
+
+fn deadline_event_batch(cursor: i64) -> EventBatch {
+    EventBatch {
+        outcome: WaitOutcome::Deadline,
+        events: Vec::new(),
+        next_cursor: cursor,
+        has_more: false,
     }
 }

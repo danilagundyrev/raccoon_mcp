@@ -17,7 +17,7 @@ use sqlx::{
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, Notify},
-    time::{Instant, interval_at, sleep_until},
+    time::{Instant, interval_at, sleep_until, timeout_at},
 };
 
 use crate::domain::{
@@ -758,7 +758,8 @@ async fn prepare_audit_scope(
     let mut scope = Vec::with_capacity(command.audit_work_items.len());
     for item in &command.audit_work_items {
         let work_item = sqlx::query(
-            "SELECT work_items.status, work_items.max_audit_iterations
+            "SELECT work_items.status, work_items.max_audit_iterations,
+                    features.status AS feature_status
              FROM work_items
              JOIN features ON features.feature_id = work_items.feature_id
              WHERE work_items.work_item_id = ? AND features.project_id = ?",
@@ -768,6 +769,13 @@ async fn prepare_audit_scope(
         .fetch_optional(&mut **transaction)
         .await?
         .ok_or_else(|| StoreError::NotFound(format!("work item {}", item.work_item_id)))?;
+        let feature_status: String = work_item.try_get("feature_status")?;
+        if feature_status != FeatureStatus::Active.as_str() {
+            return Err(StoreError::Conflict(format!(
+                "work item {} belongs to a terminal feature",
+                item.work_item_id
+            )));
+        }
         let status: String = work_item.try_get("status")?;
         if status != "completed" {
             return Err(StoreError::Conflict(format!(
@@ -852,6 +860,23 @@ async fn validate_remediation_audit(
     if audit_repository_id != repository_id || role != "auditor" || status != "completed" {
         return Err(StoreError::Conflict(format!(
             "worker run {audit_run_id} must be a completed auditor run in the same repository"
+        )));
+    }
+    let inactive_features: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT features.feature_id)
+         FROM worker_run_audit_items
+         JOIN work_items
+           ON work_items.work_item_id = worker_run_audit_items.work_item_id
+         JOIN features ON features.feature_id = work_items.feature_id
+         WHERE worker_run_audit_items.worker_run_id = ?
+           AND features.status <> 'active'",
+    )
+    .bind(audit_run_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    if inactive_features != 0 {
+        return Err(StoreError::Conflict(format!(
+            "audit worker run {audit_run_id} belongs to a terminal feature"
         )));
     }
     let existing =
