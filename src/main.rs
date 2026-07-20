@@ -9,7 +9,11 @@ use anyhow::Context;
 use clap::Parser;
 use config::Args;
 use store::SqliteStore;
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::{
+    filter::{LevelFilter, Targets},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -60,14 +64,53 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_logging(level: &str) {
-    let level_filter = match level {
+    let _ = tracing_subscriber::registry()
+        .with(logging_targets(level))
+        .with(tracing_subscriber::fmt::layer())
+        .try_init();
+}
+
+fn logging_targets(level: &str) -> Targets {
+    let application_level = match level {
         "DEBUG" => LevelFilter::DEBUG,
         "WARNING" => LevelFilter::WARN,
         "ERROR" => LevelFilter::ERROR,
         _ => LevelFilter::INFO,
     };
+    let dependency_level = if level == "ERROR" {
+        LevelFilter::ERROR
+    } else {
+        LevelFilter::WARN
+    };
 
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(level_filter)
-        .try_init();
+    Targets::new()
+        .with_default(dependency_level)
+        .with_target(env!("CARGO_CRATE_NAME"), application_level)
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing::Level;
+
+    use super::*;
+
+    #[test]
+    fn debug_logging_does_not_enable_dependency_query_traces() {
+        let targets = logging_targets("DEBUG");
+        assert!(targets.would_enable("raccoon_mcp::server", &Level::DEBUG));
+        assert!(targets.would_enable("sqlx::query", &Level::WARN));
+        assert!(!targets.would_enable("sqlx::query", &Level::DEBUG));
+        assert!(!targets.would_enable("axum::routing", &Level::INFO));
+    }
+
+    #[test]
+    fn application_log_level_remains_configurable() {
+        let info = logging_targets("INFO");
+        assert!(info.would_enable("raccoon_mcp::store", &Level::INFO));
+        assert!(!info.would_enable("raccoon_mcp::store", &Level::DEBUG));
+
+        let errors = logging_targets("ERROR");
+        assert!(errors.would_enable("raccoon_mcp::server", &Level::ERROR));
+        assert!(!errors.would_enable("sqlx::query", &Level::WARN));
+    }
 }

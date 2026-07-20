@@ -133,7 +133,7 @@ pub struct Args {
         long,
         default_value = "INFO",
         value_parser = ["DEBUG", "INFO", "WARNING", "ERROR"],
-        help = "Logging level."
+        help = "Application logging level; dependencies remain at WARN (ERROR at application ERROR)."
     )]
     pub log_level: String,
 

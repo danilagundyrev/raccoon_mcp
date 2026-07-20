@@ -829,7 +829,7 @@ cargo run -- --help
 | `--enable-metrics` | off | Expose `GET /metrics`. |
 | `--session-idle-timeout-seconds` | `3600` | MCP session idle timeout, 60–65535 seconds. |
 | `--max-sessions` | `128` | In-memory MCP-session limit, 1–4096. |
-| `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
+| `--log-level` | `INFO` | Application level: `DEBUG`, `INFO`, `WARNING`, or `ERROR`. Dependencies stay at `WARN` (`ERROR` when selected), so `DEBUG` does not print SQL statements. |
 | `--allow-host` | — | Additional Origin hostname; may be repeated. |
 
 A practical local profile is usually simple:
