@@ -2,7 +2,7 @@
 
 This document explains the coordination model and concrete MCP calls for maintainers, skill authors, and protocol debugging. It is not required for ordinary use of the server.
 
-The live MCP tool schemas, runtime validation, and `hub://guide` resource are authoritative if this document differs from the implementation. For installation and operation, see the [server README](../src/README.md).
+The live MCP tool schemas, runtime validation, and `hub://guide` resource are authoritative if this document differs from the implementation. For installation and operation, see the [server README](../README.md).
 
 ## Connect an orchestrator
 
