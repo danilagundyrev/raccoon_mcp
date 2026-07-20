@@ -136,7 +136,7 @@ Repositories are durable identities. Orchestrator instances and child worker run
 
 ## Architecture and protocol documentation
 
-Human installation, configuration, and troubleshooting stay in this README. Detailed entity rules, JSON examples, tool-by-tool workflows, schemas, event semantics, leases, and recovery behavior live in [Architecture and Protocol Reference](../docs/ARCHITECTURE.md).
+Human installation, configuration, and troubleshooting stay in this README. Detailed entity rules, JSON examples, tool-by-tool workflows, schemas, event semantics, leases, and recovery behavior live in [Architecture and Protocol Reference](/docs/ARCHITECTURE.md).
 
 Agents should normally follow the collaboration skill below together with the live MCP tool schemas and `hub://guide`. The architecture document is primarily for maintainers, skill authors, debugging, and protocol review; users do not need to manually reproduce its calls.
 
