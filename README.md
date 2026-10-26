@@ -12,6 +12,7 @@ It persists shared coordination state in SQLite and provides MCP tools for repos
 
 - [Mental model](#mental-model)
 - [Quick start](#quick-start)
+- [Browser mission control](#browser-mission-control)
 - [Connect an MCP client](#connect-an-mcp-client)
 - [Use the server](#use-the-server)
 - [Architecture and protocol documentation](#architecture-and-protocol-documentation)
@@ -93,6 +94,25 @@ Invoke-RestMethod http://127.0.0.1:8765/readyz
 `/healthz` only checks the HTTP process. `/readyz` opens a SQLite transaction, performs a harmless write, and rolls it back. `/metrics` is unavailable unless the server was started with `--enable-metrics`.
 
 `Ctrl+C` performs graceful shutdown: active waits are cancelled, maintenance stops, and local leases are expired.
+
+## Browser mission control
+
+Open **[http://127.0.0.1:8765/dashboard](http://127.0.0.1:8765/dashboard)** after starting the server. Opening the server root in a browser also shows mission control. The dashboard is embedded in the Rust binary: no Node.js, frontend build, separate web server or internet connection is required.
+
+- **Mission control:** animated repository topology, connected agents, active operations, project progress and live events.
+- **Agent network:** orchestrators and executor, auditor and butler runs, with heartbeat and lease-aware presence.
+- **Workboard:** mission cards, task status, dependencies, execution lineage, audit verification and repository requests.
+- **Transmissions:** messages, recipients, pending acknowledgements, threads and attached artifacts.
+- **Artifacts & reports:** full report content, structured audit verdicts and report downloads.
+- **Event log:** state changes with fan-out notification copies merged into one entry.
+
+Select a project, search the current view, or click a card to inspect its linked objects. `/` focuses search; `Esc` closes details. Animations respect reduced-motion preferences and can also be paused in the header.
+
+The dashboard is a read-only human observer. It does not register agents, renew leases, acknowledge messages or mutate coordination state. It refreshes every two seconds while visible, pauses in background tabs and reconnects automatically. If the server is unreachable, it labels the last received state as stale. Each collection contains up to 1,000 records, with active work prioritized and a visible notice when a collection is clipped; select a project to narrow the snapshot. Counters describe loaded records, not an unlimited historical total.
+
+**Explore demo universe** switches to explicitly labelled, browser-only sample data. It never writes sample projects or agents to your database. Return to the live server from the demo banner or sidebar.
+
+Frontend source and development checks live in [`raccoon_mcp_web`](raccoon_mcp_web/README.md). The observer API is `GET /api/dashboard/snapshot` (optional `project_id`) and `GET /api/dashboard/artifacts/{artifact_id}`. Machine clients requesting JSON from `/` retain the existing server metadata response.
 
 ## Connect an MCP client
 
@@ -508,6 +528,6 @@ The skill needs no scripts or bundled assets. `hub://guide` provides the live se
 
 The first pilot version of this server was created long ago and supported coordination between only two predefined repositories. With Codex and GPT-5.6, I completely redesigned that prototype into a full developer tool: Raccoon MCP can now connect many repositories within one project, provides a structured and persistent coordination workflow, and supports dedicated orchestrator, executor, butler, and auditor roles.
 
-Work on the main redesign began only a few days before OpenAI Build Week, with most of the implementation completed during the event itself. I used Codex to explore and plan the server architecture, implement the redesign in Rust, investigate and fix bugs, and independently audit completed changes. I remained responsible for the product direction, architectural decisions, and final review.
+I used Codex to explore and plan the server architecture, implement the redesign in Rust, investigate and fix bugs, and independently audit completed changes. I remained responsible for the product direction, architectural decisions, and final review.
 
 After the initial implementation, I ran a large multi-repository field test with real orchestrator sessions. Codex helped me analyze the resulting reports and persisted server state, turn the findings into a concrete protocol update plan, implement that plan, and verify the updated coordination workflow through further testing and audits.

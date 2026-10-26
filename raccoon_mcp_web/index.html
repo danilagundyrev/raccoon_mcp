@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101113" />
+    <meta
+      name="description"
+      content="Live mission control for your local Raccoon MCP agent coordination server."
+    />
+    <title>Raccoon / Mission Control</title>
+    <link
+      rel="icon"
+      href="/dashboard/assets/favicon.svg"
+      type="image/svg+xml"
+    />
+    <link rel="stylesheet" href="/dashboard/assets/style.css" />
+    <script type="module" src="/dashboard/assets/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#overview"
+        ><img
+          src="/dashboard/assets/favicon.svg"
+          alt=""
+          width="36"
+          height="36"
+        /><span
+          >raccoon<span class="brand-caption">AGENT COORDINATION</span></span
+        ><span class="version">MCP</span></a
+      >
+      <div class="workspace-label">WORKSPACE <span>LOCAL</span></div>
+      <div class="project-picker" id="project-picker">
+        <button
+          id="project"
+          class="project-trigger"
+          aria-label="Select project"
+          aria-haspopup="dialog"
+          aria-controls="project-menu"
+          aria-expanded="false"
+        >
+          <span class="picker-icon" aria-hidden="true">◈</span>
+          <span id="project-label">All projects</span>
+          <svg class="picker-chevron" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="m4 6 4 4 4-4" />
+          </svg>
+        </button>
+        <div
+          id="project-menu"
+          class="project-menu"
+          role="dialog"
+          aria-labelledby="project-menu-title"
+          hidden
+        >
+          <div class="project-menu-heading">
+            <span id="project-menu-title">SWITCH WORKSPACE</span
+            ><span class="project-menu-local">LOCAL</span>
+          </div>
+          <div class="project-search-wrap">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="10.5" cy="10.5" r="6.5" />
+              <path d="m16 16 5 5" /></svg
+            ><input
+              id="project-search"
+              type="text"
+              role="combobox"
+              aria-label="Search projects"
+              aria-controls="project-options"
+              aria-expanded="true"
+              aria-autocomplete="list"
+              placeholder="Find your orbit…"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </div>
+          <div
+            id="project-options"
+            class="project-options"
+            role="listbox"
+            aria-label="Projects"
+          ></div>
+          <div class="project-menu-footer">
+            <span>↑ ↓ NAVIGATE &nbsp; ↵ SELECT</span><span>ESC CLOSE</span>
+          </div>
+        </div>
+      </div>
+      <div class="nav-label">COMMAND CENTER</div>
+      <nav id="navigation" aria-label="Main navigation"></nav>
+      <div class="sidebar-bottom">
+        <div class="node-status">
+          <span class="status-light" id="sidebar-light"></span>
+          <div>
+            <strong id="sidebar-status">Establishing uplink</strong
+            ><span id="server-address"></span>
+          </div>
+          <span class="tiny-grid">▦</span>
+        </div>
+        <button id="demo-toggle" class="demo-button">
+          ◈ &nbsp; Explore demo universe <span>↗</span>
+        </button>
+        <div class="sidebar-foot">
+          <span>BUILT FOR THE AGENT ERA</span
+          ><span id="server-version">v0.1.0</span>
+        </div>
+      </div>
+    </aside>
+    <div class="app-shell">
+      <header class="topbar">
+        <button
+          class="icon-button mobile-menu"
+          id="menu-toggle"
+          aria-label="Toggle navigation"
+          aria-expanded="false"
+        >
+          ☰
+        </button>
+        <div class="breadcrumb">
+          Workspace <span>/</span>
+          <strong id="breadcrumb">Mission control</strong>
+        </div>
+        <div class="topbar-tools">
+          <label class="search-box"
+            ><span id="search-icon"></span
+            ><input
+              id="search"
+              type="search"
+              placeholder="Search this view…"
+              aria-label="Search this view"
+            /><kbd>/</kbd></label
+          ><button
+            class="icon-button"
+            id="motion-toggle"
+            title="Toggle animations"
+            aria-label="Toggle animations"
+            aria-pressed="false"
+          ></button
+          ><span class="topbar-divider"></span
+          ><span class="local-tag"><span></span> LOCAL NODE</span>
+        </div>
+      </header>
+      <div id="connection-notice" class="notice" role="status" hidden></div>
+      <main id="main" tabindex="-1">
+        <div class="loading-screen">
+          <div class="loading-orbit"></div>
+          <h1>Establishing uplink</h1>
+          <p>Reading your coordination universe…</p>
+        </div>
+      </main>
+      <footer class="statusbar">
+        <span
+          ><i id="footer-light" class="status-light"></i
+          ><span id="footer-status"
+            >Connecting to coordination server</span
+          ></span
+        ><span id="sync-time">WAITING FOR SNAPSHOT</span
+        ><span class="footer-clock" id="clock"></span>
+      </footer>
+    </div>
+    <dialog id="inspector" aria-labelledby="inspector-title">
+      <div class="inspector-header">
+        <div>
+          <span class="eyebrow" id="inspector-type">DETAILS</span>
+          <h2 id="inspector-title"></h2>
+        </div>
+        <button
+          class="icon-button"
+          id="close-inspector"
+          aria-label="Close details"
+        >
+          ✕
+        </button>
+      </div>
+      <div id="inspector-content"></div>
+    </dialog>
+    <div id="toast" class="toast" role="status" hidden></div>
+  </body>
+</html>

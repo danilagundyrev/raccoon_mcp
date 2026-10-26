@@ -41,6 +41,7 @@ use crate::domain::{
 
 use super::schema::{CREATE_SCHEMA, SCHEMA_VERSION};
 
+mod dashboard;
 mod events;
 mod history;
 mod messages;

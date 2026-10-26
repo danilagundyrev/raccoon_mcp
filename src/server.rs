@@ -37,6 +37,7 @@ use crate::{
     store::{EventWaitOptions, SqliteStore, StoreError},
 };
 
+mod dashboard;
 mod dispatch;
 mod schemas;
 mod session;
@@ -334,6 +335,11 @@ pub async fn run_server(
         listener.local_addr()?.port(),
         database_path.display()
     );
+    tracing::info!(
+        "Mission control: http://{}:{}/dashboard",
+        host,
+        listener.local_addr()?.port()
+    );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let maintenance = tokio::spawn(maintenance_loop(
@@ -363,6 +369,11 @@ fn router(
 ) -> Router {
     let mut router = Router::new()
         .route("/", get(root))
+        .route("/dashboard", get(dashboard::index))
+        .route("/dashboard/", get(dashboard::index))
+        .route("/dashboard/assets/{file}", get(dashboard::assets))
+        .route("/api/dashboard/snapshot", get(dashboard::snapshot))
+        .route("/api/dashboard/artifacts/{id}", get(dashboard::artifact))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/mcp", get(mcp_get).post(mcp_post).delete(mcp_delete))
@@ -477,7 +488,14 @@ async fn optional_interval_tick(interval: &mut Option<tokio::time::Interval>) {
     }
 }
 
-async fn root(State(state): State<AppState>) -> Response {
+async fn root(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/html"))
+    {
+        return dashboard::index().await;
+    }
     json_response(
         StatusCode::OK,
         json!({
@@ -489,6 +507,7 @@ async fn root(State(state): State<AppState>) -> Response {
             "max_summary_bytes": state.max_summary_bytes,
             "max_artifact_bytes": state.max_artifact_bytes,
             "mcp_endpoint": "/mcp",
+            "dashboard_endpoint": "/dashboard",
             "health_endpoint": "/healthz",
             "readiness_endpoint": "/readyz",
             "metrics_endpoint": state.metrics_enabled.then_some("/metrics"),
