@@ -523,11 +523,3 @@ Operational rules:
 ```
 
 The skill needs no scripts or bundled assets. `hub://guide` provides the live server-specific reference, while `SKILL.md` contains the stable operating procedure.
-
-## AI Usage
-
-The first pilot version of this server was created long ago and supported coordination between only two predefined repositories. With Codex and GPT-5.6, I completely redesigned that prototype into a full developer tool: Raccoon MCP can now connect many repositories within one project, provides a structured and persistent coordination workflow, and supports dedicated orchestrator, executor, butler, and auditor roles.
-
-I used Codex to explore and plan the server architecture, implement the redesign in Rust, investigate and fix bugs, and independently audit completed changes. I remained responsible for the product direction, architectural decisions, and final review.
-
-After the initial implementation, I ran a large multi-repository field test with real orchestrator sessions. Codex helped me analyze the resulting reports and persisted server state, turn the findings into a concrete protocol update plan, implement that plan, and verify the updated coordination workflow through further testing and audits.
